@@ -1,0 +1,9 @@
+node_modules
+frontend/node_modules
+frontend/dist
+backend/.runtime-data
+backend/.runtime-data-test
+backend/demo
+.env
+*.log
+.DS_Store

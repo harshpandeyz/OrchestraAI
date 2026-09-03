@@ -1,0 +1,11 @@
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.env
+backend/.runtime-data/
+backend/.runtime-data-test/
+backend/.runtime-data-finalization-test/
+backend/.runtime-data-contractcheck/
+backend/.runtime-data-livetest/
+*.log
+.DS_Store
