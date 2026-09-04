@@ -1,6 +1,6 @@
 import React, { memo, useMemo, useState } from 'react';
 import { useRuntime } from '../state/store';
-import { Empty, KV, Section, StatusDot, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from './ui';
+import { Empty, KV, Section, StatusDot, displaySnippet, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from './ui';
 import type { RuntimeSnapshot } from '../types';
 
 const SEG_COLORS = ['#0C7A5C', '#2F9E7E', '#2F7AC2', '#D9A62E', '#7C8B84', '#4FB3A9'];
@@ -309,7 +309,7 @@ function MemoryList({ title, items, emptyHint }: { title: string; items: Runtime
           <div className="kv"><span className="k">{m.source || 'unknown source'}</span><span className="v">rel {Number(m.importance).toFixed(2)}</span></div>
           {openId === m.id && (
             <div className="memdetail">
-              {m.snippet || 'No summary available.'}
+              {displaySnippet(m.snippet) || 'No summary available.'}
               <div className="meta">confidence {Number(m.confidence).toFixed(2)} · used {relTime(m.lastUsedAt)} · {fmtTime(m.createdAt)}</div>
             </div>
           )}

@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import { useRuntime } from '../state/store';
-import { Empty, StatusDot, fmtPct, fmtSec, relTime, usd } from '../components/ui';
+import { Empty, StatusDot, displaySnippet, fmtPct, fmtSec, relTime, usd } from '../components/ui';
 import '../styles/pages.css';
 
 type ModelSort = 'quality' | 'cost' | 'latency' | 'context' | 'reliability';
@@ -353,7 +353,7 @@ export function MemoryPage() {
                     <span className="mem-rel">{relTime(m.lastUsedAt)}</span>
                   </div>
                   <b>{m.title}</b>
-                  <p className="mem-snippet">{m.snippet || 'No summary available.'}</p>
+                  <p className="mem-snippet">{displaySnippet(m.snippet) || 'No summary available.'}</p>
                   <div className="mc-stats">
                     <span title="Source">{m.source || 'unknown'}</span>
                     <span title="Importance">imp {m.importance.toFixed(2)}</span>

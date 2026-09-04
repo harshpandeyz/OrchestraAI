@@ -372,7 +372,7 @@ kbd.hint { margin-left: 4px; }
   .toasts { left: 12px; right: 12px; bottom: 12px; max-width: none; }
   .welcome { margin: 3vh 12px 0; padding: 22px 20px; }
   .welcome h2 { font-size: 19px; }
-  .journey { overflow-x: auto; padding-bottom: 4px; }
+  .journey { overflow-x: auto; padding-bottom: 4px; scrollbar-width: thin; }
   .jstep .jlabel { display: none; }
   .jstep.active .jlabel, .jstep.done .jlabel { display: inline; }
 }

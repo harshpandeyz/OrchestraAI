@@ -49,6 +49,13 @@ describe('inspector + layout', () => {
     }
     expect(api.streamUrl('run-1')).toBe('/api/runs/run-1/events');
   });
+  it('displaySnippet cleans legacy raw-JSON escapes without touching server data', async () => {
+    const { displaySnippet } = await import('../components/ui');
+    expect(displaySnippet('passed (session): line1\\nline2\\n  line3')).toBe('passed (session): line1 line2 line3');
+    expect(displaySnippet('{"a":1}')).toBe('{"a":1}');
+    expect(displaySnippet(null)).toBe('');
+    expect(displaySnippet(undefined)).toBe('');
+  });
   it('composer is keyboard accessible with labels', () => {
     render(<RuntimeProvider><Seed><Composer /></Seed></RuntimeProvider>);
     expect(screen.getByLabelText('Message the agent')).toBeInTheDocument();

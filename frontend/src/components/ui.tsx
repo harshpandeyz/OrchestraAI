@@ -143,3 +143,10 @@ export function shortId(id: string | undefined | null, head = 8): string {
   if (!id) return '—';
   return id.length > head + 4 ? `${id.slice(0, head)}…` : id;
 }
+
+// Display-only cleanup for snippets stored before the runtime summarized tool
+// results (literal "\n" escapes from raw JSON). Server data is untouched.
+export function displaySnippet(snippet: string | null | undefined): string {
+  if (!snippet) return '';
+  return String(snippet).replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim();
+}

@@ -462,6 +462,7 @@
 .settings-row-label {
   font-size: 13px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .settings-row-desc {
