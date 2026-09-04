@@ -50,7 +50,7 @@ function loadConfig(env = process.env) {
         apiKey: openrouterKey,
         baseUrl: str('OPENROUTER_BASE_URL', 'https://openrouter.ai/api'),
         defaultModel: str('OPENROUTER_DEFAULT_MODEL', 'meta-llama/llama-3.3-70b-instruct:free'),
-        appName: str('OPENROUTER_APP_NAME', 'adaptive-agent-runtime'),
+        appName: str('OPENROUTER_APP_NAME', 'orchestraai'),
       },
       openai: {
         apiKey: openaiKey,

@@ -1,4 +1,4 @@
-# FRONTEND.md — Adaptive Agent Runtime Console (Session 4)
+# FRONTEND.md — OrchestraAI Console (Session 4)
 
 ## Architecture
 - `frontend/` — Vite + React 18 + TypeScript. No chart/map libs; all visualizations are div/SVG bars (offline-safe, no fake telemetry).

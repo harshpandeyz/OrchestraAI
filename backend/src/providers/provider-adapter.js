@@ -62,7 +62,7 @@ class ProviderAdapter {
     this.apiKey = options.apiKey || '';
     this.timeoutMs = options.timeoutMs || 60000;
     this.defaultModel = options.defaultModel || null;
-    this.appName = options.appName || 'adaptive-agent-runtime';
+    this.appName = options.appName || 'orchestraai';
   }
 
   get hasCredentials() {

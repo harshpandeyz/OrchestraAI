@@ -1,10 +1,10 @@
-# Production image for the Adaptive Agent Runtime.
+# Production image for OrchestraAI (adaptive agent runtime).
 # Backend is zero-dependency Node 20+; frontend is a static Vite build.
-# Build:  docker build -t adaptive-agent-runtime .
+# Build:  docker build -t orchestraai .
 # Run:    docker run -p 8787:8787 -p 5173:5173 \
 #           -e RUNTIME_MODE=live -e OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
 #           -e FRONTEND_ORIGIN=https://your-frontend.example \
-#           adaptive-agent-runtime
+#           orchestraai
 # Without provider credentials the server runs in explicit DEMO mode.
 # FRONTEND_ORIGIN is required in production: the API reflects only configured
 # origins (no wildcard CORS) and falls back to http://localhost:5173.

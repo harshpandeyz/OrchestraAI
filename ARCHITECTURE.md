@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Dynamic Agent Runtime (Session 1: Orchestrator + Runtime Core)
+# ARCHITECTURE.md — OrchestraAI Adaptive Agent Runtime (Session 1: Orchestrator + Runtime Core)
 
 ## Overview
 

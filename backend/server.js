@@ -1,6 +1,6 @@
 'use strict';
 
-// Adaptive Agent Runtime — production server.
+// OrchestraAI — adaptive agent runtime server.
 //
 // Wiring (canonical modules only; nothing from backend/demo/ is imported):
 //
@@ -376,7 +376,7 @@ const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && path === '/api/health') {
         return send(res, 200, {
-          ok: true, service: 'adaptive-agent-runtime', version: '1.0.0',
+          ok: true, service: 'orchestraai', version: '1.0.0',
           mode: config.mode, provider: config.provider,
           providerConfigured: providerRegistry.getAdapter(config.provider).hasCredentials,
           discovery: discovery.lastResult || { enabled: discovery.enabled },
@@ -395,7 +395,7 @@ const server = http.createServer(async (req, res) => {
         const ready = registryOk && storageProbe.ok && !discoveryPending;
         return send(res, ready ? 200 : 503, {
           ready,
-          service: 'adaptive-agent-runtime',
+          service: 'orchestraai',
           mode: config.mode,
           provider: config.provider,
           checks: {

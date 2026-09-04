@@ -1,6 +1,7 @@
-# Dynamic Agent Runtime — Adaptive Agent Control Plane (Session 5: integrated runtime)
+# OrchestraAI — Adaptive Agent Runtime
 
-Three-panel **Adaptive Agent Runtime Console**: navigate left, work with the agent in the center, understand the agent on the right.
+Three-panel **OrchestraAI console**: runs on the left, agent workspace in the
+center, runtime intelligence on the right.
 
 The backend is now a real end-to-end runtime (Session 5): user task → context →
 model routing → real provider call (OpenRouter/OpenAI/Anthropic) or explicit
@@ -17,7 +18,7 @@ npm start          # :8787 (RUNTIME_MODE=live iff provider credentials exist, el
 # terminal 2 — console
 cd frontend && npm install && npm run dev   # :5173 (proxies /api → :8787)
 ```
-Production: `cd frontend && npm run build` → `frontend/dist`. Docker: `docker build -t adaptive-agent-runtime .` (Dockerfile provided; requires a running Docker daemon).
+Production: `cd frontend && npm run build` → `frontend/dist`. Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon).
 
 ## Test it
 ```bash

@@ -1,7 +1,7 @@
 {
-  "name": "adaptive-agent-runtime",
+  "name": "orchestraai",
   "version": "0.4.0",
-  "description": "Dynamic Agent Runtime stub backend (Sessions 1-3 contracts) — zero dependencies",
+  "description": "OrchestraAI — adaptive AI agent runtime/control plane (zero-dependency Node backend + React console)",
   "type": "commonjs",
   "scripts": {
     "start": "node backend/server.js",
