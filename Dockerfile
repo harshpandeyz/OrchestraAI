@@ -1,7 +1,8 @@
 # Production image for OrchestraAI (adaptive agent runtime).
 # Backend is zero-dependency Node 20+; frontend is a static Vite build.
+# The runtime serves the built console itself on :8787 (UI + API, one port).
 # Build:  docker build -t orchestraai .
-# Run:    docker run -p 8787:8787 -p 5173:5173 \
+# Run:    docker run -p 8787:8787 \
 #           -e RUNTIME_MODE=live -e OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
 #           -e FRONTEND_ORIGIN=https://your-frontend.example \
 #           orchestraai

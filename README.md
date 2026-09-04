@@ -18,7 +18,7 @@ npm start          # :8787 (RUNTIME_MODE=live iff provider credentials exist, el
 # terminal 2 — console
 cd frontend && npm install && npm run dev   # :5173 (proxies /api → :8787)
 ```
-Production: `cd frontend && npm run build` → `frontend/dist`. Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon).
+Production: `cd frontend && npm run build` → `frontend/dist`, which the runtime serves itself on :8787 (one port: console + API). Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon).
 
 ## Test it
 ```bash

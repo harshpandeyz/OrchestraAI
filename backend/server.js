@@ -20,6 +20,8 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 const { Orchestrator } = require('./src/core/orchestrator');
 const { InMemoryModelRegistry } = require('./src/impl/model-registry');
@@ -272,6 +274,75 @@ function sendError(res, httpCode, code, message) {
 function sseLine(envelope) {
   if (envelope && typeof envelope.toSSE === 'function') return envelope.toSSE();
   return `event: ${envelope.type}\ndata: ${JSON.stringify(envelope)}\n\n`;
+}
+
+// ---------- production console (frontend/dist) ----------
+//
+// `npm run build` (frontend) + Docker both produce frontend/dist. When it is
+// present the runtime also serves the console itself, so one process is the
+// whole deployable product (:8787 serves UI + API). Dev keeps using Vite
+// (:5173 with /api proxy) — this only engages for the built bundle.
+// Zero dependencies: minimal safe static server (GET only, traversal-proof,
+// no directory listing, SPA fallback to index.html for non-/api routes).
+
+const DIST_DIR = path.resolve(__dirname, '..', 'frontend', 'dist');
+let DIST_OK = false;
+try {
+  DIST_OK = fs.existsSync(path.join(DIST_DIR, 'index.html'));
+} catch { DIST_OK = false; }
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+function serveConsole(req, res, pathname) {
+  if (!DIST_OK || (req.method !== 'GET' && req.method !== 'HEAD')) return false;
+  if (pathname.startsWith('/api/')) return false;
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return false;
+  }
+  if (rel === '/' || rel === '') rel = '/index.html';
+  // Traversal guard: resolve inside DIST_DIR only.
+  const resolved = path.normalize(path.join(DIST_DIR, rel));
+  if (resolved !== DIST_DIR && !resolved.startsWith(DIST_DIR + path.sep)) return false;
+  let file = resolved;
+  try {
+    const st = fs.statSync(file);
+    if (st.isDirectory()) file = path.join(file, 'index.html');
+  } catch {
+    // SPA fallback: unknown non-asset routes serve the console shell.
+    if (!path.extname(resolved)) file = path.join(DIST_DIR, 'index.html');
+    else return false;
+  }
+  let data;
+  try {
+    data = fs.readFileSync(file);
+  } catch {
+    return false;
+  }
+  const headers = {
+    'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+    'Cache-Control': file.includes(`${path.sep}assets${path.sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
+    ...(res._cors || {}),
+  };
+  res.writeHead(200, headers);
+  if (req.method === 'GET') res.end(data);
+  else res.end();
+  return true;
 }
 
 // ---------- validation ----------
@@ -568,6 +639,9 @@ const server = http.createServer(async (req, res) => {
           return send(res, 202, { accepted: true });
         }
       }
+
+      // Production console (only when frontend/dist was built into the image).
+      if (serveConsole(req, res, path)) return;
 
       return sendError(res, 404, 'not_found', 'not found');
     } catch (e) {
