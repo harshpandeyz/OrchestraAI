@@ -29,6 +29,12 @@ export function useEventStream(runId: string | null) {
   const { state, dispatch } = useRuntime();
   const retryRef = useRef(0);
   const lastSeq = state.server.conn.lastSeq;
+  // Sync the reconnect cursor inside effects only — writing refs during render
+  // is a side effect and breaks under concurrent rendering. The cursor always
+  // holds the latest applied seq so a dropped stream replays from the right
+  // point (the reducer dedupes by seq regardless).
+  useEffect(() => { lastSeqRef.current = lastSeq || 0; }, [lastSeq]);
+  useEffect(() => { lastUpdateRef.current = state.server.conn.lastUpdate; }, [state.server.conn.lastUpdate]);
 
   useEffect(() => {
     if (!runId) return;
@@ -62,7 +68,6 @@ export function useEventStream(runId: string | null) {
         }
       };
     };
-    lastSeqRef.current = lastSeq || 0;
     connect();
 
     // Stale watchdog: no updates for 30s => STALE (data kept, marked clearly).
@@ -77,7 +82,6 @@ export function useEventStream(runId: string | null) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
-  lastUpdateRef.current = state.server.conn.lastUpdate;
   return { lastSeq };
 }
 const lastUpdateRef: { current: string | null } = { current: null };
