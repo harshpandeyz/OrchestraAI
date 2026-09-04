@@ -68,7 +68,14 @@ async function handleSearchCode(params, ctx) {
   const query = String(params.query || '').slice(0, 200);
   if (!query) throw Object.assign(new Error('query is required'), { code: 'bad_params' });
   const maxResults = Math.min(Number(params.maxResults) || 20, 50);
-  const includeRe = params.include ? new RegExp(params.include) : /\.(js|ts|tsx|jsx|json|md|py|go|rs)$/;
+  let includeRe = /\.(js|ts|tsx|jsx|json|md|py|go|rs)$/;
+  if (params.include) {
+    try {
+      includeRe = new RegExp(String(params.include).slice(0, 120));
+    } catch {
+      includeRe = /\.(js|ts|tsx|jsx|json|md|py|go|rs)$/;
+    }
+  }
   const results = [];
   const ql = query.toLowerCase();
 
