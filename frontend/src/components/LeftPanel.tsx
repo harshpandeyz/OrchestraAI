@@ -1,16 +1,17 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
+import { api } from '../api/client';
 import { useRuntime } from '../state/store';
 import { relTime, statusPill, usd } from './ui';
 
 const RUNTIME_NAV = [
   { view: 'models' as const, label: 'Models', ico: '◈', hint: 'Browse model catalog' },
-  { view: 'tools' as const, label: 'Tools', ico: '⚒', hint: 'Tool registry' },
-  { view: 'memory' as const, label: 'Memory', ico: '🧠', hint: 'Working + long-term memory' },
-  { view: 'evals' as const, label: 'Evaluations', ico: '✓', hint: 'Runtime quality' },
+  { view: 'tools' as const, label: 'Tools', ico: '✚', hint: 'Tool registry' },
+  { view: 'memory' as const, label: 'Memory', ico: '◉', hint: 'Working + long-term memory' },
+  { view: 'evals' as const, label: 'Evaluations', ico: '★', hint: 'Runtime quality' },
 ];
 const SYSTEM_NAV = [
-  { view: 'settings' as const, label: 'Providers', ico: '⛁', hint: 'Provider configuration' },
-  { view: 'settings' as const, label: 'Settings', ico: '⚙', hint: 'Console settings' },
+  { view: 'settings' as const, anchor: 'providers', label: 'Providers', ico: '◍', hint: 'Provider configuration and runtime mode' },
+  { view: 'settings' as const, anchor: null as string | null, label: 'Settings', ico: '⚙', hint: 'Console settings' },
 ];
 
 export function LeftPanel() {
@@ -22,8 +23,24 @@ export function LeftPanel() {
     [runs, q],
   );
   const active = runs.find(r => r.id === activeRunId);
-  const go = (view: typeof state.ui.view) => {
-    dispatch({ type: 'ui/set', patch: { view, leftOpen: window.innerWidth > 980 ? state.ui.leftOpen : false } });
+  const [creating, setCreating] = useState(false);
+  const go = (view: typeof state.ui.view, anchor: string | null = null) => {
+    dispatch({ type: 'ui/set', patch: { view, settingsAnchor: anchor, leftOpen: window.innerWidth > 980 ? state.ui.leftOpen : false } });
+  };
+  const newRun = async () => {
+    if (creating) return;
+    setCreating(true);
+    try {
+      const { run } = await api.createRun('New agent run', state.ui.taskMode);
+      const { runs: fresh } = await api.getRuns();
+      dispatch({ type: 'runs/set', runs: fresh });
+      dispatch({ type: 'runs/active', id: run.id });
+      dispatch({ type: 'ui/set', patch: { view: 'run', leftOpen: window.innerWidth > 980 ? state.ui.leftOpen : false } });
+    } catch {
+      dispatch({ type: 'toast/push', toast: { kind: 'err', title: 'Could not create run', body: 'Backend unavailable — is it running on :8787?' } });
+    } finally {
+      setCreating(false);
+    }
   };
   const pickRun = (id: string) => {
     dispatch({ type: 'runs/active', id });
@@ -32,8 +49,11 @@ export function LeftPanel() {
 
   return (
     <nav className={`left ${state.ui.leftOpen ? 'open' : ''}`} aria-label="Primary">
+      <button className="newrun-btn" onClick={newRun} disabled={creating} aria-label="Create a new run">
+        <span aria-hidden="true">+</span> {creating ? 'Creating…' : 'New Run'}
+      </button>
       <div className="nav-sec">Workspace <span className="n">{runs.length}</span></div>
-      {runs.length > 6 && (
+      {runs.length > 1 && (
         <input className="nav-search" placeholder="Filter runs…" aria-label="Filter runs" value={state.ui.runQuery}
           onChange={e => dispatch({ type: 'ui/set', patch: { runQuery: e.target.value } })} />
       )}
@@ -49,7 +69,7 @@ export function LeftPanel() {
       )}
       <div className="run-list" role="listbox" aria-label="Runs">
         {filtered.length === 0 && (
-          <div className="empty" role="status"><b>No runs</b><span>Create your first runtime session.</span></div>
+          <div className="empty" role="status"><b>No runs yet</b><span>Press New Run above to start your first task.</span></div>
         )}
         {filtered.map(r => {
           const isActive = r.id === activeRunId;
@@ -84,12 +104,15 @@ export function LeftPanel() {
       })}
 
       <div className="nav-sec">System</div>
-      {SYSTEM_NAV.map(i => (
-        <button key={i.label} className={`nav-item ${state.ui.view === i.view ? 'active' : ''}`}
-          aria-current={state.ui.view === i.view ? 'page' : undefined} title={i.hint} onClick={() => go(i.view)}>
-          <span className="ico" aria-hidden="true">{i.ico}</span>{i.label}
-        </button>
-      ))}
+      {SYSTEM_NAV.map(i => {
+        const isActive = state.ui.view === i.view && (state.ui.settingsAnchor || null) === i.anchor;
+        return (
+          <button key={i.label} className={`nav-item ${isActive ? 'active' : ''}`}
+            aria-current={isActive ? 'page' : undefined} title={i.hint} onClick={() => go(i.view, i.anchor)}>
+            <span className="ico" aria-hidden="true">{i.ico}</span>{i.label}
+          </button>
+        );
+      })}
       <React.Fragment>
         <div className="nav-sec">Shortcuts</div>
         <div className="nav-hints">

@@ -16,7 +16,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => req<{ ok: boolean }>(`/api/health`),
+  health: () => req<{ ok: boolean; mode?: string; provider?: string; providerConfigured?: boolean; discovery?: any; runs?: number }>(`/api/health`),
+  config: () => req<{ mode: string; provider: string; maxSteps: number; runTimeoutMs: number; defaultBudgetUsd: number; discoveryEnabled: boolean }>(`/api/config`),
   getRuns: () => req<{ runs: Run[] }>(`/api/runs`),
   createRun: (title: string, taskMode: string) => req<{ run: Run }>(`/api/runs`, { method: 'POST', body: JSON.stringify({ title, taskMode }) }),
   getRun: (id: string) => req<{ run: Run }>(`/api/runs/${id}`),

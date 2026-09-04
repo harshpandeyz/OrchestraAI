@@ -204,7 +204,7 @@ function finalizeStream(msgs: ChatMessage[], full: string): ChatMessage[] {
 export type View = 'run' | 'models' | 'memory' | 'tools' | 'evals' | 'settings';
 export interface Toast { id: number; kind: 'ok' | 'warn' | 'err' | 'info'; title: string; body?: string }
 interface ServerState { runs: Run[]; activeRunId: string | null; snapshot: RuntimeSnapshot | null; models: ModelInfo[]; tools: RuntimeSnapshot['tools']; memItems: MemoryItem[]; evals: any[]; evalNote: string; conn: { status: ConnStatus; lastSeq: number; lastUpdate: string | null }; sending: boolean; }
-interface UIState { view: View; leftOpen: boolean; rightOpen: boolean; expanded: Record<string, boolean>; selectedTrace: number | null; paletteOpen: boolean; taskMode: string; memQuery: string; modelQuery: string; toolQuery: string; runQuery: string; theme: 'dark' | 'light'; toasts: Toast[]; }
+interface UIState { view: View; settingsAnchor: string | null; leftOpen: boolean; rightOpen: boolean; expanded: Record<string, boolean>; selectedTrace: number | null; paletteOpen: boolean; taskMode: string; memQuery: string; modelQuery: string; toolQuery: string; runQuery: string; theme: 'dark' | 'light'; toasts: Toast[]; }
 interface State { server: ServerState; ui: UIState }
 type Action =
   | { type: 'runs/set'; runs: Run[] } | { type: 'runs/active'; id: string | null }
@@ -217,9 +217,17 @@ type Action =
   | { type: 'toast/push'; toast: Omit<Toast, 'id'> } | { type: 'toast/dismiss'; id: number };
 
 let toastSeq = 1;
+function initialTheme(): 'dark' | 'light' {
+  try {
+    const saved = (typeof localStorage !== 'undefined' && (localStorage.getItem('orchestra-theme') || localStorage.getItem('aar-theme'))) as string | null;
+    if (saved === 'dark' || saved === 'light') return saved;
+  } catch { /* ignore */ }
+  // Friendly light-first product; dark remains one toggle away.
+  return 'light';
+}
 const initial: State = {
   server: { runs: [], activeRunId: null, snapshot: null, models: [], tools: [], memItems: [], evals: [], evalNote: '', conn: { status: 'idle', lastSeq: 0, lastUpdate: null }, sending: false },
-  ui: { view: 'run', leftOpen: true, rightOpen: true, expanded: { model: true, why: true, context: true, cache: true, memory: false, tools: true, cost: true, latency: true, history: true, routing: true, trace: true, changes: true, decisions: true }, selectedTrace: null, paletteOpen: false, taskMode: 'debug', memQuery: '', modelQuery: '', toolQuery: '', runQuery: '', theme: (typeof localStorage !== 'undefined' && (localStorage.getItem('aar-theme') as any)) || 'dark', toasts: [] },
+  ui: { view: 'run', settingsAnchor: null, leftOpen: true, rightOpen: true, expanded: { model: true, why: true, switch: true, context: true, cache: true, memory: false, tools: true, cost: true, latency: true, history: false, routing: false, trace: true, changes: false, decisions: false }, selectedTrace: null, paletteOpen: false, taskMode: 'debug', memQuery: '', modelQuery: '', toolQuery: '', runQuery: '', theme: initialTheme(), toasts: [] },
 };
 
 function reducer(s: State, a: Action): State {

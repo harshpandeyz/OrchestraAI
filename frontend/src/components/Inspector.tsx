@@ -3,14 +3,41 @@ import { useRuntime } from '../state/store';
 import { Empty, KV, Section, StatusDot, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from './ui';
 import type { RuntimeSnapshot } from '../types';
 
-const SEG_COLORS = ['#5aa9ff', '#3fce8f', '#b48cff', '#f0b429', '#6b7a90', '#e06c9f'];
+const SEG_COLORS = ['#0C7A5C', '#2F9E7E', '#2F7AC2', '#D9A62E', '#7C8B84', '#4FB3A9'];
 const NAV = [['model', 'Model'], ['why', 'Why?'], ['switch', 'Switch'], ['context', 'Context'], ['cache', 'Cache'], ['memory', 'Memory'], ['tools', 'Tools'], ['cost', 'Cost'], ['latency', 'Latency'], ['routing', 'Routing'], ['trace', 'Trace'], ['decisions', 'Decisions'], ['changes', 'Changes']];
+
+function freshnessLabel(status: string | null, lastUpdate: string | null): 'LIVE' | 'STALE' | 'DISCONNECTED' | 'UNKNOWN' {
+  if (status === 'connected') {
+    if (!lastUpdate) return 'LIVE';
+    const age = Date.now() - new Date(lastUpdate).getTime();
+    return age > 30000 ? 'STALE' : 'LIVE';
+  }
+  if (status === 'reconnecting') return 'STALE';
+  if (status === 'disconnected') return 'DISCONNECTED';
+  return 'UNKNOWN';
+}
+
+function ConnStatusBadge({ status, lastUpdate, terminal }: { status: string | null; lastUpdate: string | null; terminal?: boolean }) {
+  const raw = freshnessLabel(status, lastUpdate);
+  // Terminal runs are final history, never stale.
+  const label = terminal && raw !== 'DISCONNECTED' ? 'FINAL' : raw;
+  const colors = { LIVE: 'ok', STALE: 'warn', DISCONNECTED: 'err', UNKNOWN: 'muted', FINAL: 'muted' };
+  const texts = { LIVE: 'LIVE', STALE: 'STALE', DISCONNECTED: 'DISCONNECTED', UNKNOWN: 'UNKNOWN', FINAL: 'FINAL' };
+  const classNames = { LIVE: 'conn live', STALE: 'conn stale', DISCONNECTED: 'conn disconnected', UNKNOWN: 'conn unknown', FINAL: 'conn final' };
+  return (
+    <span className={`conn ${classNames[label]}`} title={label === 'FINAL' ? 'Run is complete — final state' : texts[label]}>
+      <span className="dot" />
+      {texts[label]}
+    </span>
+  );
+}
 
 export function RuntimeInspector() {
   const { state, dispatch } = useRuntime();
   const snap = state.server.snapshot;
   if (!snap) return <aside className="right" aria-label="Runtime inspector"><Empty what="Runtime state" hint="Select a run to inspect live runtime telemetry." /></aside>;
   const open = state.ui.rightOpen;
+  const snapTerminal = !!snap && ['completed', 'failed', 'cancelled'].includes(String(snap.status));
   return (
     <aside className={`right ${open ? 'open' : ''}`} aria-label="Runtime inspector">
       {!open && (
@@ -18,6 +45,7 @@ export function RuntimeInspector() {
       )}
       <div className="inspector-head">
         <span className="inspector-title">Runtime Inspector</span>
+        <ConnStatusBadge status={state.server.conn.status} lastUpdate={state.server.conn.lastUpdate} terminal={snapTerminal} />
         <button className="icon-btn sm" aria-label="Close inspector" onClick={() => dispatch({ type: 'ui/set', patch: { rightOpen: false } })}>▶</button>
       </div>
       <nav className="inspector-nav" aria-label="Inspector sections">
