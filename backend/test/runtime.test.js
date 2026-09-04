@@ -30,6 +30,7 @@ const {
   TelemetryCollector,
   StateMachine,
   Orchestrator,
+  loadConfig,
   InMemoryModelRegistry,
   InMemoryModelRouter,
   InMemoryContextManager,
@@ -583,6 +584,23 @@ async function runTests() {
     assertEqual(costs.breakdown.contextReconstruction > 0, true);
     assertEqual(costs.breakdown.cacheLoss > 0, true);
     assertEqual(costs.breakdown.providerOverhead > 0, true);
+  });
+
+  // ===========================================
+  // loadConfig threads the provided env object
+  // ===========================================
+  test('loadConfig honors a custom env object instead of process.env', () => {
+    const c = loadConfig({ PORT: '9999', PROVIDER: 'openai', OPENAI_API_KEY: 'x', DISCOVERY_ENABLED: '0', DEFAULT_BUDGET_USD: '1.5' });
+    assertEqual(c.port, 9999);
+    assertEqual(c.mode, 'live');
+    assertEqual(c.provider, 'openai');
+    assertEqual(c.discoveryEnabled, false);
+    assertEqual(c.defaultBudgetUsd, 1.5);
+  });
+  test('loadConfig resolves demo without keys and honors explicit demo', () => {
+    assertEqual(loadConfig({ PROVIDER: 'openrouter' }).mode, 'demo');
+    assertEqual(loadConfig({ PROVIDER: 'openrouter', OPENROUTER_API_KEY: 'k', RUNTIME_MODE: 'demo' }).mode, 'demo');
+    assertEqual(loadConfig({ PROVIDER: 'openrouter', OPENROUTER_API_KEY: 'k' }).mode, 'live');
   });
 
   for (const [name, fn] of queue) {
