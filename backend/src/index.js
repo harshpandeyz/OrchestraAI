@@ -10,7 +10,7 @@ const { CostEstimator } = require('./cost/cost-estimator');
 const { ExecutionCheckpoint, CheckpointManager, RecoveryManager } = require('./checkpoint/checkpoint-manager');
 const { TelemetryEvent, TelemetryCollector } = require('./telemetry/telemetry-collector');
 const { StateMachine, STATE_TRANSITIONS, TERMINAL_STATES } = require('./core/state-machine');
-const { Orchestrator } = require('./core/orchestrator');
+const { Orchestrator, frontendStatus, summarizeToolResult } = require('./core/orchestrator');
 const { 
   ModelRegistry, ModelRouter, ContextManager, MemoryManager, CacheManager, 
   ToolRegistry, ToolExecutor, CostEstimatorInterface, PolicyEngineInterface, 
@@ -90,6 +90,8 @@ module.exports = {
   
   // Orchestrator
   Orchestrator,
+  frontendStatus,
+  summarizeToolResult,
   
   // Interfaces
   ModelRegistry,

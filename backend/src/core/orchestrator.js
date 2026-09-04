@@ -52,6 +52,35 @@ function frontendStatus(internal) {
   }
 }
 
+// Human-readable one-line summary of a tool result for memory snippets and
+// trace labels. Raw JSON.stringify output embeds literal "\n" escapes (and
+// slicing can cut mid-escape), which renders as noise in the UI. Prefer a
+// result's own textual field when present, then collapse whitespace.
+function summarizeToolResult(result) {
+  let text = '';
+  if (typeof result === 'string') {
+    text = result;
+  } else if (result && typeof result === 'object') {
+    const direct = ['summary', 'output', 'stdout', 'text', 'message'].find(
+      (k) => typeof result[k] === 'string' && result[k].trim()
+    );
+    if (direct) {
+      const passed = result.passed === true ? 'passed' : result.passed === false ? 'failed' : null;
+      const suite = typeof result.suite === 'string' && result.suite ? ` (${result.suite})` : '';
+      text = (passed ? `${passed}${suite}: ` : '') + result[direct];
+    } else {
+      try {
+        text = JSON.stringify(result);
+      } catch {
+        text = String(result);
+      }
+    }
+  } else if (result !== undefined && result !== null) {
+    text = String(result);
+  }
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 class Orchestrator {
   constructor(dependencies = {}) {
     this.modelRegistry = dependencies.modelRegistry;
@@ -656,7 +685,7 @@ class Orchestrator {
         if (this.memoryManager && res.success) {
           await this.memoryManager.writeWorkingMemory(runtimeState, {
             title: `${call.name} result (step ${stepNumber})`,
-            snippet: JSON.stringify(res.result).slice(0, 500),
+            snippet: summarizeToolResult(res.result).slice(0, 500),
             source: `tool:${call.name}`,
             importance: 0.7, confidence: 0.8,
           });
@@ -1459,4 +1488,5 @@ class Orchestrator {
 module.exports = {
   Orchestrator,
   frontendStatus,
+  summarizeToolResult,
 };

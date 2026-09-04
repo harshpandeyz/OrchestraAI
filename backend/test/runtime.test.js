@@ -30,6 +30,7 @@ const {
   TelemetryCollector,
   StateMachine,
   Orchestrator,
+  summarizeToolResult,
   loadConfig,
   InMemoryModelRegistry,
   InMemoryModelRouter,
@@ -584,6 +585,19 @@ async function runTests() {
     assertEqual(costs.breakdown.contextReconstruction > 0, true);
     assertEqual(costs.breakdown.cacheLoss > 0, true);
     assertEqual(costs.breakdown.providerOverhead > 0, true);
+  });
+
+  // ===========================================
+  // Tool-result memory summaries are human-readable (no raw JSON escapes)
+  // ===========================================
+  test('summarizeToolResult prefers textual result fields and collapses whitespace', () => {
+    const out = summarizeToolResult({ suite: 'session', passed: true, stdout: 'line1\nline2\n  line3' });
+    assertEqual(out, 'passed (session): line1 line2 line3');
+  });
+  test('summarizeToolResult handles strings, null, and undefined', () => {
+    assertEqual(summarizeToolResult('plain string'), 'plain string');
+    assertEqual(summarizeToolResult(null), '');
+    assertEqual(summarizeToolResult(undefined), '');
   });
 
   // ===========================================
