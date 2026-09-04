@@ -121,6 +121,7 @@ function Boot() {
 
   // Narrow screens: drawers start closed so the center workspace is primary.
   // ?theme=dark|light deep-link overrides the saved preference once.
+  // ?view=models|tools|memory|evals|settings|run deep-links a destination.
   useEffect(() => {
     if (typeof window !== 'undefined' && window.innerWidth <= 980) {
       dispatch({ type: 'ui/set', patch: { leftOpen: false, rightOpen: false } });
@@ -129,6 +130,10 @@ function Boot() {
       const params = new URLSearchParams(window.location.search);
       const t = params.get('theme');
       if (t === 'dark' || t === 'light') dispatch({ type: 'ui/set', patch: { theme: t } });
+      const v = (params.get('view') || '').toLowerCase();
+      if (v === 'models' || v === 'tools' || v === 'memory' || v === 'evals' || v === 'settings' || v === 'run') {
+        dispatch({ type: 'ui/set', patch: { view: v as any } });
+      }
     } catch { /* ignore */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
