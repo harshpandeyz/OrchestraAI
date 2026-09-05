@@ -13,3 +13,7 @@ backend/demo
 *.log
 .DS_Store
 coverage
+.tmp
+*~
+# Git and CI artifacts
+.github
