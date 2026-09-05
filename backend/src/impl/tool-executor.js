@@ -18,6 +18,14 @@
 //   - `run_tests` / `build_project` execute ONLY allowlisted development
 //     commands via execFile (no shell, no model-supplied argv). Returns
 //     {command,cwd,exitCode,duration,stdout,stderr,timedOut,truncated}.
+//     execFile() is a command restriction, NOT a sandbox: local execution is
+//     the LOCAL RESTRICTED executor for safe development/test operations
+//     only (sanitized minimal env, always marked isolated:false). In
+//     production, these tools REQUIRE the isolated executor
+//     (POST ${ISOLATED_EXECUTOR_URL}/v1/execute, see
+//     ../execution/isolated-executor.js) and FAIL CLOSED with
+//     code 'sandbox_unavailable' when it is missing or unreachable — never a
+//     silent local fallback.
 //   - `apply_patch` supports dry-run, requires ALLOW_FILE_WRITES, applies
 //     atomically (tmp+rename) with hash verification.
 //   - Arbitrary shell execution is NOT exposed as a tool.
@@ -47,6 +55,8 @@ const { generateId, now } = require('../state/runtime-state');
 const { createExecutionResult, truncateOutput, validateInput } = require('../execution/tool-system');
 const { sandboxPath, isBinaryBuffer, resolveWorkspaceRoot, sha256 } = require('../execution/changesets');
 const { validateCommandArgs } = require('../execution/environment');
+const Isolated = require('../execution/isolated-executor');
+const Provenance = require('../execution/provenance');
 
 function hashParams(params) {
   return crypto.createHash('sha256').update(JSON.stringify(params || {})).digest('hex').slice(0, 12);
@@ -197,6 +207,199 @@ function describeTestCommand(workspace) {
   throw Object.assign(new Error('no allowlisted test command available'), { code: 'disabled' });
 }
 
+// Executor routing for command execution (Agent 3 boundary).
+//
+// Returns { mode:'local' } in development/test, or { mode:'isolated',
+// baseUrl } in production when a tool requires isolation. Throws
+// {code:'sandbox_unavailable'} when production requires isolation but no
+// executor is configured — the caller maps this to a fail-closed result,
+// never a local fallback.
+function routeCommandExecution(toolName, ctx) {
+  const isolatedOverride = ctx && ctx.isolatedExecutor;
+  const env = (isolatedOverride && isolatedOverride.env) || process.env;
+  const baseUrl = (isolatedOverride && isolatedOverride.baseUrl !== undefined)
+    ? isolatedOverride.baseUrl
+    : Isolated.getIsolatedExecutorUrl(env);
+  const production = Isolated.isProductionEnv(env);
+  if (production && Isolated.toolRequiresIsolation(toolName)) {
+    if (!baseUrl) throw Isolated.sandboxUnavailableError(toolName);
+    return { mode: 'isolated', baseUrl, token: (isolatedOverride && isolatedOverride.token) || env.ISOLATED_EXECUTOR_TOKEN || null, env };
+  }
+  return { mode: 'local' };
+}
+
+// Convert a locally-resolved spec to the isolated request shape. Host
+// absolute paths are NEVER sent: node targets go as workspace-relative
+// paths, cwd becomes the worker-internal workspace root. The run workspace
+// travels as a bounded disposable snapshot (materialized into the worker's
+// ephemeral dir, destroyed after execution) — never an empty directory and
+// never a host mount.
+function toIsolatedRequest(toolName, spec, ctx, { timeoutMs, maxOutputBytes }) {
+  const ws = resolveWorkspaceRoot(ctx.workspace);
+  const args = [...spec.args];
+  if (spec.cmd === 'node' && args[0]) {
+    const abs = path.resolve(args[0]);
+    const rel = path.relative(ws, abs);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw Object.assign(new Error('node target escapes workspace'), { code: 'denied' });
+    }
+    args[0] = rel.replace(/\\/g, '/');
+  }
+  for (const a of args) {
+    if (typeof a === 'string' && (a === '/etc/passwd' || a.startsWith('/etc/') || a.startsWith('/root'))) {
+      throw Object.assign(new Error('host path outside worker workspace refused'), { code: 'denied' });
+    }
+  }
+  // Disposable snapshot of the run workspace so the sandbox executes the
+  // customer's actual files. Best-effort read, fail-closed send: an
+  // unreadable workspace refuses rather than executing against an empty dir
+  // and reporting misleading results.
+  let workspace = null;
+  try {
+    workspace = Isolated.snapshotWorkspace(ws);
+  } catch (e) {
+    throw Object.assign(
+      new Error(`workspace snapshot failed: ${String((e && e.message) || e).slice(0, 160)}`),
+      { code: 'denied' },
+    );
+  }
+  const policy = ctx.policy || {};
+  return {
+    toolName,
+    runId: ctx.runId || 'unknown-run',
+    tenantId: ctx.tenantId || null,
+    projectId: ctx.projectId || null,
+    workspaceId: ctx.workspaceId || null,
+    command: spec.cmd,
+    args,
+    cwd: '/',
+    timeoutMs,
+    maxOutputBytes,
+    networkMode: policy.networkAccess || 'disabled',
+    networkAllowlist: Array.isArray(policy.networkAllowlist) ? policy.networkAllowlist : [],
+    workspace,
+  };
+}
+
+function capText(s, n) {
+  const str = String(s || '');
+  const truncated = Buffer.byteLength(str, 'utf8') > n;
+  return { text: truncated ? Buffer.from(str, 'utf8').slice(-n).toString('utf8') : str, truncated };
+}
+
+// Run an allowlisted spec either locally (restricted) or via the isolated
+// executor (production). Returns the structured command contract with
+// explicit executor attribution. Timeout maps to code 'timeout' with
+// timedOut/timed_out details — never test_failure.
+async function runCommandSandboxed(toolName, spec, ctx, { timeoutMs, maxOutputBytes = 6000, suite = null } = {}) {
+  const route = routeCommandExecution(toolName, ctx);
+  // Defense in depth: validate even before handing to the worker (which
+  // re-validates with the same command-guard rules).
+  try {
+    require('../execution/command-guard').validateArgv([spec.cmd, ...spec.args], ctx.workspace);
+  } catch (e) {
+    throw Object.assign(new Error(String((e && e.message) || e).slice(0, 200)), { code: (e && e.code) || 'denied' });
+  }
+  if (route.mode === 'isolated') {
+    const t0 = Date.now();
+    const body = toIsolatedRequest(toolName, spec, ctx, { timeoutMs, maxOutputBytes });
+    let resp;
+    try {
+      const execFn = (ctx.isolatedExecutor && ctx.isolatedExecutor.executeIsolated) || Isolated.executeIsolated;
+      resp = await execFn(body, { baseUrl: route.baseUrl, token: route.token, env: route.env });
+      // Enforce the documented response contract on EVERY executor response
+      // (including injected ones): missing fields or a missing isolation
+      // attestation is a failure, never trusted success.
+      resp = Isolated.validateExecuteResponse(resp);
+      if (!resp.isolated) {
+        throw Object.assign(new Error('executor did not attest isolation (isolated=true required)'), { code: 'executor_malformed' });
+      }
+    } catch (e) {
+      if (e && (e.code === 'sandbox_unavailable' || e.code === 'denied' || e.code === 'bad_params' || e.code === 'executor_malformed')) throw e;
+      throw Object.assign(
+        new Error(`isolated executor unavailable: ${String((e && e.message) || e).slice(0, 200)}`),
+        { code: 'sandbox_unavailable', failClosed: true },
+      );
+    }
+    const durationMs = Number.isFinite(resp.durationMs) ? resp.durationMs : (Date.now() - t0);
+    const out = capText(resp.stdout, maxOutputBytes);
+    const errOut = capText(resp.stderr, Math.floor(maxOutputBytes / 2));
+    if (resp.timedOut) {
+      const e = new Error('Test command timed out');
+      e.code = 'timeout';
+      e.details = {
+        command: spec.label || `${spec.cmd} ${spec.args.join(' ')}`.trim(),
+        cwd: ctx.workspace, exitCode: null, durationMs,
+        stdout: out.text, stderr: errOut.text,
+        timedOut: true, timed_out: true,
+        truncated: out.truncated || errOut.truncated,
+        isolated: true, executor: 'isolated', executorVersion: resp.executorVersion || null,
+      };
+      throw e;
+    }
+    return {
+      ...(suite !== null ? { suite } : {}),
+      passed: resp.exitCode === 0,
+      command: spec.label || `${spec.cmd} ${spec.args.join(' ')}`.trim(),
+      cwd: ctx.workspace, exitCode: resp.exitCode,
+      durationMs: durationMs, stdout: out.text, stderr: errOut.text,
+      timedOut: false, timed_out: false,
+      truncated: out.truncated || errOut.truncated,
+      isolated: true, executor: 'isolated', executorVersion: resp.executorVersion || null,
+      // Artifact surface from the ephemeral sandbox (collected files +
+      // workspace manifest). Additive; local path stays unchanged.
+      artifacts: Array.isArray(resp.artifacts) ? resp.artifacts : [],
+      workspaceManifest: Array.isArray(resp.workspaceManifest) ? resp.workspaceManifest : [],
+    };
+  }
+  // Local restricted path (development/test only for these tools).
+  return runCommandLocal(toolName, spec, ctx, { timeoutMs, maxOutputBytes, suite });
+}
+
+function runCommandLocal(toolName, spec, ctx, { timeoutMs, maxOutputBytes = 6000, suite = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const child = execFile(spec.cmd, spec.args, {
+      cwd: ctx.workspace, timeout: timeoutMs, maxBuffer: 512 * 1024, windowsHide: true,
+      // Sanitized minimal env — never the application process env wholesale.
+      env: (() => {
+        try { return require('../execution/sandbox-env').buildSandboxEnv(); }
+        catch { return { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', TERM: 'dumb' }; }
+      })(),
+    }, (error, stdout, stderr) => {
+      const duration = Date.now() - t0;
+      const out = capText(stdout, Math.floor(maxOutputBytes * 2 / 3));
+      const err = capText(stderr, Math.floor(maxOutputBytes / 3));
+      const truncated = out.truncated || err.truncated;
+      const base = {
+        ...(suite !== null ? { suite } : {}),
+        command: spec.label, cwd: ctx.workspace,
+        durationMs: duration, stdout: out.text, stderr: err.text,
+        truncated, isolated: false, executor: 'local-restricted',
+      };
+      if (error) {
+        const timeout = error.killed && error.signal === 'SIGTERM';
+        if (timeout) {
+          const e = new Error('Test command timed out');
+          e.code = 'timeout';
+          e.details = { ...base, exitCode: null, timedOut: true, timed_out: true, passed: false };
+          return reject(e);
+        }
+        const e = new Error(`Tests failed (exit ${error.code ?? '?'}): ${(out.text + err.text).slice(-500)}`);
+        e.code = 'test_failure';
+        // Structured failure carries the full contract so VERIFY can inspect.
+        e.details = { ...base, exitCode: error.code ?? 1, timedOut: false, timed_out: false, passed: false };
+        return reject(e);
+      }
+      resolve({ ...base, passed: true, exitCode: 0, timedOut: false, timed_out: false });
+    });
+    if (ctx.signal) {
+      if (ctx.signal.aborted) { try { child.kill('SIGKILL'); } catch {} }
+      else ctx.signal.addEventListener('abort', () => { try { child.kill('SIGKILL'); } catch {} }, { once: true });
+    }
+  });
+}
+
 function tryParseAllowlisted(raw, workspace) {
   const parts = raw.split(/\s+/).filter(Boolean);
   if (!parts.length) return null;
@@ -228,52 +431,14 @@ function tryParseAllowlisted(raw, workspace) {
 }
 
 function handleRunTests(params, ctx) {
-  return new Promise((resolve, reject) => {
-    let spec;
-    // Resolve the allowlisted command against the RUN's workspace (not
-    // process.cwd()): a tmp workspace containing slow.js must resolve there,
-    // otherwise the runner fails with test_failure instead of timing out.
-    try { spec = describeTestCommand(ctx && ctx.workspace); }
-    catch (e) { return reject(e); }
-    const t0 = Date.now();
-    const child = execFile(spec.cmd, spec.args, {
-      cwd: ctx.workspace, timeout: ctx.timeLeftMs, maxBuffer: 512 * 1024, windowsHide: true,
-    }, (error, stdout, stderr) => {
-      const duration = Date.now() - t0;
-      const cap = (s, n) => {
-        const str = String(s || '');
-        const truncated = Buffer.byteLength(str, 'utf8') > n;
-        return { text: truncated ? Buffer.from(str, 'utf8').slice(-n).toString('utf8') : str, truncated };
-      };
-      const out = cap(stdout, 4000);
-      const err = cap(stderr, 2000);
-      const truncated = out.truncated || err.truncated;
-      if (error) {
-        const timeout = error.killed && error.signal === 'SIGTERM';
-        if (timeout) {
-          const e = new Error('Test command timed out');
-          e.code = 'timeout';
-          e.details = { command: spec.label, cwd: ctx.workspace, exitCode: null, durationMs: duration, stdout: out.text, stderr: err.text, timedOut: true, truncated };
-          return reject(e);
-        }
-        const e = new Error(`Tests failed (exit ${error.code ?? '?'}): ${(out.text + err.text).slice(-500)}`);
-        e.code = 'test_failure';
-        // Structured failure carries the full contract so VERIFY can inspect.
-        e.details = { command: spec.label, cwd: ctx.workspace, exitCode: error.code ?? 1, durationMs: duration, stdout: out.text, stderr: err.text, timedOut: false, truncated, passed: false };
-        return reject(e);
-      }
-      resolve({
-        suite: params.suite || 'default',
-        passed: true,
-        command: spec.label, cwd: ctx.workspace, exitCode: 0,
-        durationMs: duration, stdout: out.text, stderr: err.text,
-        timedOut: false, truncated,
-      });
-    });
-    if (ctx.signal) {
-      if (ctx.signal.aborted) { try { child.kill('SIGKILL'); } catch {} }
-      else ctx.signal.addEventListener('abort', () => { try { child.kill('SIGKILL'); } catch {} }, { once: true });
-    }
+  // Resolve the allowlisted command against the RUN's workspace (not
+  // process.cwd()): a tmp workspace containing slow.js must resolve there,
+  // otherwise the runner fails with test_failure instead of timing out.
+  let spec;
+  try { spec = describeTestCommand(ctx && ctx.workspace); }
+  catch (e) { return Promise.reject(e); }
+  return runCommandSandboxed('run_tests', spec, ctx, {
+    timeoutMs: ctx.timeLeftMs, maxOutputBytes: 6000, suite: params.suite || 'default',
   });
 }
 
@@ -364,7 +529,7 @@ async function handleEnvInspect(params, ctx) {
 
 async function handleBuildProject(params, ctx) {
   // Build runs the detected/project build command (still allowlisted).
-  const { detectProject, runAllowlisted } = require('../execution/environment');
+  const { detectProject } = require('../execution/environment');
   const { isCommandAllowed } = require('../execution/execution-policy');
   const project = await detectProject(ctx.workspace).catch(() => null);
   const raw = (project && project.buildCommand) || process.env.TOOL_BUILD_COMMAND || 'npm run build';
@@ -373,13 +538,15 @@ async function handleBuildProject(params, ctx) {
   if (!gate.allowed) throw Object.assign(new Error(`build command not allowed: ${gate.reason}`), { code: 'denied' });
   const t0 = Date.now();
   try {
-    const r = await runAllowlisted(parts, { cwd: ctx.workspace, timeoutMs: Math.min(ctx.timeLeftMs, 120000), signal: ctx.signal });
-    r.durationMs = Date.now() - t0;
-    return { ...r, passed: true };
+    const r = await runCommandSandboxed('build_project', { cmd: parts[0], args: parts.slice(1), label: raw }, ctx, {
+      timeoutMs: Math.min(ctx.timeLeftMs, 120000), maxOutputBytes: 6000,
+    });
+    r.durationMs = r.durationMs ?? (Date.now() - t0);
+    return { ...r, passed: r.exitCode === 0 };
   } catch (e) {
     if (e && e.details) {
-      e.details.durationMs = Date.now() - t0;
-      const err = new Error(`Build failed: ${(e.details.stdout + e.details.stderr).slice(-500)}`);
+      e.details.durationMs = e.details.durationMs ?? (Date.now() - t0);
+      const err = new Error(`Build failed: ${((e.details.stdout || '') + (e.details.stderr || '')).slice(-500)}`);
       err.code = e.code;
       err.details = { ...e.details, passed: false };
       throw err;
@@ -432,6 +599,10 @@ class InMemoryToolExecutor extends ToolExecutor {
     // completedKeys map is only the fast path, never a competing source.
     this.idempotencyStore = options.idempotencyStore || null;
     this.gate = options.gate || null; // async ({toolName, params, definition, risk}) -> {allowed} | {needsApproval, approvalId?}
+    // Isolated-executor override for tests and embedding hosts:
+    // { baseUrl, token?, env?, executeIsolated? }. When absent, the
+    // ISOLATED_EXECUTOR_URL / NODE_ENV environment is consulted per call.
+    this.isolatedExecutor = options.isolatedExecutor || null;
     this.config = {
       timeoutMs: options.timeoutMs || 30000,
       maxParallel: options.maxParallel || 3,
@@ -540,6 +711,12 @@ class InMemoryToolExecutor extends ToolExecutor {
       timeLeftMs: timeoutMs,
       runId,
       policy: (this.policy && this.policy.policy) || this.policy || null,
+      // Tenant/workspace isolation scope for the isolated-executor boundary
+      // (secret-free identifiers only; never provider credentials).
+      tenantId: runtimeState.orgId || runtimeState.tenantId || null,
+      projectId: runtimeState.projectId || null,
+      workspaceId: null,
+      isolatedExecutor: options.isolatedExecutor || this.isolatedExecutor || null,
     };
 
     let timeoutTimer = null;
@@ -548,9 +725,9 @@ class InMemoryToolExecutor extends ToolExecutor {
         const e = new Error(`Tool ${toolName} timed out after ${timeoutMs}ms`);
         e.code = 'timeout';
         // Canonical timeout details so the result contract carries
-        // timedOut=true even when the executor-level race (not the handler)
-        // wins. Never reported as test_failure.
-        e.details = { tool: toolName, timedOut: true, timeoutMs, timedOutBy: 'executor-race' };
+        // timedOut/timed_out=true even when the executor-level race (not the
+        // handler) wins. Never reported as test_failure.
+        e.details = { tool: toolName, timedOut: true, timed_out: true, timeoutMs, timedOutBy: 'executor-race' };
         reject(e);
       }, timeoutMs);
       if (timeoutTimer.unref) timeoutTimer.unref();
@@ -582,8 +759,22 @@ class InMemoryToolExecutor extends ToolExecutor {
       // Tool result validation: a tool's self-reported success never
       // overrides actual execution evidence (exit codes, error codes).
       const validated = validateToolOutput(toolName, raw);
+      if (!validated.success) {
+        const failure = new Error(validated.error || `${toolName} reported failure`);
+        failure.code = toolName === 'run_tests' ? 'test_failure' : 'command_failure';
+        failure.details = validated.output;
+        throw failure;
+      }
       const executionResult = this._createResult(toolName, validated.success, validated.output, validated.error, latencyMs, cost, {
         executionId, idempotencyKey, startedAt, approvalId: options.approvalId || null,
+      });
+      // Agent 3 auditability + provenance (additive, secret-free). Every
+      // execution exposes what ran, under which policy/approval, whether
+      // isolated, network mode, duration, and exit code. Repository/tool
+      // content is tagged as DATA, not trusted instructions.
+      this._attachAudit(executionResult, {
+        toolName, raw: validated.output, ctx, approvalId: options.approvalId || null,
+        durationMs: latencyMs, runId,
       });
 
       this.completedKeys.set(idempotencyKey, executionResult);
@@ -618,9 +809,17 @@ class InMemoryToolExecutor extends ToolExecutor {
       const status = code === 'timeout' ? 'timed_out' : code === 'cancelled' ? 'cancelled' : 'failure';
       // Structured error details (command failures) become the output so
       // VERIFY steps can inspect exit codes instead of parsing strings.
-      const errOutput = error && error.details ? error.details : null;
+      // Timeout carries both timedOut and timed_out aliases; it is never
+      // classified as a test failure.
+      const errOutput = error && error.details
+        ? { ...error.details, ...(code === 'timeout' ? { timedOut: true, timed_out: true } : {}) }
+        : null;
       const executionResult = this._createResult(toolName, false, errOutput, String((error && error.message) || error), latencyMs, 0, {
         executionId, idempotencyKey, startedAt, code, status, approvalId: options.approvalId || null,
+      });
+      this._attachAudit(executionResult, {
+        toolName, raw: errOutput, ctx, approvalId: options.approvalId || null,
+        durationMs: latencyMs, runId,
       });
 
       if (this.eventBus) {
@@ -676,6 +875,50 @@ class InMemoryToolExecutor extends ToolExecutor {
     return [...this.inFlight.values()].map((r) => ({ ...r, state: 'unknown' }));
   }
 
+  // Secret-free execution audit + provenance. Answers: what command ran,
+  // under which policy, what approval authorized it, whether isolated,
+  // network mode, duration, exit code — without exposing secrets. Tool and
+  // repository content is tagged as DATA (provenance), never as trusted
+  // instructions.
+  _attachAudit(executionResult, { toolName, raw, ctx = {}, approvalId = null, durationMs = null, runId = null } = {}) {
+    try {
+      const out = raw && typeof raw === 'object' ? raw : {};
+      const isolated = out.isolated === true;
+      const policy = (ctx && ctx.policy) || null;
+      const networkMode = (policy && policy.networkAccess)
+        || (ctx && ctx.networkMode)
+        || 'disabled';
+      const exitCode = Number.isFinite(out.exitCode) ? out.exitCode : null;
+      const timedOut = out.timedOut === true || out.timed_out === true
+        || executionResult.status === 'timed_out';
+      executionResult.isolated = isolated;
+      executionResult.executor = out.executor || (isolated ? 'isolated' : 'local-restricted');
+      if (out.executorVersion) executionResult.executorVersion = String(out.executorVersion).slice(0, 50);
+      executionResult.timedOut = timedOut;
+      executionResult.timed_out = timedOut;
+      executionResult.audit = Isolated.buildExecutionAudit({
+        command: out.command || toolName,
+        args: out.args || [],
+        policy,
+        approvalId,
+        isolated,
+        networkMode,
+        networkAllowlist: (policy && policy.networkAllowlist) || [],
+        durationMs,
+        exitCode,
+        timedOut,
+        tenantId: (ctx && ctx.tenantId) || null,
+        projectId: (ctx && ctx.projectId) || null,
+        runId,
+      });
+      const prov = (toolName === 'read_file' || toolName === 'search_code')
+        ? Provenance.repoDataProvenance(runId, toolName, null)
+        : Provenance.toolOutputProvenance(runId, toolName, null);
+      executionResult.provenance = { ...(executionResult.provenance || {}), ...prov };
+    } catch { /* audit never fails the tool */ }
+    return executionResult;
+  }
+
   _createResult(toolName, success, result, error, latencyMs, cost = 0, extra = {}) {
     // Root-cause fix: gate/policy early-return call sites pass
     // (toolName, success, result, error, latencyMs, extra) with cost omitted,
@@ -705,6 +948,9 @@ class InMemoryToolExecutor extends ToolExecutor {
       code: extra.code,
     });
     // Legacy Session-1 shape preserved alongside the normalized contract.
+    // Timeout is explicit and canonical: success=false, status='timed_out',
+    // timedOut/timed_out=true — never a test failure.
+    const isTimeout = normalized.status === 'timed_out';
     return {
       toolName,
       success: normalized.success,
@@ -719,6 +965,8 @@ class InMemoryToolExecutor extends ToolExecutor {
       success: normalized.success,
       result: normalized.output,
       latencyMs: normalized.durationMs,
+      timedOut: isTimeout,
+      timed_out: isTimeout,
     };
   }
 
@@ -773,6 +1021,10 @@ function validateToolOutput(toolName, raw) {
 module.exports = {
   InMemoryToolExecutor,
   HANDLERS,
+  describeTestCommand,
+  routeCommandExecution,
+  runCommandSandboxed,
+  toIsolatedRequest,
   validateToolOutput,
   MAX_READ_BYTES,
   MAX_FILE_STAT_BYTES,
