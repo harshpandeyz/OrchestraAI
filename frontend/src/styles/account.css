@@ -16,3 +16,7 @@
 .cache-tiles span { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
 .cache-tiles b { font-size: 20px; color: var(--text); }
 @media (max-width: 680px) { .billing-row { grid-template-columns: 1fr auto; } .billing-row small { grid-column: 2; } .cache-tiles { grid-template-columns: 1fr; } .inline-form { align-items: stretch; flex-direction: column; } }
+@media (max-width: 480px) { .econ-grid { grid-template-columns: 1fr; } }
+/* Keyboard visibility + touch targets (product-wide minimums) */
+.account-page button:focus-visible, .command-page button:focus-visible, .o2-intel button:focus-visible { outline: 2px solid var(--accent, #0a85ff); outline-offset: 2px; }
+.account-page .icon-btn, .account-page .o2-btn { min-height: 36px; }
