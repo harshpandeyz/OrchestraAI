@@ -1,0 +1,161 @@
+# OrchestraAI production deployment: API control plane + Postgres (durable
+# source of truth) + Redis (coordination/queue) + isolated sandbox worker.
+#
+# Every infrastructure container here is actually connected to the app:
+#   Postgres <- DATABASE_URL + DATASTORE_PROVIDER=postgres (authoritative
+#     run/tenant/event/snapshot/economics persistence; file fallback REFUSED)
+#   Redis    <- REDIS_URL + QUEUE_PROVIDER=redis (locks, rate limits, durable
+#     job queue; degraded => readiness fails, never silent)
+#   sandbox-worker <- ISOLATED_EXECUTOR_URL (customer code execution; without
+#     it production tool execution fails closed)
+#
+# Start:  POSTGRES_PASSWORD=... SANDBOX_WORKER_TOKEN=... ISOLATED_EXECUTOR_TOKEN=... \
+#         DATA_ENCRYPTION_KEY=... FRONTEND_ORIGIN=https://console.example \
+#         docker compose -f deploy/docker-compose.yml up --build -d
+# No default passwords or public artifact policies anywhere in this file.
+
+x-common-env: &common-env
+  NODE_ENV: production
+
+services:
+  # --- API / control plane ---
+  # Serves UI (frontend/dist) + API on :8787. Stateless: durable state lives
+  # in Postgres; coordination in Redis.
+  api:
+    image: orchestraai
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      <<: *common-env
+      PORT: 8787
+      RUNTIME_MODE: ${RUNTIME_MODE:-auto}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:?FRONTEND_ORIGIN is required in production}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?DATA_ENCRYPTION_KEY is required in production}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      API_TOKEN: ${API_TOKEN:-}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:-}
+      PROVIDER: ${PROVIDER:-openrouter}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api}
+      OPENROUTER_DEFAULT_MODEL: ${OPENROUTER_DEFAULT_MODEL:-}
+      OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-orchestraai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_DEFAULT_MODEL: ${OPENAI_DEFAULT_MODEL:-gpt-4o-mini}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_DEFAULT_MODEL: ${ANTHROPIC_DEFAULT_MODEL:-claude-3-5-haiku-latest}
+      # Production datastore: Postgres is authoritative.
+      DATASTORE_PROVIDER: ${DATASTORE_PROVIDER:-postgres}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required (postgres service below)}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
+      # Production coordination: Redis-backed queue + distributed locks.
+      REDIS_URL: ${REDIS_URL:?REDIS_URL is required (redis service below)}
+      REDIS_REQUIRED: ${REDIS_REQUIRED:-true}
+      QUEUE_PROVIDER: ${QUEUE_PROVIDER:-redis}
+      QUEUE_CONCURRENCY: ${QUEUE_CONCURRENCY:-4}
+      # Isolated execution: the sandbox-worker service on the private network.
+      ISOLATED_EXECUTOR_URL: ${ISOLATED_EXECUTOR_URL:-http://sandbox-worker:8788}
+      ISOLATED_EXECUTOR_TOKEN: ${ISOLATED_EXECUTOR_TOKEN:?ISOLATED_EXECUTOR_TOKEN is required}
+      RUNTIME_DATA_DIR: /var/lib/orchestraai
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - runtime-data:/var/lib/orchestraai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sandbox-worker:
+        condition: service_started
+    networks:
+      - backend
+      - sandbox
+    restart: unless-stopped
+
+  # --- PostgreSQL: authoritative durable datastore ---
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orchestraai
+      POSTGRES_USER: orchestraai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in production}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestraai -d orchestraai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --- Redis: transient coordination (locks, rate limits, durable queue) ---
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Isolated sandbox worker: customer code execution ONLY ---
+  # Runs as non-root, read-only filesystem, capped CPU/memory/processes, no
+  # published ports (reachable only on the private `sandbox` network via the
+  # API using ISOLATED_EXECUTOR_TOKEN). Ephemeral per-request workspaces under
+  # a tmpfs-friendly empty dir; destroyed after every execution.
+  sandbox-worker:
+    build:
+      context: ../sandbox-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      SANDBOX_HOST: 0.0.0.0
+      SANDBOX_PORT: 8788
+      SANDBOX_WORKSPACE_ROOT: /srv/workspaces
+      SANDBOX_WORKER_TOKEN: ${SANDBOX_WORKER_TOKEN:?SANDBOX_WORKER_TOKEN is required in production}
+    networks:
+      - sandbox
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:exec,size=256m,uid=10001,gid=10001,mode=1777
+      - /srv/workspaces:exec,size=512m,uid=10001,gid=10001,mode=700
+    cpus: 1.0
+    mem_limit: 512m
+    mem_reservation: 128m
+    pids_limit: 64
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  # Application + datastores. No external ingress except api:8787.
+  backend:
+    driver: bridge
+    internal: false
+  # API <-> sandbox-worker only. The worker is unreachable from outside.
+  sandbox:
+    driver: bridge
+    internal: true
+
+volumes:
+  runtime-data:
+  postgres-data:
+  redis-data:
