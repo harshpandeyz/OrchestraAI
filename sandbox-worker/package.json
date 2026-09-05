@@ -1,0 +1,11 @@
+{
+  "name": "orchestraai-sandbox-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reference isolated executor for OrchestraAI (POST /v1/execute). Zero dependencies.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC"
+}

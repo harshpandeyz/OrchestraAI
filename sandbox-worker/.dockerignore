@@ -1,0 +1,3 @@
+worker.test.js
+*.log
+.DS_Store
