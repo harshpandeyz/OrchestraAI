@@ -69,7 +69,7 @@ export function CommandPalette() {
     out.push(
       { group: 'Actions', label: 'New Run', sub: 'start a task', shortcut: modN, run: () => dispatch({ type: 'ui/set', patch: { newRunOpen: true, view: 'run' } }) },
       { group: 'Actions', label: 'Focus Composer', sub: 'type a message', shortcut: '/', run: () => { dispatch({ type: 'ui/set', patch: { view: 'run' } }); setTimeout(() => (document.getElementById('prompt') as HTMLTextAreaElement | null)?.focus(), 50); } },
-      { group: 'Actions', label: state.ui.rightOpen ? 'Hide Inspector' : 'Show Inspector', sub: 'toggle panel', run: () => dispatch({ type: 'ui/set', patch: { rightOpen: !state.ui.rightOpen } }) },
+      { group: 'Actions', label: state.ui.rightOpen ? 'Hide Live Intelligence' : 'Show Live Intelligence', sub: 'toggle panel', run: () => dispatch({ type: 'ui/set', patch: { rightOpen: !state.ui.rightOpen } }) },
       { group: 'Actions', label: 'Connect Provider', sub: 'keys, verification, health', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: 'providers' } }) },
       { group: 'Actions', label: 'Runtime Settings', sub: 'presets and defaults', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: 'runtime' } }) },
       { group: 'Actions', label: 'Refresh Model Catalog', sub: 'discover new models', run: () => { dispatch({ type: 'ui/set', patch: { view: 'models' } }); void api.refreshModels().then(() => api.getModels().then(({ models }) => dispatch({ type: 'models/set', models }))).catch(() => {}); } },
