@@ -150,7 +150,7 @@ describe('Center: streaming', () => {
       { id: 't1', role: 'tool', content: 'search: RUNNING — scanning', ts } as any,
       { id: 's1', role: 'assistant', content: 'partial', ts, meta: { streaming: true } } as any,
     ]} /></RuntimeProvider>);
-    expect(screen.getByTestId('execution-activity')).toHaveTextContent(/Running search/);
+    expect(screen.getByTestId('execution-activity')).toHaveTextContent(/running search/i);
   });
 });
 
@@ -194,7 +194,7 @@ describe('Center: run header + states', () => {
     renderWith(baseSnap(), <RunHeader />);
     expect(screen.getByTitle('Fix authentication issue')).toHaveTextContent('Fix authentication issue');
     expect(screen.getByRole('status', { name: 'Run status RUNNING' })).toBeInTheDocument();
-    expect(screen.getByRole('list', { name: 'Runtime progress' })).toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'Mission progress' })).toBeInTheDocument();
     // Hierarchy: a subtle secondary resource summary is allowed in the
     // header; full model/budget/token/latency detail lives in the inspector.
     expect(screen.getByRole('status', { name: 'Run resources' })).toBeInTheDocument();
@@ -350,9 +350,12 @@ describe('Center: runtime journey', () => {
     const states = journeySteps(failed);
     expect(states[4].state).toBe('failed');
   });
-  it('renders the journey strip in the run header', () => {
+  it('renders the mission journey strip in the run header', () => {
     const snap = baseSnap({ status: 'running' });
     renderWith(snap, <RunHeader />);
-    expect(screen.getByRole('list', { name: 'Runtime progress' })).toBeInTheDocument();
+    const journey = screen.getByRole('list', { name: 'Mission progress' });
+    expect(journey).toBeInTheDocument();
+    // Seven truthful stages: Task → Understand → Context → Choose → Execute → Verify → Result.
+    expect(journey.querySelectorAll('[role="listitem"]').length).toBe(7);
   });
 });

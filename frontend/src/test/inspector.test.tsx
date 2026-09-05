@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import React from 'react';
 import { RuntimeProvider, useRuntime } from '../state/store';
 import { useEffect } from 'react';
@@ -32,27 +32,29 @@ function Seed({ children }: { children: React.ReactNode }) {
 }
 
 describe('inspector + layout', () => {
-  it('renders tabbed inspector with live backend data', async () => {
-    const { fireEvent: fire } = await import('@testing-library/react');
+  it('renders the live intelligence surface with live backend data', async () => {
     render(<RuntimeProvider><Seed><RuntimeInspector /></Seed></RuntimeProvider>);
     expect(await screen.findByLabelText('Runtime inspector')).toBeInTheDocument();
-    expect(screen.getByRole('tablist', { name: 'Inspector views' })).toBeInTheDocument();
-    // Overview: outcome story first.
+    // Live surface: model + metrics + approvals visible without tab-hunting.
     expect(screen.getByLabelText('Current model')).toBeInTheDocument();
     expect(screen.getByLabelText('Approvals')).toBeInTheDocument();
+    expect(screen.getByLabelText('Latency')).toBeInTheDocument();
+    expect(screen.getByLabelText('Cost')).toBeInTheDocument();
     expect((await screen.findAllByText(/Nemotron X/)).length).toBeGreaterThan(0);
-    // Decisions tab.
-    fire.click(screen.getByRole('tab', { name: 'Decisions' }));
+    // Progressive disclosure: routing + why + switches expand in place.
+    fireEvent.click(screen.getByRole('button', { name: /expand model routing/i }));
+    expect(await screen.findByLabelText('Model routing')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /expand why this model/i }));
     expect(await screen.findByLabelText('Why this model?')).toBeInTheDocument();
-    expect(screen.getByLabelText('Model routing')).toBeInTheDocument();
-    expect(screen.getByLabelText('Model switches')).toBeInTheDocument();
-    // Evidence tab.
-    fire.click(screen.getByRole('tab', { name: 'Evidence' }));
-    expect(await screen.findByRole('tabpanel')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /expand model switches/i }));
+    expect(await screen.findByLabelText('Model switches')).toBeInTheDocument();
+    // Evidence + changes expand in place.
+    fireEvent.click(screen.getByRole('button', { name: /^expand evidence/i }));
     expect(document.getElementById('sec-evidence')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /expand what changed/i }));
     expect(document.getElementById('sec-changes')).not.toBeNull();
-    // Technical tab.
-    fire.click(screen.getByRole('tab', { name: 'Technical' }));
+    // Trace expands in place.
+    fireEvent.click(screen.getByRole('button', { name: /expand execution trace/i }));
     expect(await screen.findByLabelText('Execution trace')).toBeInTheDocument();
   });
   it('api client exposes typed surface (no scattered fetch)', () => {
@@ -93,9 +95,7 @@ describe('inspector + layout', () => {
       return <>{children}</>;
     }
     r(React.createElement(P, null, React.createElement(Seed2, null, React.createElement(RI, null))));
-    // Switches live under the Decisions tab — select it, then expand.
-    const tab = await scr.findByRole('tab', { name: 'Decisions' });
-    fireEvent.click(tab);
+    // Switches live in the expandable Model switches section — expand it.
     const toggle = await scr.findByRole('button', { name: /expand model switches/i });
     fireEvent.click(toggle);
     expect(await scr.findByText('MODEL SWITCH')).toBeInTheDocument();

@@ -2,7 +2,7 @@ import React, { useEffect } from 'react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { RuntimeProvider, useRuntime } from '../state/store';
-import { humanizeEvent, liveActivity, provenanceLabel, toMilestones } from '../lib/semantics';
+import { effectiveStatus, humanizeEvent, liveActivity, provenanceLabel, toMilestones } from '../lib/semantics';
 import { ExecutionTimeline } from '../components/execution/ExecutionTimeline';
 import { OutcomeCard } from '../components/outcome/OutcomeCard';
 import { EvidencePanel } from '../components/outcome/EvidencePanel';
@@ -72,6 +72,13 @@ describe('semantics: centralized event mapping', () => {
     expect(provenanceLabel('metered (usage × provider pricing)', 'cost').text).toBe('OBSERVED');
     expect(provenanceLabel('demo', 'quality').text).toBe('DEMO');
     expect(provenanceLabel(undefined, 'cost').text).toBe('UNKNOWN');
+  });
+  it('never downgrades a terminal run record with a non-terminal snapshot', () => {
+    expect(effectiveStatus('failed', 'failed')).toBe('failed');
+    expect(effectiveStatus('idle', 'failed')).toBe('failed');
+    expect(effectiveStatus('running', 'running')).toBe('running');
+    expect(effectiveStatus('completed', 'running')).toBe('completed');
+    expect(effectiveStatus(null, null)).toBe('idle');
   });
 });
 
