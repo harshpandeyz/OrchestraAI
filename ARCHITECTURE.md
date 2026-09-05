@@ -1,8 +1,8 @@
-# ARCHITECTURE.md — OrchestraAI Adaptive Agent Runtime (Session 1: Orchestrator + Runtime Core)
+# ARCHITECTURE.md — OrchestraAI Adaptive Agent Runtime and Economic Control Plane
 
 ## Overview
 
-This document describes the architecture of the **Adaptive Agent Runtime** — a production-grade orchestration layer that dynamically optimizes AI agent execution. The orchestrator acts as the control plane, making runtime decisions about model selection, context management, tool usage, budget enforcement, and failure recovery.
+This document describes the architecture of the **Adaptive Agent Runtime** — a production-grade orchestration layer that dynamically optimizes AI agent execution. The orchestrator acts as the control plane, making runtime decisions about model selection, context management, tool usage, budget enforcement, and failure recovery. The current V1 also includes the tenant-scoped API, canonical model-call economics, authenticated SSE console, provider adapters, persistence, and BYOK platform billing described in `README.md` and `CONTRACTS.md`.
 
 ## System Architecture
 
@@ -60,10 +60,12 @@ This document describes the architecture of the **Adaptive Agent Runtime** — a
 |--------|----------------|
 | `runtime-state.js` | `RuntimeState` aggregate + all sub-states (Task, Model, Context, Memory, Tools, Budget, Execution, Policy) |
 
-### Events (`src/events/`)
+### Events (`src/events/`, `src/services/sse-service.js`)
 | Module | Responsibility |
 |--------|----------------|
-| `event-bus.js` | Append-only event log per run, SSE streaming, replay buffer |
+| `event-bus.js` | Sequenced SSE bus: replay via `?since=`, gap detection, bounded buffers, subscriber lifecycle |
+| `event-contract.js` | Canonical wire-event vocabulary + envelope shape (enforced against the console by test) |
+| `sse-service.js` | HTTP serving of run streams: framing, replay, gap frames, live subscription |
 
 ### Decisions (`src/decisions/`)
 | Module | Responsibility |
@@ -84,7 +86,8 @@ This document describes the architecture of the **Adaptive Agent Runtime** — a
 ### Checkpoint (`src/checkpoint/`)
 | Module | Responsibility |
 |--------|----------------|
-| `checkpoint-manager.js` | `ExecutionCheckpoint`, `CheckpointManager`, `RecoveryManager` with idempotency keys |
+| `checkpoint-manager.js` | Versioned `ExecutionCheckpoint` (schema version, integrity hash, control snapshot), `CheckpointManager`, `RecoveryManager` with validation + shared `planRecovery` semantics |
+| `src/core/recovery-service.js` | Authoritative run-level recovery: validate → inspect last side effect → consult idempotency → restore cursor/state → resume. Used by manual retry and (via the same `planRecovery` rules) restart reconciliation |
 
 ### Telemetry (`src/telemetry/`)
 | Module | Responsibility |
@@ -94,16 +97,16 @@ This document describes the architecture of the **Adaptive Agent Runtime** — a
 ### Interfaces (`src/interfaces/`)
 | Module | Responsibility |
 |--------|----------------|
-| `index.js` | Abstract base classes for all pluggable components (Session 2–4 integration points) |
+| `index.js` | Abstract base classes for all pluggable runtime components |
 
 ### Implementations (`src/impl/`)
 | Module | Responsibility |
 |--------|----------------|
-| `model-registry.js` | In-memory model catalog with health/price simulation |
+| `model-registry.js` | Model catalog with health, capability, and immutable pricing metadata |
 | `model-router.js` | Scoring-based routing with switching cost awareness |
 | `context-manager.js` | Context building, compression, relevance scoring |
 | `memory-manager.js` | Working + long-term memory with eviction |
-| `cache-manager.js` | In-memory cache with hit/miss tracking, prefix invalidation |
+| `cache-manager.js` | Run-local and tenant/project-scoped cache with hit/miss tracking and invalidation |
 | `tool-registry.js` | Tool catalog with health monitoring |
 | `tool-executor.js` | Sequential + parallel tool execution with validation |
 
@@ -137,11 +140,31 @@ CREATED → PLANNING → CONTEXT_BUILD → MODEL_SELECT → EXECUTING
 | WAITING_FOR_TOOL | EXECUTING, RETRYING, FAILED, CANCELLED |
 | OBSERVING | EXECUTING, REOPTIMIZING, COMPLETED, FAILED, CANCELLED |
 | REOPTIMIZING | EXECUTING, MODEL_SELECT, CONTEXT_BUILD, FAILED, CANCELLED |
-| RETRYING | EXECUTING, FAILED, CANCELLED |
+| RETRYING | EXECUTING, PLANNING, FAILED, CANCELLED |
 | PAUSED | EXECUTING, CANCELLED |
-| COMPLETED | (terminal) |
+| COMPLETED | RETRYING (same-run continuation episodes only) |
 | FAILED | RETRYING, CANCELLED |
 | CANCELLED | (terminal) |
+
+### Recovery (checkpoint-based resume, not re-run)
+
+```
+failure → load last COMPLETED checkpoint → validate (schema/version/run/freshness/integrity)
+  → restore runtime + conversation state → set cursor to last completed step
+  → inspect last tool side effect → consult idempotency records
+  → plan: resume | retry_step | skip_completed | ask_user | mark_unknown | unrecoverable
+  → resume from cursor (budget, tokens, event seq preserved) → new checkpoint → finalize
+```
+
+- `resume`: nothing in flight; continue after the cursor.
+- `retry_step`: in-flight tool is idempotent/read-only; safe to re-run.
+- `skip_completed`: idempotency proves the side effect finished; never re-execute.
+- `ask_user` / `mark_unknown`: destructive or ambiguous outcome; the run stays
+  FAILED with `execution.recovery_blocked` (auditable, operator-resolvable).
+- `unrecoverable`: no valid checkpoint and unsafe to restart blindly.
+- Concurrent retries are serialized (exactly one winner); step numbers and
+  step-scoped idempotency keys never reset, so retries cannot duplicate
+  irreversible tool calls or double-count economics.
 
 ## Data Flow
 
@@ -300,21 +323,21 @@ Every significant action emits a telemetry event with runId, stepId, model, toke
 ### 7. Cheap Deterministic Checks First
 Orchestrator evaluates budget/latency/context/model health synchronously before invoking expensive routing/optimization.
 
-## Assumptions
+## Operational assumptions
 
-1. **Single-threaded orchestrator per run** — no distributed consensus needed
-2. **In-memory implementations** for Session 1 — Session 2/3 provide production backends
-3. **SSE for real-time events** — frontend consumes via EventSource
-4. **Deterministic idempotency keys** — `{runId}:{operation}:{stepNumber}` format
-5. **Cost estimation** uses provider pricing snapshots — actual costs recorded post-execution
+1. **Single-process runtime** — runs are isolated in memory while active; the V1 deployment does not provide distributed execution or consensus.
+2. **Atomic JSON persistence** — tenant records, terminal run summaries, economics, intelligence and audit data use the configured runtime data directory. Event replay is an in-memory per-run buffer.
+3. **SSE for real-time events** — the frontend consumes authenticated snapshots plus replayable `EventSource` streams.
+4. **Deterministic idempotency keys** — `{runId}:{operation}:{stepNumber}` is used for runtime mutations and paid-side-effect guards.
+5. **Cost estimation is forecasting** — pre-call estimates are not actual spend; canonical post-call economics use provider usage/cost or an immutable captured pricing snapshot.
 
-## Known Limitations
+## Current V1 boundaries
 
-1. **No distributed execution** — single process, single run at a time per process
-2. **No persistent storage** — state lost on restart (Session 3 adds persistence)
-3. **Mock model execution** — `InMemoryToolExecutor` simulates tool calls
-4. **No authentication/authorization** — assumes trusted environment
-5. **Limited parallel tool execution** — basic Promise.all with concurrency limit
+1. **No distributed execution** — concurrent runs are supported within one process, but horizontal coordination is outside this V1.
+2. **In-flight recovery is unsupported** — terminal summaries survive restart; interrupted active runs are marked failed and are not silently resumed.
+3. **Execution tools are restricted in production** — safe read-only tools may run inside tenant-scoped workspaces; high-risk shell, patch, git, network and browser automation are denied unless a separately isolated executor is provided.
+4. **Production authentication fails closed** — sessions/bearer tokens and tenant ownership checks protect private APIs; a production `DATA_ENCRYPTION_KEY` is required for stored provider credentials.
+5. **Tool concurrency is bounded** — parallel work uses an explicit concurrency limit and does not imply durable distributed scheduling.
 
 ## Performance Characteristics
 
@@ -342,7 +365,7 @@ Covers all 15 required scenarios:
 8. Cache invalidation
 9. Tool failure
 10. Retry
-11. Checkpoint/resume
+11. Checkpoint/idempotency semantics (durable resume is not promised)
 12. Duplicate event/idempotency
 13. Model oscillation prevention
 14. Concurrent tool completion

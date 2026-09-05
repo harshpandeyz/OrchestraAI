@@ -1,4 +1,4 @@
-# CONTEXT_MEMORY_CACHE.md — Session 3 surface consumed by the console
+# CONTEXT_MEMORY_CACHE.md — Context, memory, and cache surface
 
 - Context snapshot: `context.usedTokens/windowTokens`, `segments[]` (percent composition), `items[]` with `status: KEEP|COMPRESSED|ARCHIVED|REMOVED`, each `{ id, kind, title, source, tokens, relevance }`.
 - Compression appears as `context.compressed` events `{ reclaimedTokens, items }`; frontend only visualizes.

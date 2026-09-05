@@ -1,6 +1,28 @@
-# CONTRACTS.md — Session 1 Interfaces for Sessions 2, 3, 4
+# CONTRACTS.md — OrchestraAI V1 Interfaces
 
-This document defines the exact contracts that **Session 2 (Model Intelligence)**, **Session 3 (Context/Memory/Cache)**, and **Session 4 (Frontend)** must implement or consume.
+This document defines the shared contracts implemented and consumed by the OrchestraAI V1 runtime and console.
+
+> Current V1 note: these interfaces are now implemented by the zero-dependency
+> runtime in `backend/` and the React console in `frontend/`. The current
+> commercial source of truth is the canonical model-call economic record, not
+> telemetry reconstruction. Historical interface names remain here for
+> compatibility with the existing tests and integrations.
+
+## Current V1 economics contract
+
+Each provider call and local cache hit produces one durable economic record with
+provider/model identity, request IDs, authoritative usage when returned,
+captured immutable pricing, provider/calculated/canonical cost, cost source,
+latency, and cache provenance. A local response-cache hit has no provider call
+and canonical provider inference cost `$0`.
+
+Savings use the explicit project/run reference model and its pricing snapshot;
+the reference model is never silently selected from the strongest catalog
+entry. `calculationStatus` is `verified_modeled`, `insufficient_data`, or
+`incomplete`; `economicOutcome` is `saved`, `unchanged`, or `cost_increase` when
+calculation is verified, and is null otherwise. Modeled values are not invoice
+reconciliation. Billing consumes the SavingsEngine result and applies the
+configured platform fee once.
 
 ---
 
@@ -423,6 +445,17 @@ interface ToolStateSnapshot {
 | `/api/runs/:id/cancel` | POST | `{ run: RunSummary }` |
 | `/api/runs/:id/retry` | POST | `{ accepted: true }` |
 | `/api/runs/:id/telemetry` | GET | `{ telemetry: { events: [], metrics: [] } }` |
+| `/api/runs/:id/execution` | GET | `{ execution: ExecutionView }` (plan/approvals/episodes/changes/files/tests; works for terminal history) |
+| `/api/runs/:id/continue` | POST | `{ accepted, episodeId }` — body: `{ content }` (same-run new episode; resurrects COMPLETED) |
+| `/api/runs/:id/approvals` | GET | `{ approvals: Approval[] }` |
+| `/api/runs/:id/approvals` | POST | `{ approval }` — body: `{ actionType, title, params, ... }` |
+| `/api/runs/:id/approvals/:aid/approve\|deny\|cancel` | POST | `{ ok, approval }` (single-use, expiring) |
+| `/api/runs/:id/plan` | GET/POST | `{ plan }` (executable DAG; readiness = PENDING + deps COMPLETE) |
+| `/api/runs/:id/changesets` | GET/POST | `{ changesets }` / `{ changeset }` (dry-run propose; atomic hash-verified apply) |
+| `/api/runs/:id/changesets/:cid/apply\|rollback` | POST | `{ ok, ... }` (approval-gated apply) |
+| `/api/runs/:id/verify` | POST | `{ ok, records }` (diff + tests evidence) |
+| `/api/runs/:id/episodes` | GET | `{ episodes }` (parent-linked, same run) |
+| `/api/runs/:id/result` | GET | `{ result }` (TASK_COMPLETED vs MODEL_STOPPED, honest verification state) |
 
 #### RunSummary
 ```typescript
@@ -453,13 +486,17 @@ interface RuntimeStateSnapshot {
   tools: ToolStateSnapshot[];
   cost: { spentUsd: number, budgetUsd: number, projectedUsd: number, breakdown: CostBreakdownItem[] };
   latency: { currentStepMs: number, avgStepMs: number, modelMs: number, toolMs: number, totalMs: number, samples: number[] };
-  routing: { currentId: string, candidates: ScoredCandidate[], decision: Decision | null };
+  routing: { currentId: string, candidates: ScoredCandidate[], decision: Decision | null, explanation?: string | null, tradeoff?: string | null, counterfactuals?: unknown[], taskProfile?: unknown, inputsHash?: string | null, policyVersion?: string | null };
   trace: { seq: number, ts: string, type: string, label: string, status: string, durationMs?: number, costUsd?: number }[];
   decisions: Decision[];
   changes: { seq: number, ts: string, kind: 'added' | 'removed' | 'updated' | 'retained', label: string }[];
   messages: { id: string, role: 'user' | 'assistant' | 'tool' | 'system', content: string, ts: string, meta?: object }[];
+  execution: ExecutionView | null; // plan/pendingApprovals(episodes/changes/files/tests/waitingForApproval/toolHealth/constraints — accurate state, never fakes
+  intelligence: { versions, taskProfile, outcome: { taskSuccess, overallScore, confidence, reasons } } | null;
 }
 ```
+
+Session 3 event vocabulary (extends the canonical dotted names): `plan.created/updated`, `tool.approval_required/approved/denied/timed_out`, `approval.requested/decided`, `changeset.created/approval_required/applied/rolled_back`, `verification.started/passed/failed`, `episode.started/completed`, `execution.recovery_started/recovered/recovery_blocked`. Tool timeout contract: `{ status: 'timed_out', success: false, timedOut: true }` — never `test_failure`. Browser capability: category `browser` exists with `available: false` (disabled; calls rejected honestly).
 
 ### SSE Event Stream
 
@@ -477,7 +514,7 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 
 **Keepalive**: `: ping\n\n` every 15 seconds
 
-**Resync**: Client calls `GET /api/runs/:id/state` → gets `lastSeq` → reconnects with `?since=<lastSeq>`
+**Resync**: Client calls `GET /api/runs/:id/state` → gets `lastSeq` → reconnects with `?since=<lastSeq>`. If replay reports an event gap, the client automatically fetches a fresh snapshot before resuming so missing deltas cannot silently corrupt the view.
 
 **Freshness**: Frontend marks:
 - `LIVE` — stream open, last event < 30s ago
@@ -546,7 +583,7 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 | Tool catalog | Session 3 (ToolRegistry) | Session 1, 4 | Session 3 only |
 | Tool executions | Session 3 (ToolExecutor) | Session 1, 4 | Session 3 only |
 | Cost estimates | Session 2 (CostEstimator) | Session 1, 4 | Session 2 only |
-| Actual costs | Session 1 (Orchestrator) | Session 4 | Session 1 only |
+| Canonical model-call economics | `backend/src/economics/` + SavingsEngine | Runtime, analytics, billing, frontend | Runtime finalization only |
 | RuntimeState | Session 1 (Orchestrator) | Session 4 | Session 1 only |
 | Decisions | Session 1 (DecisionEngine) | Session 4 | Session 1 only |
 | Checkpoints | Session 1 (CheckpointManager) | Session 1 | Session 1 only |
@@ -554,7 +591,15 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 
 ---
 
-## Integration Checklist for Session 2
+## Historical staged checklists
+
+The following checklists document the original staged interface scope. They are
+kept as compatibility context, not as a release gate. V1 intentionally uses
+single-process atomic JSON persistence, bounded in-memory cache behavior, and
+lexical retrieval; it does not require Redis, embeddings, or distributed
+infrastructure.
+
+### Session 2 checklist
 
 - [ ] Implement `ModelRegistry` with persistent storage
 - [ ] Implement `ModelRouter` with production scoring algorithm
@@ -564,7 +609,7 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 - [ ] Register models with all required fields (including `cachedPer1k`)
 - [ ] Support capability-based filtering
 
-## Integration Checklist for Session 3
+### Session 3 checklist
 
 - [ ] Implement `ContextManager` with vector search / RAG
 - [ ] Implement `MemoryManager` with persistent storage + embeddings
@@ -575,7 +620,7 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 - [ ] Handle `task.created` → warm cache with relevant context
 - [ ] Handle `execution.step_completed` → write important results to memory
 
-## Integration Checklist for Session 4
+### Session 4 checklist
 
 - [ ] Consume `/api/runs/:id/state` for initial snapshot
 - [ ] Consume `/api/runs/:id/events` SSE stream for live updates

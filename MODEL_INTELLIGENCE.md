@@ -1,4 +1,4 @@
-# MODEL_INTELLIGENCE.md — Session 2 surface consumed by the console
+# MODEL_INTELLIGENCE.md — Model intelligence surface consumed by the console
 
 - `GET /api/models` returns the registry. Frontend MUST NOT hard-code a catalog; render only this.
 - Routing: backend owns scoring (`quality, cost, latency, reliability, contextFit, switchCost`).
