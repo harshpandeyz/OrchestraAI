@@ -197,8 +197,10 @@ function evaluateOutcome(input = {}) {
   //   can decide failure, but positive feedback alone NEVER proves success
   //   (stays null/unknown — weak evidence + thumbs-up is not verification).
   let taskSuccess = null;
+  let conflicted = false;
   const requiredFailed = evaluated.some((c) => c.required && c.status === 'failed');
   const requiredPassed = required.length > 0 && required.every((c) => !c.required || c.status === 'passed');
+  const requiredPending = evaluated.some((c) => c.required && c.status !== 'passed' && c.status !== 'failed');
   let objective = null;
   if (requiredFailed || (testEvidence && testEvidence.failed > 0 && (s.strictTests !== false))) {
     objective = false;
@@ -209,10 +211,10 @@ function evaluateOutcome(input = {}) {
   const fbNeg = !!(userSignal && userSignal.signal === 'negative');
   const fbPos = !!(userSignal && userSignal.signal === 'positive');
   if (objective === false) {
-    if (fbPos && fbConf >= 0.8) taskSuccess = null; // conflict: user loves it but tests fail
+    if (fbPos && fbConf >= 0.8) { taskSuccess = null; conflicted = true; } // conflict: user loves it but tests fail
     else taskSuccess = false;
   } else if (objective === true) {
-    if (fbNeg && fbConf >= 0.7) taskSuccess = null; // conflict: tests pass but user strongly disagrees
+    if (fbNeg && fbConf >= 0.7) { taskSuccess = null; conflicted = true; } // conflict: tests pass but user strongly disagrees
     else taskSuccess = true;
   } else if (fbNeg && fbConf >= 0.3) {
     taskSuccess = false;
@@ -221,6 +223,17 @@ function evaluateOutcome(input = {}) {
   } else {
     taskSuccess = null;
   }
+
+  // Explicit outcome status. A finished assistant response (completed=true)
+  // is NOT automatically task success — success requires objective evidence.
+  // executionCompleted tracks the run lifecycle separately from taskSuccess.
+  const executionCompleted = s.completed === true;
+  let status;
+  if (taskSuccess === true) status = 'succeeded';
+  else if (taskSuccess === false) status = 'failed';
+  else if (conflicted) status = 'conflicted';
+  else if (requiredPending || (executionCompleted && !testEvidence && !(byType.tool_result || []).length && !userSignal)) status = 'verification_required';
+  else status = 'unknown';
 
   const reasons = [];
   if (s.completed) reasons.push({ factor: 'completion', detail: 'run reached COMPLETED' });
@@ -241,6 +254,11 @@ function evaluateOutcome(input = {}) {
     modelId: input.modelId || s.modelId || null,
     taskCategory: input.taskCategory || s.taskCategory || 'general',
     taskSuccess, // true | false | null (unknown)
+    // Explicit outcome semantics: execution completed vs task succeeded /
+    // failed / unknown / conflicted / verification required.
+    status, // 'succeeded' | 'failed' | 'unknown' | 'conflicted' | 'verification_required'
+    executionCompleted, // run reached COMPLETED (lifecycle fact, not success)
+    conflicted, // contradictory evidence needs review before learning
     correctnessScore,
     completenessScore,
     evidenceScore: evidence.length ? Math.min(1, evidence.length / 5) : null,
