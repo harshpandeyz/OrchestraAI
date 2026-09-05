@@ -396,6 +396,10 @@ const BLOCKED_V6 = [
   ['fc00::', 7, 'unique-local'], ['ff00::', 8, 'multicast'], ['2001:db8::', 32, 'documentation'],
   ['::ffff:0:0', 96, 'ipv4-mapped'], ['2002::', 16, '6to4-transition'], ['2001::', 32, 'teredo-transition'],
   ['64:ff9b::', 96, 'translation'], ['100::', 64, 'discard'],
+  // WHATWG URL canonicalizes IPv4-compatible literals such as
+  // `::192.168.1.1` to an address in ::/96. They are deprecated and must not
+  // provide a way around the IPv4 private-range checks.
+  ['::', 96, 'ipv4-compatible'],
 ];
 
 // Returns null when public, otherwise a short reason string.
@@ -413,10 +417,10 @@ function blockedIpReason(ip) {
     for (const [base, bits, reason] of BLOCKED_V6) {
       if (ipv6InCidr(n, base, bits)) {
         // IPv4-mapped: also judge the embedded address on its own merits.
-        if (reason === 'ipv4-mapped') {
+        if (reason === 'ipv4-mapped' || reason === 'ipv4-compatible') {
           const inner = `${(n >> 24n) & 255n}.${(n >> 16n) & 255n}.${(n >> 8n) & 255n}.${n & 255n}`;
           const innerReason = blockedIpReason(inner);
-          return innerReason ? `ipv4-mapped-${innerReason}` : 'ipv4-mapped';
+          return innerReason ? `${reason}-${innerReason}` : reason;
         }
         return reason;
       }
@@ -442,6 +446,7 @@ function normalizeHostname(raw) {
 function blockedHostnameReason(host) {
   const h = normalizeHostname(host);
   if (!h) return 'empty-host';
+  if (h.includes('..')) return 'double-dot-hostname';
   if (BLOCKED_HOSTNAMES.has(h)) return 'blocked-hostname';
   for (const sfx of BLOCKED_SUFFIXES) {
     if (h === sfx.slice(1) || h.endsWith(sfx)) return 'private-suffix';
@@ -467,6 +472,14 @@ function parseAndGuardUrl(raw, policy) {
   }
   const host = normalizeHostname(u.hostname);
   if (!host) throw Object.assign(new Error('URL has no hostname'), { code: 'bad_params' });
+  // Block URL pathname traversal: .. or %2e%2e or %252e%252e in path.
+  // Check both the parsed pathname and the raw URL string (the parser may
+  // decode %2e%2e to .., so we need to check the original string too).
+  const path = u.pathname || '';
+  const rawHasTraversal = raw.includes('..') || raw.includes('%2e%2e') || raw.includes('%252e%252e') || raw.includes('%2f') || raw.includes('@');
+  if (path.includes('..') || path.includes('%2e%2e') || path.includes('%252e%252e') || rawHasTraversal) {
+    throw Object.assign(new Error('blocked URL pathname traversal (..)'), { code: 'denied' });
+  }
   // Literal IPs are judged by range, not by string prefix (catches
   // 0x7f.1, 0177.0.0.1-style obfuscation only insofar as URL parses them;
   // the DNS gate below re-checks whatever the resolver returns).

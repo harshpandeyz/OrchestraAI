@@ -287,7 +287,17 @@ const GIT_WRITE = new Set(['add', 'commit', 'branch']);
 const GIT_HIGH_RISK = new Set(['push', 'reset', 'clean', 'checkout']);
 
 function gitEnv() {
-  return { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
+  // Git is a trusted binary, but there is no reason to hand provider secrets
+  // to any child process. Preserve the host environment git needs (HOME,
+  // PATH, GIT_* knobs) while stripping secret-looking keys.
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
+  try {
+    const { SECRET_ENV_RE } = require('./sandbox-env');
+    for (const k of Object.keys(env)) {
+      if (SECRET_ENV_RE.test(k)) delete env[k];
+    }
+  } catch { /* sanitization advisory; git still runs */ }
+  return env;
 }
 
 function runGit(workspace, args, { timeoutMs = 10000, maxBytes = 32 * 1024 } = {}) {
