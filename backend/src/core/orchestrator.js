@@ -424,7 +424,7 @@ class Orchestrator {
 
   // ---------- lifecycle ----------
 
-  async createRun(taskObjective, config = {}) {
+async createRun(taskObjective, config = {}) {
     // Concurrency guard: bounded live runs (DoS protection).
     const liveCount = this.activeRuns.size;
     const maxConcurrent = (this.config.maxConcurrentRuns) || 20;
@@ -531,7 +531,7 @@ class Orchestrator {
       deadlineTimer: null,
       mode: config.mode || this.config.mode,
       providerId: resolved.provider,
-      providerModel: null, // resolved registry model definition for the active model
+      providerModel: null, // resolved model definition for the active model
       messages: [],
       history: [], // provider conversation turns [{role, content, name?}]
       trace: [],
@@ -564,7 +564,7 @@ class Orchestrator {
     if (this.modelRegistry && typeof this.modelRegistry.getModels === 'function') {
       try {
         const models = await this.modelRegistry.getModels();
-      for (const m of models) {
+        for (const m of models) {
           runtimeState.model.setPricing(m.id, { inputPer1k: m.inputPer1k, outputPer1k: m.outputPer1k, cachedPer1k: m.cachedPer1k });
         }
         if (runtimeState.referenceModelId && typeof this.modelRegistry.getPricing === 'function') {
@@ -588,6 +588,256 @@ class Orchestrator {
 
     this.log.info('run created', { runId: runtimeState.runId, taskType: runtimeState.task.taskType, mode: this.config.mode });
     return runtimeState;
+  }
+
+  // ---------- run fork / duplicate (Session 5) ----------
+
+  async forkRun(runId) {
+    const src = this.activeRuns.get(runId);
+    if (!src) throw Object.assign(new Error(`Run ${runId} not found`), { code: 'not_found' });
+    if (TERMINAL.has(src.status)) throw Object.assign(new Error(`Cannot fork a terminal run (${src.status})`), { code: 'terminal' });
+
+    // Build a new run config from the source, preserving key settings.
+    const newConfig = {
+      mode: src.config.mode || this.config.mode,
+      provider: src.config.provider,
+      taskMode: src.config.taskType || 'general',
+      maxSteps: src.config.maxSteps,
+      maxToolCalls: src.config.maxToolCalls,
+      maxRetries: src.config.maxRetries,
+      defaultBudgetUsd: src.config.defaultBudgetUsd,
+      defaultMaxContextTokens: src.config.defaultMaxContextTokens,
+      runTimeoutMs: src.config.runTimeoutMs,
+      optimizationInterval: this.config.optimizationInterval,
+      maxToolCallsTotal: this.config.maxToolCallsTotal,
+      contextCompressionThreshold: this.config.contextCompressionThreshold,
+      budgetWarningThreshold: this.config.budgetWarningThreshold,
+    };
+
+    const title = `Fork of ${src.task.objective}`.slice(0, 200);
+    const forkConfig = {
+      title,
+      taskMode: newConfig.taskMode,
+      budget: newConfig.defaultBudgetUsd,
+      maxCost: newConfig.defaultBudgetUsd,
+      maxLatencyMs: newConfig.runTimeoutMs,
+      maxContextTokens: newConfig.defaultMaxContextTokens,
+      policy: {
+        allowSwitching: src.policy.allowSwitching ?? newConfig.allowSwitching ?? this.config.allowSwitching ?? true,
+        allowCompaction: src.policy.allowCompaction ?? newConfig.allowCompaction ?? this.config.allowCompaction ?? true,
+        qualityFloor: src.policy.qualityFloor,
+        latencyTargetMs: src.policy.latencyTargetMs,
+        hardBudget: src.policy.hardBudget,
+      },
+      tools: [],
+      memory: {
+        working: src.memory.working.length ? src.memory.working.slice(0, 20) : [],
+        longterm: src.memory.longterm.length ? src.memory.longterm.slice(0, 50) : [],
+      },
+    };
+
+    // Clear transient per-run state that shouldn't cross fork boundaries.
+    const runtimeState = new RuntimeState(forkConfig.title, forkConfig);
+    runtimeState.task.taskType = newConfig.taskMode;
+    runtimeState.task.objective = src.task.objective;
+    runtimeState.status = TaskStatus.CREATED;
+    runtimeState.updatedAt = new Date().toISOString();
+
+    // Copy over model pricing from the source registry.
+    if (this.modelRegistry && typeof this.modelRegistry.getModels === 'function') {
+      try {
+        const models = await this.modelRegistry.getModels();
+        for (const m of models) {
+          runtimeState.model.setPricing(m.id, { inputPer1k: m.inputPer1k, outputPer1k: m.outputPer1k, cachedPer1k: m.cachedPer1k });
+        }
+      } catch { /* best-effort */ }
+    }
+
+    // Preserve the active model if it still exists in the registry.
+    if (src.model.currentModel) {
+      const def = this.modelRegistry?.getModels?.()?.find((m) => m.id === src.model.currentModel);
+      if (def) {
+        runtimeState.model.setCurrentModel(src.model.currentModel, def.provider || null, 'Forked from parent run');
+        runtimeState.model.modelContextLimit = def?.contextWindow || 0;
+        runtimeState.model.setPricing(def.id, { inputPer1k: def.inputPer1k, outputPer1k: def.outputPer1k, cachedPer1k: def.cachedPer1k });
+      }
+    }
+
+    this.activeRuns.set(runtimeState.runId, runtimeState);
+    if (typeof eventBus.setPrivacyMode === 'function') {
+      eventBus.setPrivacyMode(runtimeState.runId, runtimeState.privacyMode);
+    }
+    const ctrlRecord = {
+      policyEngine: new PolicyEngine(runtimeState.policy, this.config),
+      machine: new StateMachine(TaskStatus.CREATED),
+      abort: false,
+      abortController: new AbortController(),
+      running: false,
+      startedAt: Date.now(),
+      deadlineTimer: null,
+      mode: newConfig.mode || this.config.mode,
+      providerId: newConfig.provider,
+      providerModel: null,
+      messages: [],
+      history: [],
+      trace: [],
+      decisions: [],
+      changes: [],
+      latency: { currentStepMs: 0, avgStepMs: 0, modelMs: 0, toolMs: 0, totalMs: 0, samples: [], modelSamples: [], toolSamples: [] },
+      series: [],
+      tokens: { input: 0, output: 0, cached: 0, reasoning: 0 },
+      routing: { candidates: [], decision: null },
+      lastPromptTokens: 0,
+      lastUserMessage: '',
+      heuristicToolUsed: false,
+      toolCalls: 0,
+      retries: 0,
+      triedModels: new Set(),
+      completedCheckpoints: 0,
+      lastToolEffect: null,
+      toolRiskCache: new Map(),
+      recoveryInProgress: false,
+    };
+    this.runControl.set(runtimeState.runId, ctrlRecord);
+
+    this._emit(runtimeState.runId, EventType.TASK_CREATED, {
+      runId: runtimeState.runId,
+      title: runtimeState.task.objective,
+      taskType: runtimeState.task.taskType,
+    });
+
+    this.telemetry.recordEvent(runtimeState.runId, new TelemetryEvent(
+      runtimeState.runId, EventType.TASK_CREATED,
+      { runId: runtimeState.runId, title: runtimeState.task.objective },
+      { status: 'success' }
+    ));
+
+    this.log.info('run forked', { runId: runtimeState.runId, sourceRunId: runId });
+    return runtimeState.runId;
+  }
+
+  async duplicateRun(runId) {
+    const src = this.activeRuns.get(runId);
+    if (!src) throw Object.assign(new Error(`Run ${runId} not found`), { code: 'not_found' });
+    if (TERMINAL.has(src.status)) throw Object.assign(new Error(`Cannot duplicate a terminal run (${src.status})`), { code: 'terminal' });
+
+    // Build a new run config from the source, preserving key settings.
+    const newConfig = {
+      mode: src.config.mode || this.config.mode,
+      provider: src.config.provider,
+      taskMode: src.config.taskType || 'general',
+      maxSteps: src.config.maxSteps,
+      maxToolCalls: src.config.maxToolCalls,
+      maxRetries: src.config.maxRetries,
+      defaultBudgetUsd: src.config.defaultBudgetUsd,
+      defaultMaxContextTokens: src.config.defaultMaxContextTokens,
+      runTimeoutMs: src.config.runTimeoutMs,
+      optimizationInterval: this.config.optimizationInterval,
+      maxToolCallsTotal: this.config.maxToolCallsTotal,
+      contextCompressionThreshold: this.config.contextCompressionThreshold,
+      budgetWarningThreshold: this.config.budgetWarningThreshold,
+    };
+
+    const title = `Duplicate of ${src.task.objective}`.slice(0, 200);
+    const dupConfig = {
+      title,
+      taskMode: newConfig.taskMode,
+      budget: newConfig.defaultBudgetUsd,
+      maxCost: newConfig.defaultBudgetUsd,
+      maxLatencyMs: newConfig.runTimeoutMs,
+      maxContextTokens: newConfig.defaultMaxContextTokens,
+      policy: {
+        allowSwitching: src.policy.allowSwitching ?? newConfig.allowSwitching ?? this.config.allowSwitching ?? true,
+        allowCompaction: src.policy.allowCompaction ?? newConfig.allowCompaction ?? this.config.allowCompaction ?? true,
+        qualityFloor: src.policy.qualityFloor,
+        latencyTargetMs: src.policy.latencyTargetMs,
+        hardBudget: src.policy.hardBudget,
+      },
+      tools: [],
+      memory: {
+        working: src.memory.working.length ? src.memory.working.slice(0, 20) : [],
+        longterm: src.memory.longterm.length ? src.memory.longterm.slice(0, 50) : [],
+      },
+    };
+
+    // Clear transient per-run state that shouldn't cross duplicate boundaries.
+    const runtimeState = new RuntimeState(dupConfig.title, dupConfig);
+    runtimeState.task.taskType = newConfig.taskMode;
+    runtimeState.task.objective = src.task.objective;
+    runtimeState.status = TaskStatus.CREATED;
+    runtimeState.updatedAt = new Date().toISOString();
+
+    // Copy over model pricing from the source registry.
+    if (this.modelRegistry && typeof this.modelRegistry.getModels === 'function') {
+      try {
+        const models = await this.modelRegistry.getModels();
+        for (const m of models) {
+          runtimeState.model.setPricing(m.id, { inputPer1k: m.inputPer1k, outputPer1k: m.outputPer1k, cachedPer1k: m.cachedPer1k });
+        }
+      } catch { /* best-effort */ }
+    }
+
+    // Preserve the active model if it still exists in the registry.
+    if (src.model.currentModel) {
+      const def = this.modelRegistry?.getModels?.()?.find((m) => m.id === src.model.currentModel);
+      if (def) {
+        runtimeState.model.setCurrentModel(src.model.currentModel, def.provider || null, 'Duplicated from parent run');
+        runtimeState.model.modelContextLimit = def?.contextWindow || 0;
+        runtimeState.model.setPricing(def.id, { inputPer1k: def.inputPer1k, outputPer1k: def.outputPer1k, cachedPer1k: def.cachedPer1k });
+      }
+    }
+
+    this.activeRuns.set(runtimeState.runId, runtimeState);
+    if (typeof eventBus.setPrivacyMode === 'function') {
+      eventBus.setPrivacyMode(runtimeState.runId, runtimeState.privacyMode);
+    }
+    const ctrlRecord = {
+      policyEngine: new PolicyEngine(runtimeState.policy, this.config),
+      machine: new StateMachine(TaskStatus.CREATED),
+      abort: false,
+      abortController: new AbortController(),
+      running: false,
+      startedAt: Date.now(),
+      deadlineTimer: null,
+      mode: newConfig.mode || this.config.mode,
+      providerId: newConfig.provider,
+      providerModel: null,
+      messages: [],
+      history: [],
+      trace: [],
+      decisions: [],
+      changes: [],
+      latency: { currentStepMs: 0, avgStepMs: 0, modelMs: 0, toolMs: 0, totalMs: 0, samples: [], modelSamples: [], toolSamples: [] },
+      series: [],
+      tokens: { input: 0, output: 0, cached: 0, reasoning: 0 },
+      routing: { candidates: [], decision: null },
+      lastPromptTokens: 0,
+      lastUserMessage: '',
+      heuristicToolUsed: false,
+      toolCalls: 0,
+      retries: 0,
+      triedModels: new Set(),
+      completedCheckpoints: 0,
+      lastToolEffect: null,
+      toolRiskCache: new Map(),
+      recoveryInProgress: false,
+    };
+    this.runControl.set(runtimeState.runId, ctrlRecord);
+
+    this._emit(runtimeState.runId, EventType.TASK_CREATED, {
+      runId: runtimeState.runId,
+      title: runtimeState.task.objective,
+      taskType: runtimeState.task.taskType,
+    });
+
+    this.telemetry.recordEvent(runtimeState.runId, new TelemetryEvent(
+      runtimeState.runId, EventType.TASK_CREATED,
+      { runId: runtimeState.runId, title: runtimeState.task.objective },
+      { status: 'success' }
+    ));
+
+    this.log.info('run duplicated', { runId: runtimeState.runId, sourceRunId: runId });
+    return runtimeState.runId;
   }
 
   async startRun(runId, userMessage) {
@@ -653,7 +903,21 @@ class Orchestrator {
     const ctrl = this.control(runId);
     if (!ctrl || !ctrl.completion) {
       // Retired runs have no pending completion; return their terminal state.
-      return this.getRun(runId);
+      // Queue-scheduled starts may land a few ms after the HTTP 202: when the
+      // run is active but non-terminal with no completion yet, poll briefly
+      // for the worker's claim instead of returning a stale snapshot.
+      const rs = this.getRun(runId);
+      const terminal = !rs || ['completed', 'failed', 'cancelled'].includes(String(rs.status));
+      if (!ctrl || terminal) return rs;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+        const c2 = this.control(runId);
+        if ((c2 && c2.completion) || !this.getRun(runId) || ['completed', 'failed', 'cancelled'].includes(String(this.getRun(runId).status))) break;
+      }
+      const c3 = this.control(runId);
+      if (!c3 || !c3.completion) return this.getRun(runId);
+      return this.waitForCompletion(runId, timeoutMs);
     }
     let timer = null;
     try {
@@ -1924,6 +2188,25 @@ class Orchestrator {
       return this._cancelledRun(runtimeState, 'cancel requested');
     }
     const code = (error && error.code) || 'unknown';
+    // Invariant budget-caused termination must surface `budget.exceeded`
+    // before `run.failed`. Budget failures can originate in several places
+    // (pre-check, loop-top guard, mid-step guard, router budget eligibility),
+    // and only some of them emit the event inline — so _failRun closes the
+    // gap here (once per run) instead of trusting every throw site.
+    if (code === 'budget_exceeded' || code === 'budget_constraint') {
+      try {
+        const log = this.eventBus && this.eventBus.eventLogs
+          ? this.eventBus.eventLogs.get(runId) || []
+          : [];
+        const already = log.some((e) => e && e.type === EventType.BUDGET_EXCEEDED);
+        if (!already) {
+          this._emit(runId, EventType.BUDGET_EXCEEDED, {
+            spent: runtimeState.budget.currentSpend,
+            budget: runtimeState.budget.maximumCost,
+          });
+        }
+      } catch {}
+    }
     try {
       this.transition(runtimeState, TaskStatus.FAILED);
     } catch (e) {
