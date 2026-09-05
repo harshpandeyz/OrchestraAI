@@ -1,29 +1,33 @@
-/* OrchestraAI design system.
-   Friendly, clear, and calm: warm paper surfaces, chunky rounded actions,
-   obvious progress, honest statuses. Light-first; dark stays warm, never neon.
-   Identity: orchestration green (primary) + calm sky (secondary) on warm
-   neutrals. Color is used for hierarchy, state, action and emphasis only —
-   never decoration. Principles borrowed from the best learning products: big
-   readable actions, visible progression, rewarding feedback, zero friction. */
+/* OrchestraAI design system — dark-first premium developer platform.
+   Premium, modern, restrained. Dark-first with light option.
+   Identity: deep slate neutrals + blue primary accent + semantic status colors.
+   Tokens: color, typography, spacing, radii, shadows, elevation, motion, focus.
+   Accessible, responsive, reduced-motion aware. */
 :root {
-  --bg: #FAF8F2; --bg2: #FFFFFF; --panel: #FFFFFF; --panel2: #F2EEE1; --panel3: #E8E1CE;
-  --border: #E3DCC7; --border-soft: #ECE5D2; --border-strong: #CFC2A2;
-  --text: #20302A; --text2: #3D4C46; --muted: #63736C; --faint: #8FA098;
-  --accent: #0C7A5C; --accent-ink: #FFFFFF; --accent-deep: #095C46;
-  --accent-dim: #A9DABD; --accent-soft: #E1F3E8;
-  --sky: #2F7AC2; --sky-deep: #21598F; --sky-dim: #ACCDE9; --sky-soft: #E4EFFA;
-  --ok: #0E7A55; --ok-dim: #A9DDBF; --ok-soft: #DFF4E8;
-  --warn: #8A5A00; --warn-dim: #EACD85; --warn-soft: #FAEFD0;
-  --err: #BE4444; --err-dim: #EFB9B9; --err-soft: #F9E2E2;
-  --violet: #2F7AC2;
-  --radius-s: 10px; --radius: 16px; --radius-l: 22px;
+  --bg: #070a0f; --bg2: #0b1118; --panel: #0f1520; --panel2: #131b27; --panel3: #182234;
+  --border: #1f2a3b; --border-soft: #242f42; --border-strong: #2c3b52;
+  --text: #e6edf3; --text2: #c2cddb; --muted: #8a94a6; --faint: #5b6677;
+  --accent: #3b82f6; --accent-ink: #ffffff; --accent-deep: #1d4ed8;
+  --accent-dim: #1e3a8a; --accent-soft: #1e3a8a22;
+  --sky: #60a5fa; --sky-deep: #3b82f6; --sky-dim: #1e40af; --sky-soft: #1e3a8a22;
+  --ok: #22c55e; --ok-dim: #14532d; --ok-soft: #14532d33;
+  --warn: #f59e0b; --warn-dim: #7c2d12; --warn-soft: #78350f33;
+  --err: #ef4444; --err-dim: #7f1d1d; --err-soft: #7f1d1d33;
+  --violet: #3b82f6;
+  --radius-s: 6px; --radius: 10px; --radius-l: 14px;
   --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
-  --sp1: 4px; --sp2: 8px; --sp3: 12px; --sp4: 16px; --sp5: 20px; --sp6: 28px;
-  --topbar-h: 58px;
-  --shadow: 0 10px 28px rgba(46, 84, 70, .10);
-  --shadow-sm: 0 2px 8px rgba(46, 84, 70, .08);
-  --focus: 0 0 0 2px var(--bg2), 0 0 0 4px var(--accent);
+  --sp1: 4px; --sp2: 8px; --sp3: 12px; --sp4: 16px; --sp5: 20px; --sp6: 24px;
+  --topbar-h: 56px;
+  --shadow: 0 10px 30px rgba(0,0,0,.45);
+  --shadow-sm: 0 4px 12px rgba(0,0,0,.30);
+  --focus: 0 0 0 2px var(--bg2), 0 0 0 3px var(--accent);
+  --motion-duration-fast: 120ms;
+  --motion-duration-base: 200ms;
+  --motion-duration-slow: 320ms;
+  --motion-easing: cubic-bezier(.2,.8,.2,1);
+  --motion-easing-decel: cubic-bezier(0,0,.2,1);
+  --motion-easing-accel: cubic-bezier(.4,0,1,1);
 }
 [data-theme="dark"] {
   --bg: #111713; --bg2: #182019; --panel: #1C251E; --panel2: #243129; --panel3: #2F3F35;
@@ -37,6 +41,19 @@
   --err: #F08A8A; --err-dim: #5E2626; --err-soft: #3A1D1D;
   --shadow: 0 12px 32px rgba(0,0,0,.45);
   --shadow-sm: 0 2px 10px rgba(0,0,0,.35);
+}
+[data-theme="light"] {
+  --bg: #f7f9fc; --bg2: #ffffff; --panel: #ffffff; --panel2: #f1f5f9; --panel3: #e2e8f0;
+  --border: #e2e8f0; --border-soft: #edf2f7; --border-strong: #cbd5e1;
+  --text: #0f172a; --text2: #334155; --muted: #64748b; --faint: #94a3b8;
+  --accent: #2563eb; --accent-ink: #ffffff; --accent-deep: #1e40af;
+  --accent-dim: #93c5fd; --accent-soft: #dbeafe;
+  --sky: #0ea5e9; --sky-deep: #0284c7; --sky-dim: #bae6fd; --sky-soft: #e0f2fe;
+  --ok: #16a34a; --ok-dim: #86efac; --ok-soft: #dcfce7;
+  --warn: #d97706; --warn-dim: #fbbf24; --warn-soft: #fef3c7;
+  --err: #dc2626; --err-dim: #fca5a5; --err-soft: #fee2e2;
+  --shadow: 0 10px 30px rgba(0,0,0,.08);
+  --shadow-sm: 0 4px 12px rgba(0,0,0,.06);
 }
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }

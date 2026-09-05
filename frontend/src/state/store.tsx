@@ -247,7 +247,7 @@ function finalizeStream(msgs: ChatMessage[], full: string): ChatMessage[] {
 }
 
 // ---------- Store ----------
-export type View = 'overview' | 'savings' | 'run' | 'sessions' | 'models' | 'prompts' | 'memory' | 'tools' | 'evals' | 'cache' | 'alerts' | 'projects' | 'billing' | 'settings';
+export type View = 'overview' | 'savings' | 'run' | 'sessions' | 'models' | 'prompts' | 'memory' | 'tools' | 'evals' | 'cache' | 'alerts' | 'projects' | 'billing' | 'settings' | 'intelligence';
 export interface Toast { id: number; kind: 'ok' | 'warn' | 'err' | 'info'; title: string; body?: string }
 interface ServerState { runs: Run[]; activeRunId: string | null; snapshot: RuntimeSnapshot | null; models: ModelInfo[]; tools: RuntimeSnapshot['tools']; memItems: MemoryItem[]; evals: EvaluationRecord[]; evalNote: string; conn: { status: ConnStatus; lastSeq: number; lastUpdate: string | null }; sending: boolean; }
 interface UIState { view: View; settingsAnchor: string | null; leftOpen: boolean; rightOpen: boolean; leftWidth: number; rightWidth: number; expanded: Record<string, boolean>; selectedTrace: number | null; paletteOpen: boolean; newRunOpen: boolean; taskMode: string; memQuery: string; modelQuery: string; toolQuery: string; runQuery: string; runStatusFilter: string; theme: 'dark' | 'light'; toasts: Toast[]; }
@@ -296,8 +296,8 @@ function initialTheme(): 'dark' | 'light' {
     const saved = (typeof localStorage !== 'undefined' && (localStorage.getItem('orchestra-theme') || localStorage.getItem('aar-theme'))) as string | null;
     if (saved === 'dark' || saved === 'light') return saved;
   } catch { /* ignore */ }
-  // Friendly light-first product; dark remains one toggle away.
-  return 'light';
+  // Dark-first premium developer platform
+  return 'dark';
 }
 const panels = initialPanels();
 const initial: State = {
