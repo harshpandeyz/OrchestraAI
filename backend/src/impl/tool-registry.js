@@ -27,8 +27,19 @@ class InMemoryToolRegistry extends ToolRegistry {
       id: tool.id || generateId('tool'),
       name: tool.name,
       description: tool.description,
-      parameters: tool.parameters || { type: 'object', properties: {}, required: [] },
-      status: tool.status || 'enabled',
+      parameters: tool.parameters || tool.inputSchema || { type: 'object', properties: {}, required: [] },
+      inputSchema: tool.inputSchema || tool.parameters || { type: 'object', properties: {}, required: [] },
+      outputSchema: tool.outputSchema || null,
+      // Session 3 capability fields (safe defaults for legacy records).
+      category: tool.category || 'code',
+      riskLevel: tool.riskLevel || 'LOW',
+      requiresApproval: !!tool.requiresApproval,
+      supportsDryRun: !!tool.supportsDryRun,
+      idempotent: !!tool.idempotent,
+      delivery: tool.delivery || 'unknown',
+      status: tool.status || (tool.disabled ? 'disabled' : 'enabled'),
+      available: tool.available === false ? false : true,
+      disabled: !!tool.disabled,
       capabilities: tool.capabilities || [],
       permissions: tool.permissions || [],
       timeoutMs: tool.timeoutMs || 30000,
@@ -100,7 +111,11 @@ class InMemoryToolRegistry extends ToolRegistry {
         ...tool,
         id: tool.id || generateId('tool'),
         registeredAt: tool.registeredAt || now(),
-        status: tool.status || 'enabled'
+        status: tool.status || 'enabled',
+        inputSchema: tool.inputSchema || tool.parameters || { type: 'object', properties: {}, required: [] },
+        parameters: tool.parameters || tool.inputSchema || { type: 'object', properties: {}, required: [] },
+        category: tool.category || 'code',
+        riskLevel: tool.riskLevel || 'LOW',
       });
     }
   }

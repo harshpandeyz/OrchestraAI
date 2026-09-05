@@ -2,6 +2,9 @@
 
 const { CacheManager } = require('../interfaces');
 const { EventType } = require('../core/types');
+// Session 2 semantic cache (additive): L3 near-duplicate reuse with
+// similarity + freshness + fingerprint + tool-dependency gates.
+const { SemanticCacheIndex } = require('../intelligence/semantic-cache');
 
 class InMemoryCacheManager extends CacheManager {
   constructor(eventBus = null, options = {}) {
@@ -17,6 +20,46 @@ class InMemoryCacheManager extends CacheManager {
       maxSize: options.maxSize || 1000,
       ...options
     };
+    // L3 semantic index (workspace-scoped reuse). Exact L1 behavior above is
+    // untouched; semantic lookup is opt-in via lookupSemantic().
+    this.semantic = options.semantic || new SemanticCacheIndex(options.semanticOptions);
+    this.intelligence = options.intelligence || null;
+  }
+
+  attachIntelligence(store) {
+    this.intelligence = store || null;
+    // Share the durable semantic index when the learning store is attached so
+    // semantic entries survive restarts via intelligence.json.
+    if (store && store.semanticCache) this.semantic = store.semanticCache;
+    return this;
+  }
+
+  // L3 semantic reuse (§21): gated, explainable, never blind. Returns the
+  // cached result on hit, plus hit metadata (similarity, freshness, source
+  // task, model used, tool dependencies, context fingerprint).
+  async storeSemantic(taskText, result, opts = {}) {
+    return this.semantic.store({
+      taskText,
+      result,
+      fingerprint: opts.fingerprint || null,
+      modelId: opts.modelId || null,
+      tools: opts.tools || [],
+      workspaceRev: opts.workspaceRev || null,
+      tenantId: opts.tenantId || null,
+      projectId: opts.projectId || null,
+      runId: opts.runId || null,
+    });
+  }
+
+  async lookupSemantic(query = {}) {
+    const res = this.semantic.lookup(query);
+    if (this.eventBus && query.runId) {
+      this._recordRecent(query.runId, res.hit ? 'cache.hit' : 'cache.miss',
+        res.hit
+          ? `Semantic reuse (similarity ${res.similarity}, freshness ${res.freshness})`
+          : `Semantic miss: ${res.reason}`);
+    }
+    return res;
   }
 
   // Namespaced key so concurrent runs never share prompt/response entries.

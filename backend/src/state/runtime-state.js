@@ -58,11 +58,16 @@ class ModelState {
   }
 
   setCurrentModel(modelId, provider, reason) {
+    // Initial selection is NOT a switch: 0 switches after first selection,
+    // A->B = 1, B->C = 2. Re-setting the same model never increments.
+    const prev = this.currentModel;
     this.currentModel = modelId;
     this.currentProvider = provider;
     this.modelSelectionReason = reason;
     this.lastModelChange = now();
-    this.modelSwitchCount += 1;
+    if (prev !== null && prev !== undefined && prev !== modelId) {
+      this.modelSwitchCount += 1;
+    }
   }
 
   updateHealth(health) {
@@ -498,7 +503,31 @@ class RuntimeState {
     this.createdAt = now();
     this.updatedAt = now();
     this.metadata = {};
+    // Resource ownership (Session 1 auth): principal id that created the run.
+    // Null = pre-auth / public legacy run.
+    this.ownerId = typeof config.ownerId === 'string' ? config.ownerId.slice(0, 128) : null;
+    this.orgId = typeof config.orgId === 'string' ? config.orgId.slice(0, 128) : null;
+    this.projectId = typeof config.projectId === 'string' ? config.projectId.slice(0, 128) : null;
+    this.referenceModelId = typeof config.referenceModelId === 'string' ? config.referenceModelId.slice(0, 200) : null;
+    this.referencePricingSnapshot = config.referencePricingSnapshot && typeof config.referencePricingSnapshot === 'object'
+      ? { ...config.referencePricingSnapshot } : null;
+    // Filled exactly once when the run reaches a terminal state. The server
+    // persists this frozen result so historical pricing or policy changes
+    // cannot rewrite the economics later.
+    this.economics = config.economics && typeof config.economics === 'object'
+      ? JSON.parse(JSON.stringify(config.economics)) : null;
+    this.privacyMode = ['metadata_only', 'standard', 'zero_retention'].includes(config.privacyMode) ? config.privacyMode : 'standard';
+    this.executionMode = config.mode === 'live' ? 'live' : 'demo';
+    this.modelCalls = [];
     this._eventSeq = 0;
+  }
+
+  addModelCall(record) {
+    if (!record || typeof record !== 'object') return null;
+    this.modelCalls.push(record);
+    if (this.modelCalls.length > 200) this.modelCalls.shift();
+    this.updatedAt = now();
+    return record;
   }
 
   getEventSeq() {
@@ -525,7 +554,16 @@ class RuntimeState {
       policy: this.policy.toJSON(),
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
-      metadata: this.metadata
+      metadata: this.metadata,
+      ownerId: this.ownerId || null,
+      orgId: this.orgId || null,
+      projectId: this.projectId || null,
+      referenceModelId: this.referenceModelId || null,
+      referencePricingSnapshot: this.referencePricingSnapshot || null,
+      economics: this.economics || null,
+      privacyMode: this.privacyMode,
+      executionMode: this.executionMode,
+      modelCalls: this.modelCalls.slice(-200),
     };
   }
 }

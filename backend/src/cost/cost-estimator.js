@@ -57,30 +57,47 @@ class CostEstimator {
     return this.defaultPricing;
   }
 
-  estimateModelCost(modelId, provider, inputTokens, outputTokens, cachedTokens = 0) {
+  estimateModelCost(modelId, provider, inputTokens, outputTokens, cachedTokens = 0, extra = {}) {
     const pricing = this.resolveModelPricing(modelId);
+    const reasoningTokens = Number(extra.reasoningTokens) || 0;
     const uncachedInput = Math.max(0, inputTokens - cachedTokens);
-    
+
     const inputCost = (uncachedInput / 1000) * pricing.inputPer1k;
     const cachedCost = (cachedTokens / 1000) * pricing.cachedPer1k;
     const outputCost = (outputTokens / 1000) * pricing.outputPer1k;
-    
+    const reasoningCost = (reasoningTokens / 1000) * pricing.outputPer1k;
+
+    const round6 = (n) => Math.round(Number(n || 0) * 1e6) / 1e6;
     return {
       [CostCategory.INPUT_TOKENS]: inputCost,
       [CostCategory.CACHED_INPUT_TOKENS]: cachedCost,
       [CostCategory.UNCACHED_INPUT_TOKENS]: inputCost,
       [CostCategory.OUTPUT_TOKENS]: outputCost,
-      total: inputCost + cachedCost + outputCost,
+      ...(reasoningTokens > 0 ? { reasoning_tokens: reasoningCost } : {}),
+      total: inputCost + cachedCost + outputCost + reasoningCost,
       breakdown: {
         inputTokens,
         outputTokens,
         cachedTokens,
+        reasoningTokens,
         uncachedTokens: uncachedInput,
         pricingSource: pricing.source,
         inputPer1k: pricing.inputPer1k,
         outputPer1k: pricing.outputPer1k,
         cachedPer1k: pricing.cachedPer1k,
-      }
+      },
+      // Normalized accounting (Session 1): total is NEVER output-only.
+      normalized: {
+        inputTokens: { tokens: inputTokens - cachedTokens, costUsd: round6(inputCost) },
+        cachedInputTokens: { tokens: cachedTokens, costUsd: round6(cachedCost) },
+        outputTokens: { tokens: outputTokens, costUsd: round6(outputCost) },
+        reasoningTokens: { tokens: reasoningTokens, costUsd: round6(reasoningCost) },
+        toolCosts: { costUsd: 0 },
+        totalUsd: round6(inputCost + cachedCost + outputCost + reasoningCost),
+        currency: 'USD',
+        provider: provider || null,
+        model: modelId || null,
+      },
     };
   }
 

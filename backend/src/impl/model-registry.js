@@ -13,7 +13,7 @@ class InMemoryModelRegistry extends ModelRegistry {
     this.pricingHistory = new Map();
     
     for (const model of models) {
-      this.models.set(model.id, { ...model, status: model.status || ModelStatus.HEALTHY });
+      this.models.set(model.id, { ...model, pricingVersion: model.pricingVersion || 1, status: model.status || ModelStatus.HEALTHY });
     }
   }
 
@@ -144,6 +144,7 @@ class InMemoryModelRegistry extends ModelRegistry {
       cachedPer1k: model.cachedPer1k ?? null,
       updatedAt: model.pricingUpdatedAt || model.updatedAt || null,
       source: model.pricingSource || 'seed',
+      version: model.pricingVersion || 1,
     };
   }
 
@@ -162,6 +163,7 @@ class InMemoryModelRegistry extends ModelRegistry {
     if (pricing.outputPer1k !== undefined) model.outputPer1k = pricing.outputPer1k;
     if (pricing.cachedPer1k !== undefined) model.cachedPer1k = pricing.cachedPer1k;
     model.pricingSource = source;
+    model.pricingVersion = (prev?.version || model.pricingVersion || 1) + 1;
     model.pricingUpdatedAt = now();
     model.updatedAt = now();
     const record = { modelId, prev, next: this.getPricing(modelId), source, at: now() };
