@@ -92,6 +92,10 @@ function bearerFromHeaders(headers = {}) {
 
 // Resolve the principal for a request. In explicitly open development mode
 // (auth disabled) returns the synthetic admin dev principal.
+//
+// Dual sync/async: bearer/env-token paths resolve synchronously; the
+// session-cookie path returns a Promise only when the tenant store itself is
+// asynchronous (Postgres). `await` works with both — server.js always awaits.
 function authenticate(req, authConfig, tenantStore = null) {
   const cfg = authConfig || loadAuthConfig();
   if (!cfg.enabled) return { id: 'dev', role: 'admin', orgId: 'dev-org', source: 'dev-mode' };
@@ -103,8 +107,11 @@ function authenticate(req, authConfig, tenantStore = null) {
     if (rawCookie) {
       try {
         const session = decodeURIComponent(rawCookie.slice('oa_session='.length));
-        const user = tenantStore.userForSession(session);
-        if (user) return { id: user.id, role: user.role, orgId: user.orgId, source: 'session' };
+        const found = tenantStore.userForSession(session);
+        if (found && typeof found.then === 'function') {
+          return found.then((user) => (user ? { id: user.id, role: user.role, orgId: user.orgId, source: 'session' } : null));
+        }
+        if (found) return { id: found.id, role: found.role, orgId: found.orgId, source: 'session' };
       } catch { /* malformed cookie stays unauthenticated */ }
     }
   }
