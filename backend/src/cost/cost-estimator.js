@@ -101,6 +101,26 @@ class CostEstimator {
     };
   }
 
+  // Strict commercial estimate: null when the registry has no real pricing
+  // for this model (unknown stays unknown — never default-priced). Used by
+  // the routing optimizer's budget gate; the forecasting estimateModelCost
+  // above keeps its default fallback for spend tracking.
+  estimateModelCostStrict(modelId, inputTokens, outputTokens, cachedTokens = 0) {
+    let pricing = null;
+    if (this.modelRegistry && typeof this.modelRegistry.getPricing === 'function') {
+      try { pricing = this.modelRegistry.getPricing(modelId); } catch { pricing = null; }
+    }
+    const known = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v)) && Number(v) >= 0;
+    if (!pricing || !known(pricing.inputPer1k) || !known(pricing.outputPer1k)) return null;
+    const cached = Math.max(0, Math.min(Number(inputTokens) || 0, Number(cachedTokens) || 0));
+    if (cached > 0 && !known(pricing.cachedPer1k)) return null;
+    const uncached = Math.max(0, (Number(inputTokens) || 0) - cached);
+    const total = (uncached / 1000) * Number(pricing.inputPer1k)
+      + (cached / 1000) * Number(pricing.cachedPer1k ?? 0)
+      + (Math.max(0, Number(outputTokens) || 0) / 1000) * Number(pricing.outputPer1k);
+    return Number.isFinite(total) ? Math.max(0, Math.round(total * 1e6) / 1e6) : null;
+  }
+
   estimateToolCost(toolName, estimatedCalls = 1, complexity = 'medium') {
     const multipliers = { low: 0.5, medium: 1, high: 2 };
     const multiplier = multipliers[complexity] || 1;
