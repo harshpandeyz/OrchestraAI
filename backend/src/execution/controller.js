@@ -42,6 +42,10 @@ class ExecutionController {
     this.orch = orchestrator;
     this.workspace = options.workspace || process.env.WORKSPACE_ROOT || process.cwd();
     this.productionSafeToolsOnly = !!options.productionSafeToolsOnly;
+    // Isolated-executor URL override for tests/hosts; defaults to env.
+    this.isolatedExecutorUrl = options.isolatedExecutorUrl !== undefined
+      ? options.isolatedExecutorUrl
+      : (process.env.ISOLATED_EXECUTOR_URL || null);
     this.approvals = new ApprovalStore(options.approvals);
     this.changesets = new ChangesetStore();
     this.plans = new PlanManager();
@@ -241,7 +245,23 @@ class ExecutionController {
     const policy = this.policyFor(runId);
     const def = normalizeDefinition(definition || { name: toolName });
     if (this.productionSafeToolsOnly && !new Set(['read_file', 'search_code', 'git_status', 'git_diff', 'git_log', 'git_branch']).has(toolName)) {
-      return { allowed: false, code: 'denied', reason: `production safe-tools policy blocks ${toolName}` };
+      // Production boundary: untrusted code execution (run_tests,
+      // build_project) may proceed ONLY through the isolated executor. When
+      // one is configured the gate passes and the executor enforces the
+      // boundary at runtime (fail-closed when unreachable). Without one,
+      // deny with the sandbox_unavailable contract — never run locally.
+      if (toolName === 'run_tests' || toolName === 'build_project') {
+        const url = this.isolatedExecutorUrl || process.env.ISOLATED_EXECUTOR_URL || null;
+        if (url) {
+          // Fall through to the normal policy + approval checks below; the
+          // tool executor routes the actual subprocess to the isolated
+          // executor and fails closed if it is unreachable.
+        } else {
+          return { allowed: false, code: 'sandbox_unavailable', reason: `production requires an isolated executor for ${toolName} (set ISOLATED_EXECUTOR_URL); failing closed` };
+        }
+      } else {
+        return { allowed: false, code: 'denied', reason: `production safe-tools policy blocks ${toolName}` };
+      }
     }
     // Unify source of truth: the canonical TOOL_DEFINITIONS are authoritative
     // for requiresApproval/risk. A legacy registry record missing the flag
@@ -847,6 +867,9 @@ class ExecutionController {
       observations: (this.observations.get(runId) || []).slice(-20),
       recovery: (this.recoveryLog.get(runId) || []).slice(-5),
       result: this.results.get(runId) || null,
+      // ArtifactStore intentionally strips inline content here; the execution
+      // summary exposes references and bounded metadata only.
+      artifacts: this.artifacts.listForRun(runId),
     };
   }
 
