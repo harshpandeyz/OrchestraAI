@@ -138,6 +138,95 @@ function rankMemories(memories, query, opts = {}) {
 
 // ---------- Deduplication (§19) ----------
 
+// ---------- Candidate memory + secret safety (Agent 2) ----------
+//
+// Model/system output is NEVER durable on arrival. It enters as a CANDIDATE:
+//   propose -> classify -> confidence -> policy/visibility -> persist.
+// Only explicit durability signals (user/API source, explicit approval flag,
+// high-confidence vetted facts) may become long-term project memory.
+// Keyword-like model output ("remember:", "preference:", ...) is weak
+// evidence and quarantines to working memory until approved.
+
+const SECRET_PATTERNS = [
+  /sk-[A-Za-z0-9-_]{8,}/g,
+  /xox[bpas]-[A-Za-z0-9-]+/g,
+  /ghp_[A-Za-z0-9]{8,}/g,
+  /gho_[A-Za-z0-9]{8,}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----/g,
+  /(password\s*[:=]\s*)\S+/gi,
+  /(passwd\s*[:=]\s*)\S+/gi,
+  /(api[_-]?key\s*[:=]\s*)\S+/gi,
+  /(secret\s*[:=]\s*)\S+/gi,
+  /((?:auth|access|refresh)[_-]?token\s*[:=]\s*)\S+/gi,
+  /(bearer\s+)[A-Za-z0-9-_.~+/=]+/gi,
+  /mongodb(\+srv)?:\/\/\S+/gi,
+  /postgres(?:ql)?:\/\/\S+/gi,
+];
+
+function findSecrets(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  return SECRET_PATTERNS.some((re) => { re.lastIndex = 0; return re.test(s); });
+}
+
+function redactSecrets(text) {
+  let s = String(text || '');
+  if (!s) return s;
+  for (const re of SECRET_PATTERNS) {
+    re.lastIndex = 0;
+    s = s.replace(re, (m, prefix) => (typeof prefix === 'string' && /[:=]\s*$|\s$/.test(prefix) ? `${prefix}[REDACTED]` : '[REDACTED]'));
+  }
+  return s;
+}
+
+const KEYWORD_LIKE = /(remember|preference|always|never|convention)\s*:/i;
+
+// Deterministic candidate classification. Pure; never persists anything.
+function classifyMemoryCandidate(input = {}) {
+  const title = String(input.title || '');
+  const snippet = String(input.snippet || input.content || '');
+  const source = String(input.source || '');
+  const text = `${title}\n${snippet}`;
+  const explicit = input.explicit === true || input.durable === true || input.candidateApproved === true;
+  const givenConfidence = Number.isFinite(Number(input.confidence)) ? Math.max(0, Math.min(1, Number(input.confidence))) : null;
+
+  if (findSecrets(text)) {
+    return {
+      kind: 'secret_or_unsafe', confidence: 0.9, durableEligible: false,
+      reasons: ['secret material detected: redacted and never durable without explicit approval'],
+    };
+  }
+  if (explicit) {
+    return {
+      kind: 'explicit_fact', confidence: Math.max(0.85, givenConfidence ?? 0.85), durableEligible: true,
+      reasons: ['explicit durability signal (caller-approved persist)'],
+    };
+  }
+  if (/^model:/i.test(source) && KEYWORD_LIKE.test(text)) {
+    return {
+      kind: 'unvetted_model_output', confidence: 0.45, durableEligible: false,
+      reasons: ['keyword-like model output is weak evidence; requires candidate approval before becoming durable memory'],
+    };
+  }
+  if (/^tool:/i.test(source)) {
+    return {
+      kind: 'tool_observation', confidence: 0.7, durableEligible: false,
+      reasons: ['tool observations default to working memory; promote explicitly when durable'],
+    };
+  }
+  if (/^(user|api):/i.test(source)) {
+    return {
+      kind: 'user_fact', confidence: Math.max(0.8, givenConfidence ?? 0.8), durableEligible: true,
+      reasons: ['user/API-sourced fact'],
+    };
+  }
+  return {
+    kind: 'working_note', confidence: givenConfidence ?? 0.5, durableEligible: false,
+    reasons: ['no explicit durability signal; working memory by default'],
+  };
+}
+
 function similarity(a, b) {
   const ta = `${a.title || ''} ${a.snippet || ''}`;
   const tb = `${b.title || ''} ${b.snippet || ''}`;
@@ -222,6 +311,7 @@ function describeConflict(a, b) {
 module.exports = {
   MEMORY_TYPES,
   DEFAULT_RETRIEVAL_WEIGHTS,
+  SECRET_PATTERNS,
   createMemoryRecord,
   scoreMemory,
   rankMemories,
@@ -229,4 +319,7 @@ module.exports = {
   isContradiction,
   describeConflict,
   similarity,
+  findSecrets,
+  redactSecrets,
+  classifyMemoryCandidate,
 };

@@ -55,10 +55,18 @@ class IntelligenceStore {
     }
     let learning = null;
     const update = outcomeToLearningUpdate(outcome);
+    // Workload dimensions for the learning slice (context size + tool
+    // profile derived from observations when not provided explicitly).
+    const contextTokens = Number.isFinite(Number(input.contextTokens)) ? Number(input.contextTokens) : null;
+    const toolProfile = input.toolProfile !== undefined && input.toolProfile !== null ? input.toolProfile
+      : Array.isArray(input.toolObservations) && input.toolObservations.length
+        ? input.toolObservations.map((o) => o.toolName).filter(Boolean).sort().join(',')
+        : null;
     if (update && input.modelId) {
       if (update.latencyOnly) {
         learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
           success: null, qualityScore: null, latencyMs: input.latencyMs, errorCode: null,
+          contextTokens, toolProfile,
         });
       } else {
         learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
@@ -66,12 +74,14 @@ class IntelligenceStore {
           qualityScore: Number.isFinite(Number(update.qualityScore)) ? update.qualityScore : null,
           latencyMs: input.latencyMs,
           errorCode: update.success === false ? (input.errorCode || 'task_failed') : null,
+          contextTokens, toolProfile,
         });
       }
     } else if (input.modelId && Number.isFinite(Number(input.latencyMs))) {
       // Latency observations are always safe to record (no success claim).
       learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
         success: null, qualityScore: null, latencyMs: input.latencyMs, errorCode: null,
+        contextTokens, toolProfile,
       });
     }
     if (input.runId) this.routingHistory.attachOutcome(input.runId, { taskSuccess: outcome.taskSuccess, overallScore: outcome.overallScore });
