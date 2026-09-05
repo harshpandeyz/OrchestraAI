@@ -95,8 +95,11 @@ function backoffForAttempt(attempt) {
 
 function retryDecision({ code, attempt = 0, maxAttempts = 3, idempotent = false, destructive = false }) {
   const c = String(code || '');
-  // Never retry unchanged: validation / permission / scope errors.
-  if (['bad_params', 'denied', 'scope_violation', 'path_escape', 'not_found', 'patch_conflict'].includes(c)) {
+  // Never retry unchanged: validation / permission / scope errors. A missing
+  // or unreachable isolated executor (sandbox_unavailable /
+  // executor_unavailable) also fails identically until an operator provides
+  // one — retrying the same call cannot fix it.
+  if (['bad_params', 'denied', 'scope_violation', 'path_escape', 'not_found', 'patch_conflict', 'sandbox_unavailable', 'executor_unavailable', 'secret_refused', 'executor_malformed'].includes(c)) {
     return { retry: false, reason: `${c}: retrying unchanged would fail identically` };
   }
   // Destructive + unknown: NEVER blindly retry.
