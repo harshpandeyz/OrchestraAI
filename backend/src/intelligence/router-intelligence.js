@@ -124,9 +124,13 @@ function scoreCandidate(model, ctx = {}) {
   let perfLatency = null;
   if (perf && typeof perf.predictedSuccess === 'function') {
     try {
-      const p = perf.predictedSuccess(model.id, taskProfile.category);
+      // Workload-aware when the store supports it (context-size slice blends
+      // toward the category rate at low n); plain category rate otherwise.
+      const p = perf.predictedSuccess.length >= 3
+        ? perf.predictedSuccess(model.id, taskProfile.category, { contextTokens: needTokens })
+        : perf.predictedSuccess(model.id, taskProfile.category);
       predicted = p.predicted;
-      predMeta = { attempts: p.attempts, confidence: p.confidence, observed: p.observed };
+      predMeta = { attempts: p.attempts, confidence: p.confidence, observed: p.observed, workload: p.workload || null };
       perfLatency = perf.latency(model.id, taskProfile.category);
     } catch { /* performance is advisory */ }
   }
