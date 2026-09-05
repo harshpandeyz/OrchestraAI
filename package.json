@@ -11,7 +11,7 @@
     "test:integration": "node backend/test/integration.test.js",
     "test:providers": "node backend/test/provider-config.test.js",
     "test:savings": "node backend/test/savings/savings-engine.test.js",
-    "test:analytics": "node backend/test/analytics.test.js",
+    "test:analytics": "node backend/test/analytics.test.js && node backend/test/intelligence-analytics.test.js",
     "test:boundaries": "node backend/test/production-boundaries.test.js",
     "test:privacy": "node backend/test/privacy.test.js",
     "test:auth": "node backend/test/auth-integration.test.js",
@@ -25,13 +25,22 @@
     "test:persistence": "node backend/test/persistence.test.js",
     "test:events": "node backend/test/event-contract.test.js",
     "test:economics": "node backend/test/economics.test.js",
-    "test:all": "node backend/test/runtime.test.js && node backend/test/session1-regression.test.js && node backend/test/intelligence.test.js && node backend/test/session3-execution.test.js && node backend/test/recovery.test.js && node backend/test/ssrf.test.js && node backend/test/persistence.test.js && node backend/test/event-contract.test.js && node backend/test/economics.test.js && node backend/test/model-failover.test.js && node backend/test/prompt-semantic.test.js && node backend/test/backend-finalization.test.js && node backend/test/integration.test.js && node backend/test/provider-config.test.js && node backend/test/production-boundaries.test.js && node backend/test/privacy.test.js && node backend/test/auth-integration.test.js && node backend/test/savings/savings-engine.test.js && node backend/test/analytics.test.js",
+    "test:sandbox": "node sandbox-worker/worker.test.js",
+    "test:workspace": "node backend/test/agent3/workspace-transfer.test.js",
+    "test:agent3": "node backend/test/agent3/security.test.js",
+    "test:runstore": "node backend/test/agent1/run-store.test.js",
+    "test:agent1": "node backend/test/agent1/coordination.test.js && node backend/test/agent1/config-datastore.test.js && node backend/test/agent1/tenant-idempotency.test.js",
+    "test:all": "node backend/test/runtime.test.js && node backend/test/session1-regression.test.js && node backend/test/intelligence.test.js && node backend/test/session3-execution.test.js && node backend/test/recovery.test.js && node backend/test/ssrf.test.js && node backend/test/persistence.test.js && node backend/test/event-contract.test.js && node backend/test/economics.test.js && node backend/test/model-failover.test.js && node backend/test/prompt-semantic.test.js && node backend/test/backend-finalization.test.js && node backend/test/integration.test.js && node backend/test/provider-config.test.js && node backend/test/production-boundaries.test.js && node backend/test/privacy.test.js && node backend/test/auth-integration.test.js && node backend/test/savings/savings-engine.test.js && node backend/test/analytics.test.js && node backend/test/intelligence-analytics.test.js && node backend/test/agent1/coordination.test.js && node backend/test/agent1/config-datastore.test.js && node backend/test/agent1/tenant-idempotency.test.js && node backend/test/agent1/run-store.test.js && node backend/test/agent3/security.test.js && node backend/test/agent3/workspace-transfer.test.js && node sandbox-worker/worker.test.js",
     "test:frontend": "npm --prefix frontend run test -- --run",
     "build:frontend": "npm --prefix frontend run build",
     "release:container": "docker build -t orchestraai:release-check .",
     "release:check": "npm run test:all && npm run test:frontend && npm run build:frontend"
   },
   "main": "index.js",
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC"
