@@ -5,6 +5,9 @@ const { EventType } = require('../core/types');
 // Session 2 semantic cache (additive): L3 near-duplicate reuse with
 // similarity + freshness + fingerprint + tool-dependency gates.
 const { SemanticCacheIndex } = require('../intelligence/semantic-cache');
+// Monetary value is derived from an explicit pricing snapshot via canonical
+// economics — this manager never hardcodes dollars per token.
+const { cacheValueUsd } = require('../economics/economic-states');
 
 class InMemoryCacheManager extends CacheManager {
   constructor(eventBus = null, options = {}) {
@@ -48,6 +51,11 @@ class InMemoryCacheManager extends CacheManager {
       tenantId: opts.tenantId || null,
       projectId: opts.projectId || null,
       runId: opts.runId || null,
+      // Provenance facts for the reuse hierarchy (additive):
+      cachedAt: opts.cachedAt || new Date().toISOString(),
+      maxAgeMs: opts.maxAgeMs,
+      pureAnswer: opts.pureAnswer === true,
+      compatibleModels: Array.isArray(opts.compatibleModels) ? opts.compatibleModels.slice(0, 20) : null,
     });
   }
 
@@ -256,15 +264,140 @@ class InMemoryCacheManager extends CacheManager {
     }
   }
 
-  getCacheState(runtimeState) {
+  // Facts for one exact-cache entry (no dollar math here; monetary value is
+  // derived by canonical economics from a pricing snapshot).
+  describeEntry(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return { key, hit: false, providerCallAvoided: false, tokensReused: 0 };
+    const nowMs = Date.now();
+    const expired = !!(entry.expiresAt && nowMs > entry.expiresAt);
+    return {
+      key,
+      hit: !expired,
+      providerCallAvoided: !expired,
+      tokensReused: !expired ? estimateTokensOf(entry.value) : 0,
+      freshness: entry.expiresAt ? Math.max(0, entry.expiresAt - nowMs) : null,
+      cachedAt: entry.cachedAt || null,
+      accessCount: entry.accessCount || 0,
+      runId: entry.runId || null,
+      expired,
+    };
+  }
+
+  // Reuse hierarchy (safe order, gates enforced at every layer):
+  //   L1 local/request exact  -> L2 run/project exact reuse
+  //   -> L3 semantic project reuse.
+  // query: { key?, runId?, tenantId?, projectId?, taskText?, fingerprint?,
+  //          tools?, modelId?, requireSameModel?, requiresPureAnswer?,
+  //          workspaceRev? }
+  // Never upgrades a gated miss into a hit: tenant/project isolation,
+  // fingerprint drift, freshness, model/tool compatibility and the
+  // pure-answer constraint are all enforced before reporting hit:true.
+  async resolveReuse(query = {}) {
+    // L1: exact key in this process (request cache).
+    if (query.key) {
+      const entry = this.cache.get(query.key);
+      if (entry && !(entry.expiresAt && Date.now() > entry.expiresAt)) {
+        entry.lastAccessed = Date.now();
+        entry.accessCount++;
+        this.stats.hits++;
+        const rs = this._runStats(query.runId);
+        if (rs) rs.hits++;
+        return {
+          hit: true, layer: 'local_exact', value: entry.value,
+          facts: { tokensReused: estimateTokensOf(entry.value), providerCallAvoided: true, freshness: entry.expiresAt ? Math.max(0, entry.expiresAt - Date.now()) : null, similarity: 1, contextFingerprint: null, modelCompatible: true, toolCompatible: true },
+        };
+      }
+    }
+    // L2: run/project exact reuse — same key under the run or project scope.
+    if (query.key && (query.runId || query.projectId)) {
+      const scoped = [query.runId ? `${query.runId}:${query.key}` : null, query.projectId ? `${query.projectId}:${query.key}` : null].filter(Boolean);
+      for (const sk of scoped) {
+        const entry = this.cache.get(sk);
+        if (entry && !(entry.expiresAt && Date.now() > entry.expiresAt)) {
+          entry.lastAccessed = Date.now();
+          entry.accessCount++;
+          this.stats.hits++;
+          const rs = this._runStats(query.runId);
+          if (rs) rs.hits++;
+          return {
+            hit: true, layer: 'scoped_exact', value: entry.value,
+            facts: { tokensReused: estimateTokensOf(entry.value), providerCallAvoided: true, freshness: entry.expiresAt ? Math.max(0, entry.expiresAt - Date.now()) : null, similarity: 1, contextFingerprint: null, modelCompatible: true, toolCompatible: true },
+          };
+        }
+      }
+    }
+    // L3: semantic project reuse (all safety gates live in the index plus
+    // the model/purity gates applied here).
+    if (query.taskText) {
+      const res = this.semantic.lookup(query);
+      if (!res.hit) {
+        this.stats.misses++;
+        const rs = this._runStats(query.runId);
+        if (rs) rs.misses++;
+        return { hit: false, layer: 'semantic', reason: res.reason, facts: { similarity: res.similarity ?? null, freshness: res.freshness ?? null } };
+      }
+      if (query.requireSameModel && query.modelId && res.modelUsed && res.modelUsed !== query.modelId) {
+        this.stats.misses++;
+        const rs = this._runStats(query.runId);
+        if (rs) rs.misses++;
+        return { hit: false, layer: 'semantic', reason: `model incompatibility (cached ${res.modelUsed}, need ${query.modelId})`, facts: { similarity: res.similarity, freshness: res.freshness, modelCompatible: false } };
+      }
+      const entryPure = res.pureAnswer === true;
+      if (query.requiresPureAnswer === true && res.pureAnswer !== true && res.pureAnswer !== undefined) {
+        this.stats.misses++;
+        const rs = this._runStats(query.runId);
+        if (rs) rs.misses++;
+        return { hit: false, layer: 'semantic', reason: 'pure-answer constraint: cached entry may depend on tools/context', facts: { similarity: res.similarity, freshness: res.freshness } };
+      }
+      this.stats.hits++;
+      const rs = this._runStats(query.runId);
+      if (rs) rs.hits++;
+      return {
+        hit: true, layer: 'semantic_project', value: res.result,
+        facts: {
+          tokensReused: estimateTokensOf(res.result), providerCallAvoided: true,
+          similarity: res.similarity, freshness: res.freshness,
+          contextFingerprint: res.contextFingerprint || null,
+          modelCompatible: !query.modelId || !res.modelUsed || res.modelUsed === query.modelId,
+          toolCompatible: true, sourceTask: res.sourceTask || null, modelUsed: res.modelUsed || null,
+          pureAnswer: entryPure || null,
+        },
+      };
+    }
+    this.stats.misses++;
+    const rs = this._runStats(query.runId);
+    if (rs) rs.misses++;
+    return { hit: false, layer: 'none', reason: 'no key or task text' };
+  }
+
+  // Monetary value of reused tokens, derived from the caller's pricing
+  // snapshot (canonical economics). No pricing -> value 0 labelled unpriced.
+  describeValue(reusedTokens, pricing = null) {
+    return cacheValueUsd({ reusedTokens, pricing });
+  }
+
+  getCacheState(runtimeState, pricing = null) {
     const stats = this.getStatsSync();
+    const runId = runtimeState && runtimeState.runId;
+    const perRun = runId && this.runStats.get(runId);
+    const recent = perRun ? perRun.recent.slice() : [];
+    const { valueUsd, basis } = cacheValueUsd({ reusedTokens: stats.cachedTokens, pricing });
     return {
       hitRate: stats.hitRate,
       cachedTokens: stats.cachedTokens,
-      uncachedTokens: runtimeState.context.currentTokens - stats.cachedTokens,
-      savedUsd: stats.cachedTokens * 0.0000002,
+      uncachedTokens: Math.max(0, (runtimeState.context.currentTokens || 0) - stats.cachedTokens),
+      // Wire-compatible dollar field, now derived from the pricing snapshot
+      // (or 0 when unpriced) instead of a hardcoded rate.
+      savedUsd: valueUsd,
+      valueBasis: basis,
       state: stats.state,
-      recent: []
+      recent,
+      facts: {
+        hits: this.stats.hits, misses: this.stats.misses,
+        providerCallsAvoided: this.stats.hits,
+        tokensReused: stats.cachedTokens,
+      },
     };
   }
 
@@ -310,6 +443,14 @@ class InMemoryCacheManager extends CacheManager {
     this.cache.clear();
     this.stats = { hits: 0, misses: 0, sets: 0, invalidations: 0 };
   }
+}
+
+function estimateTokensOf(value) {
+  try {
+    if (typeof value === 'string') return Math.ceil(value.length / 4);
+    if (value && typeof value === 'object') return Math.ceil(JSON.stringify(value).length / 4);
+  } catch { /* fall through */ }
+  return 0;
 }
 
 module.exports = {
