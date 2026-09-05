@@ -206,6 +206,22 @@ export function provenanceLabel(source: string | undefined | null, kind: 'cost' 
   return { text: 'UNKNOWN', cls: 'unknown', title: 'No data yet — appears after real usage' };
 }
 
+const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+
+/**
+ * Effective run status: the live snapshot wins while the run is in flight,
+ * but a terminal run record is never downgraded by a non-terminal snapshot.
+ * (Interrupted runs can report a synthesized idle snapshot after a restart;
+ * showing READY for a failed run would mislead.)
+ */
+export function effectiveStatus(snapshotStatus: string | undefined | null, runStatus: string | undefined | null): string {
+  const snap = String(snapshotStatus || '');
+  const run = String(runStatus || '');
+  if (TERMINAL.has(snap)) return snap;
+  if (TERMINAL.has(run)) return run;
+  return snap || run || 'idle';
+}
+
 /** Explain a confidence/trust score only from legitimate backend grounding. */
 export function trustGrounding(evidence: {
   evaluationScore?: number | null;

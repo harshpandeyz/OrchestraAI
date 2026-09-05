@@ -3,10 +3,12 @@ import type { AlertRecord, AnalyticsOverview, ApprovalRecord, BillingResponse, C
 
 const BASE = '';
 const TOKEN_KEY = 'orchestra-api-token';
+const REQUEST_ID_KEY = 'orchestra-request-id';
 // Runtime API token for backends with authentication enabled. Stored only in
 // this browser, sent as a Bearer header, never rendered or logged. The
 // Local development may be open; production uses a session cookie or this
 // optional operator token. Tokens are only sent as Authorization headers.
+
 export function getApiToken(): string | null {
   try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
 }
@@ -16,23 +18,54 @@ export function setApiToken(token: string | null): void {
     else localStorage.removeItem(TOKEN_KEY);
   } catch { /* private mode — session only */ }
 }
+export function generateRequestId(): string {
+  return 'req-' + Math.random().toString(36).substring(2, 18);
+}
+// Cached request ID per browser session, so consecutive calls correlate.
+export function getRequestId(): string | null {
+  try { return localStorage.getItem(REQUEST_ID_KEY); } catch { return null; }
+}
+export function setRequestId(id: string | null): void {
+  try {
+    if (id) localStorage.setItem(REQUEST_ID_KEY, id);
+    else localStorage.removeItem(REQUEST_ID_KEY);
+  } catch { /* private mode — session only */ }
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly path: string;
+  readonly requestId: string;
+  constructor(message: string, status: number, path: string, requestId: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.path = path;
+    this.requestId = requestId;
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...((init?.headers || {}) as Record<string, string>) };
   try {
     const token = localStorage.getItem(TOKEN_KEY);
     if (token && !headers['Authorization']) headers['Authorization'] = `Bearer ${token}`;
+    const rid = localStorage.getItem(REQUEST_ID_KEY) || generateRequestId();
+    headers['X-Request-Id'] = rid;
+    localStorage.setItem(REQUEST_ID_KEY, rid);
   } catch { /* private mode — unauthenticated */ }
   const res = await fetch(`${BASE}${path}`, { credentials: 'include', ...init, headers });
   if (!res.ok) {
     let detail = '';
+    let parsedBody: unknown;
     try {
-      const body = await res.json() as { error?: string; code?: string };
-      if (body?.error) detail = `: ${body.error}`;
-      else if (body?.code) detail = ` (${body.code})`;
+      parsedBody = await res.json();
+      if ((parsedBody as { error?: string }).error) detail = `: ${(parsedBody as { error?: string }).error}`;
+      else if ((parsedBody as { code?: string }).code) detail = ` (${(parsedBody as { code?: string }).code})`;
     } catch { /* ignore */ }
     // 401/403 surface explicitly (never silent): callers show the message,
     // and the Settings API-access row explains the token requirement.
-    throw new Error(`API ${res.status} ${path}${detail}`);
+    throw new ApiError(`API ${res.status} ${path}${detail}`, res.status, path, localStorage.getItem(REQUEST_ID_KEY) || generateRequestId());
   }
   return res.json() as Promise<T>;
 }
@@ -49,6 +82,8 @@ export const api = {
   sendMessage: (id: string, content: string) => req<{ accepted: boolean }>(`/api/runs/${id}/messages`, { method: 'POST', body: JSON.stringify({ content }) }),
   cancelRun: (id: string) => req<{ run: Run }>(`/api/runs/${id}/cancel`, { method: 'POST' }),
   retryRun: (id: string) => req<{ accepted: boolean }>(`/api/runs/${id}/retry`, { method: 'POST' }),
+  forkRun: (id: string) => req<{ accepted: boolean; newRunId?: string }>(`/api/runs/${id}/fork`, { method: 'POST' }),
+  duplicateRun: (id: string) => req<{ accepted: boolean; newRunId?: string }>(`/api/runs/${id}/duplicate`, { method: 'POST' }),
   compareRuns: (a: string, b: string) => req<CompareResponse>(`/api/runs/${a}/compare/${b}`),
   getModels: () => req<{ models: ModelInfo[]; meta?: { updatedAt: string | null; discoveryEnabled: boolean; mode: string } }>(`/api/models`),
   refreshModels: (provider?: string) => req<{ ok: boolean; discovered?: number; updated?: number; prices?: number; at?: string; skipped?: string; error?: string; changes?: ModelChange[] }>(`/api/models/refresh`, { method: 'POST', body: JSON.stringify(provider ? { provider } : {}) }),
@@ -80,6 +115,8 @@ export const api = {
   getSavings: (query = '') => req<{ summary: AnalyticsOverview['summary']; runs: SavingsRunRow[]; waterfall: WaterfallRow[]; note: string }>(`/api/savings${query}`),
   getOverview: (query = '') => req<{ analytics: AnalyticsOverview }>(`/api/analytics/overview${query}`),
   getBilling: (query = '') => req<BillingResponse>(`/api/billing${query}`),
+  getIntelligence: (query = '') => req<{ intelligence: import('../analytics/types').Intelligence }>(`/api/analytics/intelligence${query}`),
+  getIntelligenceSection: (section: string, query = '') => req<{ meta: import('../analytics/types').IntelligenceMeta; section: string; data: unknown }>(`/api/analytics/${section}${query}`),
   getSessions: () => req<{ sessions: SessionRecord[] }>(`/api/sessions`),
   getCache: () => req<{ cache: CacheOverview; note: string }>(`/api/cache`),
   getAlerts: () => req<{ alerts: AlertRecord[]; note: string }>(`/api/alerts`),

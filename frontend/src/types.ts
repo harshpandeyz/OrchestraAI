@@ -24,6 +24,7 @@ export interface ProjectCreateOptions { referenceModelId?: string | null; policy
 export interface PrincipalInfo { id: string; role: string; orgId?: string; source?: string }
 export interface ApprovalRecord { id: string; actionType?: string; title?: string; description?: string; detail?: string; riskLevel?: string; risk?: string; reason?: string; tool?: string; affectedResources?: string[]; expiresAt?: string; status?: string }
 export interface ChangeSetView { id: string; files: Array<{ path: string } | string>; additions?: number; deletions?: number; status?: string }
+export interface ArtifactView { artifactId?: string; id?: string; type: string; name?: string; size: number; mimeType?: string; hash?: string; inline?: string | null }
 export interface VerificationRecord { kind: string; passed: boolean; summary: string; at?: string }
 export interface EpisodeView { episodeId: string; parentEpisodeId?: string | null; status: string; steps?: number; toolCalls?: number }
 export interface RuntimePreset { id: string; label: string; blurb: string; consequence: string }
@@ -78,6 +79,7 @@ export interface ExecutionView {
   constraints?: { forbidPaths?: string[]; onlyPaths?: string[]; branch?: string | null; notes?: string[] };
   toolHealth?: Record<string, { calls: number; successRate: number; timeoutRate?: number }> | unknown;
   observations?: unknown[]; recovery?: unknown[]; result?: unknown;
+  artifacts?: ArtifactView[];
 }
 export interface IntelligenceView {
   versions?: Record<string, string> | null;

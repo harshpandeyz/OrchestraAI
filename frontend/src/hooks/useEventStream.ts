@@ -103,17 +103,24 @@ export function useEventStream(runId: string | null) {
       }
     };
 
-    const connect = () => {
+const connect = () => {
       dispatch({ type: 'conn/set', conn: { status: retryRef.current > 0 ? 'reconnecting' : 'connected' } });
       // Capture since-seq at (re)connect time for server-side replay.
       // Session cookies must accompany cross-origin Vite-dev SSE as well as
       // same-origin production SSE; the backend authenticates the stream.
       es = new EventSource(api.streamUrl(runId, lastSeqRef.current || undefined), { withCredentials: true });
-      es.onopen = () => { retryRef.current = 0; dispatch({ type: 'conn/set', conn: { status: 'connected' } }); };
+      es.onopen = () => {
+        retryRef.current = 0;
+        lastUpdateRef.current = new Date().toISOString();
+        dispatch({ type: 'conn/set', conn: { status: 'connected' } });
+      };
       for (const name of KNOWN_EVENTS) {
         es.addEventListener(name, (ev) => apply((ev as MessageEvent).data));
       }
-      es.onmessage = (ev) => apply((ev as MessageEvent).data);
+      es.onmessage = (ev) => {
+        lastUpdateRef.current = new Date().toISOString();
+        apply((ev as MessageEvent).data);
+      };
       es.onerror = () => {
         dispatch({ type: 'conn/set', conn: { status: 'reconnecting' } });
         try { es?.close(); } catch { /* ignore */ }
