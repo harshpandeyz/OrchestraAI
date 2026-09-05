@@ -153,6 +153,11 @@ function needsApproval(policy, definition, riskLevel) {
 }
 
 // --- Command policy: no arbitrary shell. ---
+//
+// Agent 3: execFile() is a command restriction, NOT a sandbox. The strict
+// argv rules live in ./command-guard.js (single source of truth, shared with
+// the isolated worker); this module keeps the policy-level family
+// declarations and delegates enforcement there.
 
 // Allowlisted command families. Exact argv matching happens in environment.js;
 // this is the policy-level declaration of which families a run may use.
@@ -167,54 +172,34 @@ const COMMAND_FAMILIES = Object.freeze({
 });
 
 function classifyCommand(argv) {
-  const args = Array.isArray(argv) ? argv.filter(Boolean) : [];
-  if (!args.length) return { family: null, risk: RiskLevel.CRITICAL, reason: 'empty command' };
-  const [bin, ...rest] = args;
-  if (bin === 'node' && rest[0] && !String(rest[0]).startsWith('-')) {
-    return { family: COMMAND_FAMILIES.NODE_TEST_FILE, risk: RiskLevel.LOW, reason: 'node workspace file' };
+  try {
+    return require('./command-guard').classifyArgv(argv);
+  } catch {
+    return { family: null, risk: RiskLevel.CRITICAL, reason: 'classification failed' };
   }
-  if (bin === 'npm' && (rest.join(' ') === 'test' || /^run\s+(test|build|lint)$/.test(rest.join(' ')))) {
-    return { family: COMMAND_FAMILIES.NPM_TEST, risk: RiskLevel.LOW, reason: 'npm test/build/lint' };
-  }
-  if (bin === 'pytest' || (bin === 'python' && rest[0] === '-m' && rest[1] === 'pytest')) {
-    return { family: COMMAND_FAMILIES.PYTEST, risk: RiskLevel.LOW, reason: 'pytest' };
-  }
-  if (bin === 'cargo' && rest[0] === 'test') return { family: COMMAND_FAMILIES.CARGO_TEST, risk: RiskLevel.LOW, reason: 'cargo test' };
-  if (bin === 'go' && rest[0] === 'test') return { family: COMMAND_FAMILIES.GO_TEST, risk: RiskLevel.LOW, reason: 'go test' };
-  if (bin === 'git' && ['status', 'diff', 'log', 'branch', 'show', 'rev-parse'].includes(rest[0])) {
-    return { family: COMMAND_FAMILIES.GIT_READONLY, risk: RiskLevel.LOW, reason: 'git read-only' };
-  }
-  if (bin === 'git' && ['add', 'commit', 'checkout', 'push', 'reset', 'clean', 'branch'].includes(rest[0])) {
-    const destructive = /push|reset|clean|checkout\s+--/.test(args.join(' '));
-    return { family: COMMAND_FAMILIES.GIT_WRITE, risk: destructive ? RiskLevel.HIGH : RiskLevel.MEDIUM, reason: 'git write' };
-  }
-  // Package installs are a separate capability, never part of test commands.
-  if (/^(npm|pip|pip3|yarn|pnpm|cargo|go)\b/.test(args.join(' ')) && /install|add /.test(args.join(' '))) {
-    return { family: null, risk: RiskLevel.HIGH, reason: 'package install is a separate capability' };
-  }
-  return { family: null, risk: RiskLevel.CRITICAL, reason: `command not allowlisted: ${bin}` };
 }
 
+// Shell metacharacters: any argv element containing one is rejected. Brackets
+// [ ] are intentionally NOT in this set: pytest selectors such as
+// test.py::case[param] need them and workspace escape is still blocked by the
+// path rules in command-guard.js.
 const SHELL_METACHAR_RE = /[;&|`$(){}!#~*?<>\n\r]/;
 
 function containsShellMetachars(argv) {
-  return (Array.isArray(argv) ? argv : []).some((a) => SHELL_METACHAR_RE.test(String(a)));
+  if ((Array.isArray(argv) ? argv : []).some((a) => SHELL_METACHAR_RE.test(String(a)))) return true;
+  try {
+    return require('./command-guard').containsSubstitution((Array.isArray(argv) ? argv : []).map(String).join(' '));
+  } catch {
+    return false;
+  }
 }
 
 function isCommandAllowed(policy, argv) {
-  const classification = classifyCommand(argv);
-  if (!classification.family) return { allowed: false, ...classification };
-  if (containsShellMetachars(argv)) {
-    return { allowed: false, family: classification.family, risk: RiskLevel.CRITICAL, reason: 'shell metacharacters rejected' };
+  try {
+    return require('./command-guard').assertCommandAllowed(policy, argv);
+  } catch (e) {
+    return { allowed: false, family: null, risk: RiskLevel.CRITICAL, reason: String((e && e.message) || e).slice(0, 200) };
   }
-  const denied = (policy && policy.deniedCommands) || [];
-  const allowed = (policy && policy.allowedCommands) || [];
-  const key = argv.join(' ');
-  if (denied.some((d) => key.startsWith(d))) return { allowed: false, ...classification, reason: `command denied by policy: ${key}` };
-  if (allowed.length && !allowed.some((a) => key.startsWith(a) || classification.family === a)) {
-    return { allowed: false, ...classification, reason: 'command not in policy allowlist' };
-  }
-  return { allowed: true, ...classification };
 }
 
 module.exports = {
