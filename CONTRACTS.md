@@ -594,10 +594,12 @@ data: {"seq":123,"runId":"run-abc","type":"model.switched","ts":"2026-01-15T10:3
 ## Historical staged checklists
 
 The following checklists document the original staged interface scope. They are
-kept as compatibility context, not as a release gate. V1 intentionally uses
-single-process atomic JSON persistence, bounded in-memory cache behavior, and
-lexical retrieval; it does not require Redis, embeddings, or distributed
-infrastructure.
+kept as compatibility context, not as a release gate. Deployment posture
+(see ARCHITECTURE.md): development/test use single-process atomic JSON
+persistence (FileStore) and in-memory coordination; production compose uses
+PostgreSQL as the authoritative store and Redis for coordination/queue, with
+fail-closed readiness when either is unreachable. Lexical retrieval remains
+the V1 semantic mechanism (no embeddings infrastructure).
 
 ### Session 2 checklist
 

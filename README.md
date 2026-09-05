@@ -21,6 +21,26 @@ No `.env` editing required: open the console → welcome guide → **Settings �
 Providers** → paste a key → **Test & save**. Keys are verified against the
 real provider, encrypted at rest, and never rendered again. `.env` remains
 for deployment/bootstrap preconfiguration (see `.env.example`).
+
+## Production deployment
+
+```bash
+POSTGRES_PASSWORD=... SANDBOX_WORKER_TOKEN=... ISOLATED_EXECUTOR_TOKEN=... \
+DATA_ENCRYPTION_KEY=... FRONTEND_ORIGIN=https://console.example \
+docker compose -f deploy/docker-compose.yml up --build -d
+```
+
+What you get: API control plane + **Postgres** (authoritative durable store:
+users, sessions, orgs, projects, runs, events, snapshots, idempotency,
+evaluations, intelligence, billing, audit — migrations in
+`backend/migrations/`, applied by the entrypoint, fatal on failure) +
+**Redis** (locks, rate limits, durable `run.execute` queue) + **isolated
+sandbox worker** (customer code runs there via bounded workspace snapshots,
+never in the API process). Missing secrets fail compose interpolation;
+unreachable Postgres/Redis fail `/api/ready`, never silent fallbacks.
+No object store is provisioned (no app path needs one); no default
+passwords or public artifact policies anywhere. See `ARCHITECTURE.md`
+(operational assumptions) and `deploy/backup-procedures.md`.
 Production: `cd frontend && npm run build` → `frontend/dist`, which the runtime serves itself on :8787 (one port: console + API). Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon).
 
 ## Test it

@@ -325,17 +325,42 @@ Orchestrator evaluates budget/latency/context/model health synchronously before 
 
 ## Operational assumptions
 
-1. **Single-process runtime** — runs are isolated in memory while active; the V1 deployment does not provide distributed execution or consensus.
-2. **Atomic JSON persistence** — tenant records, terminal run summaries, economics, intelligence and audit data use the configured runtime data directory. Event replay is an in-memory per-run buffer.
-3. **SSE for real-time events** — the frontend consumes authenticated snapshots plus replayable `EventSource` streams.
-4. **Deterministic idempotency keys** — `{runId}:{operation}:{stepNumber}` is used for runtime mutations and paid-side-effect guards.
-5. **Cost estimation is forecasting** — pre-call estimates are not actual spend; canonical post-call economics use provider usage/cost or an immutable captured pricing snapshot.
+1. **API is the control plane; execution is scheduled** — `POST /messages`
+   enqueues a `run.execute` job (`run-execute:{runId}` idempotency key) and a
+   worker claims it (202 = claimed). Redis provider (`QUEUE_PROVIDER=redis`)
+   makes pending jobs durable across API restarts; the memory provider is
+   single-process (dev/test).
+2. **PostgreSQL is the production source of truth** — users, sessions,
+   organizations, projects, run index, events, snapshots, idempotency,
+   evaluations, intelligence docs, billing records, audit log
+   (`backend/migrations/001_init.sql`, `002_persistence.sql`, applied by the
+   container entrypoint; failures refuse to boot). FileStore (atomic JSON +
+   quarantine) is the explicit dev/test adapter only — never a production
+   fallback.
+3. **Redis is transient coordination only** — locks, rate limits, queue
+   scheduling, idempotency backend. Never durable business data. Degraded
+   Redis fails readiness instead of pretending.
+4. **SSE for real-time events** — the frontend consumes authenticated snapshots
+   plus replayable `EventSource` streams; replay merges the live bus with the
+   durable event log (`?since=` / Last-Event-ID, gap frames, dedupe).
+5. **Deterministic idempotency keys** — `{runId}:{operation}:{stepNumber}` is used for runtime mutations and paid-side-effect guards.
+6. **Cost estimation is forecasting** — pre-call estimates are not actual spend; canonical post-call economics use provider usage/cost or an immutable captured pricing snapshot.
+7. **Isolated execution for customer code** — `run_tests`/`build_project` in
+   production execute in the sandbox-worker via a bounded disposable workspace
+   snapshot (secret-aware, symlink-free, capped) over `ISOLATED_EXECUTOR_URL`;
+   without a reachable worker they fail closed. No host mounts, no provider
+   secrets cross the boundary.
 
 ## Current V1 boundaries
 
-1. **No distributed execution** — concurrent runs are supported within one process, but horizontal coordination is outside this V1.
+1. **Single-node API processes, shared datastores** — concurrent runs execute
+   within one API process (bounded concurrency); Postgres + Redis make state
+   durable and coordination distributed, but there is no multi-API leader
+   election or cross-instance run migration. Queue retries never blindly
+   re-run run execution (unknown side effects); recovery-service decides
+   resume/skip/refuse.
 2. **In-flight recovery is unsupported** — terminal summaries survive restart; interrupted active runs are marked failed and are not silently resumed.
-3. **Execution tools are restricted in production** — safe read-only tools may run inside tenant-scoped workspaces; high-risk shell, patch, git, network and browser automation are denied unless a separately isolated executor is provided.
+3. **Execution tools are restricted in production** — safe read-only tools may run inside tenant-scoped workspaces; `run_tests`/`build_project` run ONLY in the isolated sandbox-worker (workspace snapshot in, results/artifacts out, workspace destroyed). High-risk shell, patch, git, network and browser automation stay denied; network egress is deny-by-default with an explicit allowlist.
 4. **Production authentication fails closed** — sessions/bearer tokens and tenant ownership checks protect private APIs; a production `DATA_ENCRYPTION_KEY` is required for stored provider credentials.
 5. **Tool concurrency is bounded** — parallel work uses an explicit concurrency limit and does not imply durable distributed scheduling.
 
