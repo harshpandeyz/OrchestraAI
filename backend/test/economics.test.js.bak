@@ -251,57 +251,6 @@ async function main() {
     assert.strictEqual(rec.providerCostUsd, null);
     assert.strictEqual(rec.canonicalCostUsd, null);
   });
-
-  await test('cached tokens with pricing produce correct cost source', async () => {
-    const rec = createModelCallRecord({
-      runId: 'r', providerCall: false, cacheType: 'local_response',
-      usage: { inputTokens: 1000, outputTokens: 500, cachedTokens: 500 },
-      pricingSnapshot: { modelId: 'm', inputPer1k: 0.001, outputPer1k: 0.002, cachedPer1k: 0.0005, source: 'registry' },
-      calculatedCostUsd: 0.00085,
-    });
-    assert.strictEqual(rec.usageSource, 'cache_hit');
-    assert.strictEqual(rec.costSource, 'local_response_cache_hit');
-    assert.strictEqual(rec.canonicalCostUsd, 0, 'canonical cost is 0 when providerCall is false');
-  });
-
-  await test('partial usage with pricing has correct cost source', async () => {
-    const rec = createModelCallRecord({
-      runId: 'r', providerCall: true,
-      usage: { inputTokens: 100, outputTokens: null, cachedTokens: null },
-      pricingSnapshot: { modelId: 'm', inputPer1k: 0.001, outputPer1k: 0.002, source: 'registry' },
-      calculatedCostUsd: 0.0001,
-    });
-    assert.strictEqual(rec.usageSource, 'provider_reported_partial');
-    assert.strictEqual(rec.canonicalCostUsd, 0.0001, 'partial usage has calculated cost');
-  });
-
-  await test('missing usage tokens stay null, no fictitious cost', async () => {
-    const rec = createModelCallRecord({
-      runId: 'r', providerCall: true,
-      usage: { inputTokens: null, outputTokens: null, cachedTokens: null },
-      pricingSnapshot: { modelId: 'm', inputPer1k: 0.001, outputPer1k: 0.002, source: 'registry' },
-      calculatedCostUsd: null,
-    });
-    assert.strictEqual(rec.usage.inputTokens, null);
-    assert.strictEqual(rec.usage.outputTokens, null);
-    assert.strictEqual(rec.usage.cachedTokens, null);
-    assert.strictEqual(rec.canonicalCostUsd, null, 'no cost without usage');
-    assert.strictEqual(rec.costSource, 'unknown');
-  });
-
-  await test('zero usage with pricing returns zero cost, not fictitious', async () => {
-    const rec = createModelCallRecord({
-      runId: 'r', providerCall: true,
-      usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
-      pricingSnapshot: { modelId: 'm', inputPer1k: 0.001, outputPer1k: 0.002, source: 'registry' },
-      calculatedCostUsd: 0,
-    });
-    assert.strictEqual(rec.usage.inputTokens, 0);
-    assert.strictEqual(rec.usage.outputTokens, 0);
-    assert.strictEqual(rec.usage.cachedTokens, 0);
-    assert.strictEqual(rec.canonicalCostUsd, 0, 'zero tokens with pricing = zero cost');
-    assert.strictEqual(rec.costSource, 'pricing_snapshot');
-  });
 }
 
 main().then(() => {

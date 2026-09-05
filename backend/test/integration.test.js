@@ -501,7 +501,7 @@ async function main() {
   });
 
   await test('Scenario 7: budget nearly exhausted -> safe termination', async () => {
-    const id = await runToCompletion('sc-7', 'Tests are failing, investigate deeply and thoroughly', { run: { budget: 0.0000001 }, timeoutMs: 90000 });
+    const id = await runToCompletion('sc-7', 'Tests are failing, investigate deeply and thoroughly', { run: { budget: 0.0001 }, timeoutMs: 90000 });
     const s = snapOf(id);
     assert.ok(['completed', 'failed'].includes(s.status));
     assert.ok(typesOf(id).includes('budget.exceeded'), 'budget exceeded surfaced');

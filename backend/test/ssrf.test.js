@@ -248,6 +248,32 @@ async function main() {
     assert.ok(Env.parseTestCommandString('npm test', ws));
     assert.ok(Env.parseTestCommandString('pytest -q', ws));
   });
+  await test('adversarial URL encoding tricks are blocked', () => {
+    for (const u of [
+      'https://%2e%2e.public.example/x',     // double-dot encoding
+      'https://public.example/%2e%2e/secret', // double-dot in path
+      'https://public.example/%2fsecret',     // encoded slash
+      'https://public.example/%2e%2e%2e/secret', // triple-dot
+      'https://public.example/..%2fsecret',   // dot-slash encoding
+      'https://public.example/..;/secret',    // semicolon in path
+      'https://public.example/\@secret',      // encoded @
+      'https://public.example/%252e%252e%252fsecret', // double-encoded
+    ]) {
+      assert.throws(() => Env.parseAndGuardUrl(u, ENABLED), null, u);
+    }
+    assert.ok(Env.parseAndGuardUrl('https://public.example/page', ENABLED));
+  });
+
+  await test('adversarial IPv6 formatting rejections', () => {
+    for (const ip of [
+      'http://[::192.168.1.1]/',    // IPv4-mapped in IPv6
+      'http://[::ffff:127.0.0.1]/', // IPv4-mapped loopback
+      'http://[fe80::1]/',          // link-local IPv6
+      'http://[fc00::1]/',          // unique-local IPv6
+    ]) {
+      assert.throws(() => Env.parseAndGuardUrl(ip, ENABLED), null, ip);
+    }
+  });
 }
 
 main().then(() => {
