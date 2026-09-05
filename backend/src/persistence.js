@@ -240,6 +240,20 @@ class FileStore {
     });
   }
 
+  // Merge newly observed immutable envelopes instead of replacing the whole
+  // run log. This keeps the adapter's behavior aligned with Postgres when a
+  // persistence tick races another in-process writer.
+  appendEvents(runId, events) {
+    const merged = new Map();
+    for (const event of this.loadEvents(runId)) {
+      if (event && Number.isFinite(event.seq)) merged.set(event.seq, event);
+    }
+    for (const event of Array.isArray(events) ? events : []) {
+      if (event && Number.isFinite(event.seq) && !merged.has(event.seq)) merged.set(event.seq, event);
+    }
+    return this.saveEvents(runId, Array.from(merged.values()).sort((a, b) => a.seq - b.seq).slice(-MAX_EVENTS_PER_RUN));
+  }
+
   loadEvents(runId) {
     const { value } = this._readJson(`${runId}.events.json`, []);
     return Array.isArray(value) ? value : [];
@@ -409,4 +423,30 @@ module.exports = {
   RETENTION_GRACE_MS, TMP_MAX_AGE_MS, MAX_CORRUPT_KEPT,
   INTELLIGENCE_CAPS, GENERIC_ARRAY_CAP,
   pruneIntelligenceDoc, intelligenceOverflow,
+  // Production datastore boundary (Agent 1). FileStore is the explicit
+  // development/test adapter (single-process atomic JSON). Production
+  // multi-instance deployments must use the postgres adapter via
+  // infrastructure/datastore.js + backend/migrations/*.sql. This guard
+  // makes a postgres->file downgrade a loud operational error instead of a
+  // silent fallback: call after resolving the datastore kind.
+  assertNoSilentFallback,
+  isFileAdapter,
 };
+
+// True when the resolved datastore is the file adapter (dev/test).
+function isFileAdapter(kind) {
+  return String(kind || 'file').toLowerCase() !== 'postgres';
+}
+
+// Throws code 'datastore_fallback' when a DATABASE_URL was configured but
+// the resolved kind is still file (wiring bug). Never auto-swaps adapters.
+function assertNoSilentFallback(config, resolvedKind) {
+  const kind = String(resolvedKind || 'file').toLowerCase();
+  const urlConfigured = !!(config && config.databaseUrl);
+  if (urlConfigured && kind !== 'postgres') {
+    const err = new Error('DATABASE_URL is configured but the resolved datastore is file; refusing to silently bypass Postgres');
+    err.code = 'datastore_fallback';
+    throw err;
+  }
+  return true;
+}
