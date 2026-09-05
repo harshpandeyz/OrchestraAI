@@ -57,6 +57,48 @@ function confidenceFor(n) {
   return 'none';
 }
 
+// Workload dimensions (Agent 2): evidence is keyed by model x task category
+// x context-size bucket x tool profile, so a model that shines on small
+// no-tool tasks does not borrow credit on large tool-heavy ones. Buckets are
+// coarse and deterministic; priors stay conservative and low-n workload
+// slices blend toward the category rate instead of ruling.
+function contextBucket(contextTokens) {
+  const n = Number(contextTokens);
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n <= 2000) return 's';
+  if (n <= 16000) return 'm';
+  return 'l';
+}
+
+function toolProfileKey(toolProfile) {
+  if (toolProfile === null || toolProfile === undefined || toolProfile === '') return null;
+  if (Array.isArray(toolProfile)) {
+    const names = toolProfile.map((t) => String((t && t.name) || t)).filter(Boolean).sort();
+    return names.length ? `tools:${names.join(',')}` : 'tools:none';
+  }
+  return `tools:${String(toolProfile).slice(0, 120)}`;
+}
+
+function workloadKey(workload = {}) {
+  const ctx = contextBucket(workload.contextTokens);
+  const tools = toolProfileKey(workload.toolProfile);
+  if (!ctx && !tools) return null;
+  return `${ctx || 'ctx:?'}|${tools || 'tools:?'}`;
+}
+
+function sanitizeWorkloads(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [k, w] of Object.entries(raw).slice(0, 50)) {
+    if (!w || typeof w !== 'object') continue;
+    out[String(k).slice(0, 160)] = {
+      attempts: Math.max(0, Math.floor(Number(w.attempts) || 0)),
+      successes: Math.max(0, Math.floor(Number(w.successes) || 0)),
+    };
+  }
+  return out;
+}
+
 class ModelPerformanceStore {
   constructor(options = {}) {
     this.priorSuccess = Number.isFinite(options.priorSuccess) ? options.priorSuccess : DEFAULT_PRIOR_SUCCESS;
@@ -84,13 +126,16 @@ class ModelPerformanceStore {
         latencySamples: [],
         lastUpdated: null,
         version: this.version,
+        workloads: {},
       };
       this.records.set(k, r);
     }
+    if (!r.workloads || typeof r.workloads !== 'object') r.workloads = {};
     return r;
   }
 
-  // outcome: { success: bool|null, qualityScore: 0..1|null, latencyMs, errorCode }
+  // outcome: { success: bool|null, qualityScore: 0..1|null, latencyMs, errorCode,
+  //            contextTokens, toolProfile }
   // success=null means "no outcome evidence" -> record latency only, never
   // moves success counters (learning safety: unknown stays unknown).
   recordOutcome(modelId, category, outcome = {}) {
@@ -100,6 +145,15 @@ class ModelPerformanceStore {
     if (hasSuccess) {
       r.attempts += 1;
       if (outcome.success) r.successes += 1;
+      // Workload slice: same counters per (context bucket x tool profile).
+      // One sample never dominates — consumers blend toward the category
+      // rate until the slice has >= 2 attempts.
+      const wkey = workloadKey({ contextTokens: outcome.contextTokens, toolProfile: outcome.toolProfile });
+      if (wkey) {
+        const w = r.workloads[wkey] || (r.workloads[wkey] = { attempts: 0, successes: 0 });
+        w.attempts += 1;
+        if (outcome.success) w.successes += 1;
+      }
     }
     if (Number.isFinite(Number(outcome.qualityScore))) {
       const q = clamp01(outcome.qualityScore);
@@ -138,12 +192,17 @@ class ModelPerformanceStore {
   // explicit confidence + sample count so callers can reason about
   // uncertainty (§27). With zero samples this returns the prior with
   // confidence 'none' and observed=false.
-  predictedSuccess(modelId, category) {
+  //
+  // workload ({ contextTokens, toolProfile }) optionally narrows the estimate
+  // to the matching workload slice. Slices with < 2 attempts blend toward
+  // the category rate (prior weight 2) so one sample can never dominate;
+  // the category-level fields below are unchanged.
+  predictedSuccess(modelId, category, workload = null) {
     const r = this.records.get(this._key(modelId, category));
     const attempts = r ? r.attempts : 0;
     const successes = r ? r.successes : 0;
     const smoothed = (successes + this.priorSuccess * this.priorSamples) / (attempts + this.priorSamples);
-    return {
+    let out = {
       modelId,
       category: category || 'general',
       predicted: Math.round(smoothed * 1000) / 1000,
@@ -153,7 +212,22 @@ class ModelPerformanceStore {
       confidence: confidenceFor(attempts),
       prior: { success: this.priorSuccess, samples: this.priorSamples },
       estimatorVersion: this.version,
+      workload: null,
     };
+    const wkey = workload ? workloadKey(workload) : null;
+    const slice = wkey && r && r.workloads ? r.workloads[wkey] : null;
+    if (wkey && slice && slice.attempts >= 2) {
+      const priorW = 2;
+      const blended = (slice.successes + smoothed * priorW) / (slice.attempts + priorW);
+      out = {
+        ...out,
+        predicted: Math.round(blended * 1000) / 1000,
+        workload: { key: wkey, attempts: slice.attempts, successes: slice.successes, blendedToward: 'category rate' },
+      };
+    } else if (wkey) {
+      out = { ...out, workload: { key: wkey, attempts: slice ? slice.attempts : 0, successes: slice ? slice.successes : 0, blendedToward: 'category rate (insufficient slice evidence)' } };
+    }
+    return out;
   }
 
   latency(modelId, category) {
@@ -235,6 +309,7 @@ class ModelPerformanceStore {
         latencySamples: Array.isArray(r.latencySamples) ? r.latencySamples.filter(Number.isFinite).slice(-MAX_LATENCY_SAMPLES) : [],
         lastUpdated: r.lastUpdated || null,
         version: r.version || this.version,
+        workloads: sanitizeWorkloads(r.workloads),
       });
       n++;
     }
@@ -312,4 +387,7 @@ module.exports = {
   confidenceFor,
   latencyStats,
   clamp01,
+  contextBucket,
+  toolProfileKey,
+  workloadKey,
 };
