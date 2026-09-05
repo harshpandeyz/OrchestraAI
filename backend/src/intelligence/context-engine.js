@@ -126,6 +126,62 @@ function scoreContextItem(item, ctx = {}) {
 
 // Budgeted selection with dependency closure. Returns selected + omitted with
 // reasons (§13). Deterministic: sort by (score desc, tokens asc, id asc).
+//
+// Categories (explicit, budget-aware):
+//   MUST_KEEP      — user task, hard constraints, success criteria, system
+//                    instructions. Selected first, bypass the relevance
+//                    threshold, never compressed. If MUST_KEEP alone exceeds
+//                    the budget it is still preserved verbatim and the result
+//                    is flagged overBudget (dropping the user task is never
+//                    the answer; the caller must raise the budget).
+//   SHOULD_KEEP    — selected by score while budget remains.
+//   OPTIONAL       — selected only after SHOULD_KEEP, while budget remains.
+//   NEVER_COMPRESS — selection-eligible by score, but never a compression
+//                    candidate (verbatim or omitted, never summarized).
+//
+// Dependency closure invariant: an item is selected only together with its
+// transitive keep-status dependencies. When the closure does not fit, the
+// dependent is omitted with an explicit reason (never silently detached).
+const CONTEXT_CATEGORIES = Object.freeze(['MUST_KEEP', 'SHOULD_KEEP', 'OPTIONAL', 'NEVER_COMPRESS']);
+
+// Mirrors the context-manager protected set (kept local to avoid a cycle:
+// the manager imports this engine, never the reverse).
+function isProtectedCategoryItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (item.protected === true) return true;
+  const meta = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+  if (meta.protected === true || meta.neverCompress === true) return false; // handled as NEVER_COMPRESS below
+  const kind = String(item.kind || '').toLowerCase();
+  const source = String(item.source || '').toLowerCase();
+  const title = String(item.title || '');
+  const category = String(meta.category || meta.kind || '').toLowerCase();
+  if (['user_task', 'constraint', 'constraints', 'success_criteria', 'criteria', 'criterion', 'system'].includes(category)) return true;
+  if (source === 'user') return true;
+  if (kind === 'chat' && /user task/i.test(title)) return true;
+  if (kind === 'constraint' || kind === 'constraints') return true;
+  if (kind === 'criterion' || kind === 'criteria' || kind === 'success_criteria' || kind === 'success-criteria') return true;
+  if (kind === 'system' || source === 'system') return true;
+  return false;
+}
+
+function categorizeContextItem(item) {
+  if (!item || typeof item !== 'object') return 'OPTIONAL';
+  const meta = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+  const explicit = String(meta.contextCategory || item.contextCategory || '').toUpperCase();
+  if (CONTEXT_CATEGORIES.includes(explicit)) {
+    // Explicit NEVER_COMPRESS wins over derived MUST_KEEP for compression
+    // purposes, but MUST_KEEP protection (verbatim preservation) always wins
+    // for selection: a protected item is never droppable.
+    if (explicit === 'NEVER_COMPRESS' && isProtectedCategoryItem(item)) return 'MUST_KEEP';
+    return explicit;
+  }
+  if (meta.protected === true || meta.neverCompress === true || item.protected === true) return 'NEVER_COMPRESS';
+  if (isProtectedCategoryItem(item)) return 'MUST_KEEP';
+  const rel = Number(item.relevance);
+  if (Number.isFinite(rel) && rel >= 0.7) return 'SHOULD_KEEP';
+  return 'OPTIONAL';
+}
+
 function selectContext(items, opts = {}) {
   const budget = Math.max(0, Number(opts.tokenBudget) || 0) || Infinity;
   const threshold = Number.isFinite(Number(opts.relevanceThreshold)) ? Number(opts.relevanceThreshold) : 0;
@@ -135,41 +191,119 @@ function selectContext(items, opts = {}) {
   scored.sort((a, b) => b.s.score - a.s.score || (a.item.tokens || 0) - (b.item.tokens || 0) || String(a.item.id).localeCompare(String(b.item.id)));
 
   const byId = new Map((items || []).map((i) => [i.id, i]));
+  const scoreById = new Map(scored.map(({ item, s }) => [item.id, s]));
   const selected = [];
   const omitted = [];
+  const decided = new Set();
   let used = 0;
+  let overBudget = false;
 
-  const fits = (it) => (used + (Number(it.tokens) || 0)) <= budget;
+  const fits = (tokens) => (used + (Number(tokens) || 0)) <= budget;
 
-  for (const { item, s } of scored) {
+  // Transitive keep-status closure, deterministic (BFS, id order). Missing or
+  // non-KEEP references cannot be selected, so they never block the
+  // dependent — but every resolvable dependency must fit, or the dependent
+  // is omitted rather than silently detached.
+  const closureOf = (item) => {
+    const out = [];
+    const seen = new Set([item.id]);
+    const queue = [...(item.dependencies || (item.metadata && item.metadata.dependsOn) || [])].map(String);
+    while (queue.length) {
+      queue.sort();
+      const id = queue.shift();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const dep = byId.get(id);
+      if (!dep || decided.has(id)) continue;
+      if (dep.status && dep.status !== 'KEEP') continue;
+      out.push(dep);
+      for (const d of (dep.dependencies || (dep.metadata && dep.metadata.dependsOn) || []).map(String)) {
+        if (!seen.has(d)) queue.push(d);
+      }
+    }
+    return out;
+  };
+
+  const trySelect = ({ item, s }, { mustKeep }) => {
+    if (decided.has(item.id)) return;
     if (item.status && item.status !== 'KEEP') {
-      omitted.push({ id: item.id, title: item.title, reason: `status ${item.status}`, score: s.score });
+      decided.add(item.id);
+      omitted.push({ id: item.id, title: item.title, reason: `status ${item.status}`, score: s.score, category: categorizeContextItem(item) });
+      return;
+    }
+    if (!mustKeep && s.score < threshold) {
+      decided.add(item.id);
+      omitted.push({ id: item.id, title: item.title, reason: `below relevance threshold (${s.score} < ${threshold}): ${s.explanation}`, score: s.score, category: categorizeContextItem(item) });
+      return;
+    }
+    const closure = closureOf(item);
+    const need = (Number(item.tokens) || 0) + closure.reduce((n, d) => n + (Number(d.tokens) || 0), 0);
+    if (!mustKeep && !fits(need)) {
+      decided.add(item.id);
+      const missing = closure.length ? ` + closure [${closure.map((d) => d.id).join(', ')}]` : '';
+      omitted.push({ id: item.id, title: item.title, reason: `token budget exceeded (needs ${need}${missing}, ${budget === Infinity ? 'unbounded' : Math.max(0, budget - used)} left)`, score: s.score, category: categorizeContextItem(item) });
+      return;
+    }
+    // MUST_KEEP is preserved verbatim even when it alone exceeds the budget;
+    // the overBudget flag tells the caller to raise the budget (the user
+    // task, constraints, criteria and system instructions are never dropped
+    // to satisfy accounting).
+    if (mustKeep && !fits(need)) overBudget = true;
+    decided.add(item.id);
+    selected.push({ item, score: s, category: 'MUST_KEEP' });
+    used += Number(item.tokens) || 0;
+    for (const dep of closure) {
+      if (decided.has(dep.id)) continue;
+      decided.add(dep.id);
+      selected.push({ item: dep, score: scoreById.get(dep.id) || scoreContextItem(dep, { ...ctx, dependencyHits: depSet }), category: 'MUST_KEEP (closure)' });
+      used += Number(dep.tokens) || 0;
+    }
+  };
+
+  // Phase 1: MUST_KEEP first (score order among themselves for determinism).
+  const must = [];
+  const rest = [];
+  for (const entry of scored) {
+    (categorizeContextItem(entry.item) === 'MUST_KEEP' ? must : rest).push(entry);
+  }
+  for (const entry of must) trySelect(entry, { mustKeep: true });
+  // Phase 2: SHOULD_KEEP, then NEVER_COMPRESS, then OPTIONAL — score order.
+  const rank = { SHOULD_KEEP: 0, NEVER_COMPRESS: 1, OPTIONAL: 2 };
+  rest.sort((a, b) =>
+    (rank[categorizeContextItem(a.item)] ?? 2) - (rank[categorizeContextItem(b.item)] ?? 2) ||
+    b.s.score - a.s.score || (a.item.tokens || 0) - (b.item.tokens || 0) || String(a.item.id).localeCompare(String(b.item.id)));
+  for (const entry of rest) {
+    if (decided.has(entry.item.id)) continue; // pulled in as closure
+    const s = entry.s;
+    if (entry.item.status && entry.item.status !== 'KEEP') {
+      decided.add(entry.item.id);
+      omitted.push({ id: entry.item.id, title: entry.item.title, reason: `status ${entry.item.status}`, score: s.score, category: categorizeContextItem(entry.item) });
       continue;
     }
     if (s.score < threshold) {
-      omitted.push({ id: item.id, title: item.title, reason: `below relevance threshold (${s.score} < ${threshold}): ${s.explanation}`, score: s.score });
+      decided.add(entry.item.id);
+      omitted.push({ id: entry.item.id, title: entry.item.title, reason: `below relevance threshold (${s.score} < ${threshold}): ${s.explanation}`, score: s.score, category: categorizeContextItem(entry.item) });
       continue;
     }
-    if (!fits(item)) {
-      omitted.push({ id: item.id, title: item.title, reason: `token budget exceeded (needs ${item.tokens}, ${Math.max(0, budget - used)} left)`, score: s.score });
+    const closure = closureOf(entry.item);
+    const need = (Number(entry.item.tokens) || 0) + closure.reduce((n, d) => n + (Number(d.tokens) || 0), 0);
+    if (!fits(need)) {
+      decided.add(entry.item.id);
+      const missing = closure.length ? ` + closure [${closure.map((d) => d.id).join(', ')}]` : '';
+      omitted.push({ id: entry.item.id, title: entry.item.title, reason: `token budget exceeded (needs ${need}${missing}, ${budget === Infinity ? 'unbounded' : Math.max(0, budget - used)} left)`, score: s.score, category: categorizeContextItem(entry.item) });
       continue;
     }
-    selected.push({ item, score: s });
-    used += Number(item.tokens) || 0;
-    // Dependency closure: pull in referenced items even if scored lower.
-    const deps = item.dependencies || (item.metadata && item.metadata.dependsOn) || [];
-    for (const depId of deps) {
-      const dep = byId.get(depId);
-      if (!dep || selected.some((x) => x.item.id === depId) || omitted.some((x) => x.id === depId)) continue;
-      if (!fits(dep)) {
-        omitted.push({ id: dep.id, title: dep.title, reason: `dependency of ${item.id} but token budget exceeded`, score: scoreContextItem(dep, { ...ctx, dependencyHits: depSet }).score });
-        continue;
-      }
-      selected.push({ item: dep, score: scoreContextItem(dep, { ...ctx, dependencyHits: depSet }) });
+    decided.add(entry.item.id);
+    selected.push({ item: entry.item, score: s, category: categorizeContextItem(entry.item) });
+    used += Number(entry.item.tokens) || 0;
+    for (const dep of closure) {
+      if (decided.has(dep.id)) continue;
+      decided.add(dep.id);
+      selected.push({ item: dep, score: scoreById.get(dep.id) || scoreContextItem(dep, { ...ctx, dependencyHits: depSet }), category: `${categorizeContextItem(dep)} (closure)` });
       used += Number(dep.tokens) || 0;
     }
   }
-  return { selected, omitted, usedTokens: used, tokenBudget: budget === Infinity ? null : budget };
+  return { selected, omitted, usedTokens: used, tokenBudget: budget === Infinity ? null : budget, overBudget };
 }
 
 // ---------- PromptPlan (§14) ----------
@@ -332,6 +466,8 @@ function fingerprintContext(input = {}) {
 module.exports = {
   DEFAULT_WEIGHTS,
   KIND_TASK_AFFINITY,
+  CONTEXT_CATEGORIES,
+  categorizeContextItem,
   lexicalOverlap,
   scoreContextItem,
   selectContext,
