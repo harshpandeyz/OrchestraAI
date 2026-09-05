@@ -168,8 +168,9 @@ class InMemoryContextManager extends ContextManager {
         protected: isProtectedContextItem(item),
       }))
       .sort((a, b) => a.s - b.s || (b.item.tokens || 0) - (a.item.tokens || 0));
-    // Exclude protected items from compression candidates entirely.
-    const candidates = scored.filter((c) => !c.protected);
+    // Exclude protected + NEVER_COMPRESS items from compression candidates
+    // entirely.
+    const candidates = scored.filter((c) => !c.protected && contextEngine.categorizeContextItem(c.item) !== 'NEVER_COMPRESS');
 
     for (const { item } of candidates) {
       if (reclaimed >= toReclaim) break;
@@ -395,11 +396,12 @@ class InMemoryContextManager extends ContextManager {
       taskCategory: profile.category,
       usedTokens,
       tokenBudget: budget,
-      included: selected.map(({ item, score }) => ({
+      included: selected.map(({ item, score, category }) => ({
         id: item.id, title: item.title, kind: item.kind,
         tokens: item.tokens, score: score.score, reason: score.explanation,
+        category: category || contextEngine.categorizeContextItem(item),
       })),
-      excluded: omitted.map((o) => ({ id: o.id, title: o.title, reason: o.reason, score: o.score })),
+      excluded: omitted.map((o) => ({ id: o.id, title: o.title, reason: o.reason, score: o.score, category: o.category || null })),
       scoringVersion: VERSIONS.contextScoring,
     };
   }
