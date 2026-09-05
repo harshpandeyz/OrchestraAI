@@ -65,8 +65,21 @@ const { resolveRunConfig } = require('./src/run-config');
 const { TenantStore } = require('./src/tenant-store');
 const { aggregate: aggregateBilling, fromSavings: billingLine } = require('./src/billing');
 const { buildAnalytics } = require('./src/analytics');
+const { buildIntelligence } = require('./src/intelligence-analytics');
 const { verifyStripeSignature, eventMetadata } = require('./src/billing-webhooks');
 const { persistedEvents, persistedSnapshot, persistedRunSummary, normalizePrivacyMode } = require('./src/privacy');
+// Agent 1 production infrastructure (datastore/Redis/locks/queue/readiness).
+// All new environment variables are centralized in src/config.js; this file
+// reads them via `config`, never via new process.env accesses.
+const { assertNoSilentFallback } = require('./src/persistence');
+const { createDatastore } = require('./src/infrastructure/datastore');
+const { createCoordinator, createMemoryCoordinatorForTests } = require('./src/infrastructure/redis');
+const { LockManager } = require('./src/infrastructure/locks');
+const { RateLimiter } = require('./src/infrastructure/rate-limit');
+const { createJobQueue } = require('./src/infrastructure/queue');
+const { checkReadiness } = require('./src/infrastructure/readiness');
+const { parseCursor, parseLastEventIdHeader, readDurableSince } = require('./src/infrastructure/event-log');
+const { RedisIdempotencyBackend, PostgresIdempotencyBackend } = require('./src/idempotency');
 
 const config = loadConfig();
 const log = createLogger({ level: config.logLevel });
@@ -94,7 +107,7 @@ const disabledProviders = disabledSet(process.env);
 const credentials = new CredentialStore(config.dataDir, {
   logger: log,
   encryptionKey: config.dataEncryptionKey,
-  requireEncryptionKey: process.env.NODE_ENV === 'production',
+  requireEncryptionKey: config.isProduction,
 });
 const runtimeSettings = new RuntimeSettings(config.dataDir, { logger: log });
 const modelChanges = new ModelChangeLog(config.dataDir);
@@ -318,19 +331,227 @@ const toolRegistry = new InMemoryToolRegistry(eventBus);
 // Tool catalog is real (sandboxed handlers) in every mode.
 toolRegistry.seedTools(TOOLS);
 const store = new FileStore(config.dataDir, { logger: log });
-const tenants = new TenantStore(config.dataDir);
-// Durable idempotency (Session 1 primitive for Session 3 tools).
-const idempotencyStore = new IdempotencyStore(config.dataDir, { logger: log });
+// Production datastore boundary: FileStore is the explicit dev/test adapter.
+// Postgres is selected via DATASTORE_PROVIDER/DATABASE_URL (see config.js +
+// infrastructure/datastore.js). Postgres requested-but-unavailable throws at
+// factory time — never a silent fallback to JSON.
+let datastore = { kind: 'file', store, pg: null };
 try {
-  const restored = store.loadIdempotency();
-  if (Array.isArray(restored) && restored.length) {
-    for (const r of restored.slice(-1000)) {
-      if (r && typeof r.key === 'string' && !idempotencyStore.records.has(r.key)) {
-        idempotencyStore.records.set(r.key, r);
+  datastore = createDatastore(config, { fileStore: store, logger: log });
+  assertNoSilentFallback(config, datastore.kind);
+  if (datastore.kind !== 'file') log.info('durable datastore active', { kind: datastore.kind });
+} catch (e) {
+  // Fail fast: a miswired production datastore must not boot on JSON.
+  throw new Error(`refusing to start: datastore misconfigured: ${String((e && e.message) || e).slice(0, 300)}`);
+}
+const tenants = new TenantStore(config.dataDir);
+// Authoritative durable run persistence: Postgres when configured
+// (DATASTORE_PROVIDER=postgres + DATABASE_URL), FileStore only as the
+// explicit dev/test adapter. Reads/writes below go through runStore —
+// never past it to `store` — so Postgres is genuinely the source of truth.
+const { RunStore } = require('./src/infrastructure/run-store');
+const runStore = new RunStore({ datastore, fileStore: store, logger: log });
+if (datastore.kind === 'postgres' && datastore.pg) {
+  tenants.remote = datastore.pg;
+  log.info('tenant store durable backend active', { kind: 'postgres' });
+}
+// Append-only audit for security-relevant operations. Postgres mode writes
+// to audit_log; file mode keeps audit in structured logs. Never throws into
+// request paths (failures are logged, never fatal).
+async function auditEvent({ actor = null, action, runId = null, projectId = null, orgId = null, detail = null } = {}) {
+  if (!action) return;
+  try {
+    const r = await runStore.audit({ actor, action, runId, projectId, orgId, detail });
+    if (!r.ok && r.error) log.warn('audit write failed', { action, error: r.error });
+  } catch (e) {
+    log.warn('audit write failed', { action, error: String((e && e.message) || e).slice(0, 160) });
+  }
+  if (runStore.kind !== 'postgres') {
+    try { log.info('audit', { actor, action, runId, projectId, orgId }); } catch {}
+  }
+}
+// Durable idempotency (Session 1 primitive for Session 3 tools).
+// Production paid/durable side effects must use the async distributed path
+// (beginAsync/completeAsync); the local Map is only the dev/test authority.
+const idempotencyStore = new IdempotencyStore(config.dataDir, { logger: log });
+// Distributed coordination (Redis) + durable job scheduling. Synchronous
+// memory adapters boot immediately so tests/demo never need infrastructure;
+// when REDIS_URL is configured the coordinator upgrades asynchronously and
+// readiness reflects the real state (degraded => not ready, never silent).
+let coordinator = createMemoryCoordinatorForTests();
+let locks = new LockManager(coordinator);
+let distributedLimiter = new RateLimiter(coordinator);
+const coordinationRequired = !!(config.redisUrl || config.queueProvider === 'redis');
+let coordinationReady = !coordinationRequired;
+let coordinationPromise = Promise.resolve();
+let jobQueue = createJobQueue({
+  provider: config.queueProvider === 'redis' ? 'redis' : 'memory',
+  coordinator, concurrency: config.queueConcurrency, logger: log,
+});
+// Durable execution scheduling boundary: run-lifecycle jobs go through the
+// queue so API -> enqueue -> worker claims -> executes -> persists -> emits
+// holds in every deployment. Run execution is NON-retryable by construction
+// (unknown side effects are never blindly re-run; recovery-service decides
+// resume/skip/refuse). Maintenance uses retryable jobs. Handlers resolve
+// their dependencies lazily because the queue boots before the orchestrator.
+function wireQueueHandlers(q) {
+  q.on('run.execute', async (job) => {
+    // When Redis is configured, the initial in-memory queue is only a startup
+    // buffer. Do not execute a job against process-local coordination before
+    // the shared coordinator has been probed and installed.
+    if (coordinationRequired && !coordinationReady) {
+      await coordinationPromise;
+      if (!coordinationReady) {
+        throw Object.assign(new Error('shared coordination is not ready'), { code: 'coordination_unavailable' });
       }
     }
+    const { runId, content, attempt } = (job && job.payload) || {};
+    if (!runId || typeof runId !== 'string') {
+      throw Object.assign(new Error('run.execute job missing runId'), { code: 'bad_params' });
+    }
+    const text = String(content || '');
+    const waitMs = Math.min((config.runTimeoutMs || 300000) + 60000, 600000);
+    // Distributed execution claim: exactly one worker runs a run at a time,
+    // even across API instances sharing the redis queue. withLock renews the
+    // lease while the provider/tool loop runs, so a long run cannot be
+    // mistaken for a crashed worker and started concurrently elsewhere.
+    try {
+      return await locks.withLock(`run-exec:${runId}`, waitMs, () => executeRunJob(runId, text, attempt, waitMs));
+    } catch (e) {
+      if (e && (e.code === 'lock_busy' || e.code === 'lock_lost')) throw e;
+      if (e && e.code !== 'lock_unavailable') throw e;
+      throw Object.assign(new Error('Run is already executing; wait for it to finish.'), { code: 'busy' });
+    }
+  });
+  q.on('maintenance.sweep', async () => runRetentionSweep('queued'));
+}
+
+// The actual run lifecycle (start or same-run continuation episode), run
+// under the distributed claim above. Terminal/refused outcomes throw with
+// honest codes; post-claim progress travels over SSE/run state.
+async function executeRunJob(runId, text, attempt, waitMs) {
+  if (attempt === 'continue') {
+    let cont = null;
+    try {
+      cont = await execution.continueRun(runId, text);
+    } catch (ce) {
+      throw Object.assign(new Error(String((ce && ce.message) || ce).slice(0, 220)), { code: 'terminal' });
+    }
+    if (!cont || !cont.ok) throw Object.assign(new Error('continuation refused'), { code: 'terminal' });
+    await orchestrator.waitForCompletion(runId, waitMs);
+    return { accepted: true, continued: true, episodeId: (cont.episode && cont.episode.episodeId) || null };
   }
-} catch {}
+  try {
+    await orchestrator.startRun(runId, text);
+  } catch (e) {
+    // Session 3: a message to a COMPLETED run continues the SAME run as a
+    // new execution episode (never an unrelated run).
+    if (e && e.code === 'terminal') {
+      let cont = null;
+      try {
+        cont = await execution.continueRun(runId, text);
+      } catch (ce) {
+        throw Object.assign(new Error(String((ce && ce.message) || ce).slice(0, 220)), { code: 'terminal' });
+      }
+      if (!cont || !cont.ok) throw e;
+      await orchestrator.waitForCompletion(runId, waitMs);
+      return { accepted: true, continued: true, episodeId: (cont.episode && cont.episode.episodeId) || null };
+    }
+    throw e;
+  }
+  await orchestrator.waitForCompletion(runId, waitMs);
+  return { accepted: true };
+}
+function wireIdempotencyRemote() {
+  try {
+    if (datastore.kind === 'postgres' && datastore.pg) {
+      idempotencyStore.remote = new PostgresIdempotencyBackend(datastore.pg);
+      return;
+    }
+    if (coordinator && coordinator.backend === 'redis') {
+      idempotencyStore.remote = new RedisIdempotencyBackend(coordinator);
+    }
+  } catch (e) {
+    log.warn('idempotency remote wiring failed; local-only mode', { error: String((e && e.message) || e).slice(0, 160) });
+  }
+}
+wireIdempotencyRemote();
+if (config.redisUrl || config.queueProvider === 'redis') {
+  coordinationPromise = createCoordinator(config, log).then(async (upgraded) => {
+    coordinator = upgraded;
+    locks = new LockManager(coordinator);
+    distributedLimiter = new RateLimiter(coordinator);
+    if (config.queueProvider === 'redis') {
+      const previousQueue = jobQueue;
+      const pending = Array.isArray(previousQueue.local) ? previousQueue.local.splice(0) : [];
+      const pendingIds = new Set(pending.map((job) => job && job.id).filter(Boolean));
+      const pendingWaiters = new Map();
+      const pendingClaimWaiters = new Map();
+      for (const id of pendingIds) {
+        if (previousQueue.waiters && previousQueue.waiters.has(id)) {
+          pendingWaiters.set(id, previousQueue.waiters.get(id));
+          previousQueue.waiters.delete(id);
+        }
+        if (previousQueue.claimWaiters && previousQueue.claimWaiters.has(id)) {
+          pendingClaimWaiters.set(id, previousQueue.claimWaiters.get(id));
+          previousQueue.claimWaiters.delete(id);
+        }
+      }
+      // Preserve accepted startup-buffer jobs and their HTTP claim waiters
+      // while stopping the old in-memory dispatcher. Already-running jobs
+      // remain owned by the old queue until their handler settles.
+      try { await previousQueue.close({ drain: false, rejectWaiters: false }); } catch {}
+      const nextQueue = createJobQueue({ provider: 'redis', coordinator, concurrency: config.queueConcurrency, logger: log });
+      jobQueue = nextQueue;
+      wireQueueHandlers(jobQueue);
+      for (const job of pending) {
+        if (!job || !job.id) continue;
+        if (job.idempotencyKey) nextQueue.inflightKeys.set(job.idempotencyKey, job.id);
+        if (pendingWaiters.has(job.id)) nextQueue.waiters.set(job.id, pendingWaiters.get(job.id));
+        if (pendingClaimWaiters.has(job.id)) nextQueue.claimWaiters.set(job.id, pendingClaimWaiters.get(job.id));
+        try {
+          await nextQueue._push(job);
+          setImmediate(() => nextQueue._drain().catch(() => {}));
+        } catch (e) {
+          nextQueue._releaseKey(job);
+          nextQueue._settleWaiter(job, e, null);
+        }
+      }
+    }
+    coordinationReady = !coordinationRequired || coordinator.backend === 'redis';
+wireIdempotencyRemote();
+// Production startup checks (database, Redis, encryption, auth). Results
+// are logged once at boot; /api/ready gates traffic on the same checks.
+// A postgres datastore that is unreachable fails readiness (never a silent
+// file fallback). Missing encryption/auth in production refuses to boot via
+// validateConfig above.
+(async function productionStartupChecks() {
+  try {
+    if (datastore.kind === 'postgres' && datastore.pg) {
+      await datastore.pg.ping();
+      log.info('startup check: postgres reachable', {});
+    } else if (config.isProduction && datastore.kind === 'file' && !config.allowFileDatastoreInProduction) {
+      log.warn('startup check: file datastore in production (single-process only); set DATABASE_URL for durable multi-instance state');
+    }
+    if (config.redisUrl && coordinator && coordinator.backend !== 'redis') {
+      log.warn('startup check: REDIS_URL set but coordination is degraded', { backend: coordinator.backend });
+    }
+    if (config.isProduction && !config.dataEncryptionKey) {
+      log.warn('startup check: DATA_ENCRYPTION_KEY missing in production');
+    }
+    if (config.isProduction && !authConfig.enabled) {
+      log.warn('startup check: auth disabled in production (dev-open); enable AUTH_ENABLED/API_TOKEN or session auth');
+    }
+  } catch (e) {
+    log.warn('startup check failed', { error: String((e && e.message) || e).slice(0, 200) });
+  }
+})();
+    log.info('coordination backend ready', { backend: coordinator.backend, ready: coordinationReady });
+  }).catch((e) => {
+    coordinationReady = false;
+    log.warn('coordination backend unavailable', { error: String((e && e.message) || e).slice(0, 200) });
+  });
+}
 const toolExecutor = new InMemoryToolExecutor(toolRegistry, eventBus, { idempotencyStore });
 const costEstimator = new CostEstimator();
 const providerRegistry = new ProviderRegistry(config, {
@@ -346,19 +567,52 @@ const providerRegistry = new ProviderRegistry(config, {
   },
 });
 const evaluations = new EvaluationStore();
-try {
-  evaluations.loadAll(store.loadEvals());
-} catch (e) {
-  log.warn('evaluations restore failed', { error: String((e && e.message) || e).slice(0, 200) });
-}
-// Intelligence learning store: durable via intelligence.json (FileStore).
-// Process memory is a cache; the file is the system of record.
+// Intelligence learning store: durable via the authoritative runStore
+// (Postgres intelligence_docs when configured, intelligence.json otherwise).
+// Process memory is a cache; the durable store is the system of record.
 const intelligence = new IntelligenceStore();
-try {
-  const doc = store.loadIntelligence();
-  if (doc) intelligence.load(doc);
-} catch (e) {
-  log.warn('intelligence restore failed', { error: String((e && e.message) || e).slice(0, 200) });
+// Durable boot. File mode (dev/test) loads SYNCHRONOUSLY at require time —
+// exactly the historical behavior — so in-memory learning state is settled
+// before any request or test runs, and a late load can never clobber fresh
+// state (e.g. repopulate a semantic index a test just cleared). Postgres
+// mode (production) loads asynchronously; /api/ready gates traffic until
+// bootDone is true, so no writes can race the restore.
+let bootDone = false;
+let bootError = null;
+let bootPromise = Promise.resolve();
+if (runStore.kind === 'postgres') {
+  bootPromise = (async () => {
+    const evals = await runStore.loadEvals();
+    evaluations.loadAll(evals);
+    const doc = await runStore.loadIntelligence();
+    if (doc) intelligence.load(doc);
+  })().catch((e) => {
+    bootError = e;
+    log.warn('durable boot failed', { error: String((e && e.message) || e).slice(0, 200) });
+  }).then(() => { bootDone = true; });
+} else {
+  try {
+    evaluations.loadAll(store.loadEvals());
+  } catch (e) {
+    log.warn('evaluations restore failed', { error: String((e && e.message) || e).slice(0, 200) });
+  }
+  try {
+    const doc = store.loadIntelligence();
+    if (doc) intelligence.load(doc);
+  } catch (e) {
+    log.warn('intelligence restore failed', { error: String((e && e.message) || e).slice(0, 200) });
+  }
+  try {
+    const restored = store.loadIdempotency();
+    if (Array.isArray(restored) && restored.length) {
+      for (const r of restored.slice(-1000)) {
+        if (r && typeof r.key === 'string' && !idempotencyStore.records.has(r.key)) {
+          idempotencyStore.records.set(r.key, r);
+        }
+      }
+    }
+  } catch {}
+  bootDone = true;
 }
 // Attach (additive): managers gain intelligence-aware scoring with legacy
 // fallbacks; the cache shares the durable semantic index.
@@ -367,28 +621,36 @@ contextManager.attachIntelligence(intelligence);
 memoryManager.attachIntelligence(intelligence);
 cacheManager.attachIntelligence(intelligence);
 
-function persistActive() {
+async function persistActive() {
   try {
     const runs = orchestrator.getActiveRuns();
-    const safeRuns = runs.map((run) => persistedRunSummary(run, privacyModeForRun(run)));
-    const r = store.saveRunIndex(mergeIndex(store.loadRunIndex(), safeRuns));
+    const safeRuns = [];
+    for (const run of runs) {
+      safeRuns.push(persistedRunSummary(run, await privacyModeForRun(run)));
+    }
+    const r = await runStore.saveRunIndex(mergeIndex(await runStore.loadRunIndex(), safeRuns));
     if (!r.ok) log.warn('run index persist failed', { error: r.error });
     for (const run of runs) {
-      persistRunArtifacts(run.id, run);
+      await persistRunArtifacts(run.id, run);
     }
-    const e3 = store.saveEvals(evaluations.dump());
+    const e3 = typeof runStore.appendEvals === 'function'
+      ? await runStore.appendEvals(evaluations.dump())
+      : await runStore.saveEvals(evaluations.dump());
     if (!e3.ok) log.warn('evaluations persist failed', { error: e3.error });
-    // Idempotency durability: flush durable tool records periodically.
-    try {
-      const recs = Array.from(idempotencyStore.records.values()).slice(-1000);
-      const e4 = store.saveIdempotency(recs);
-      if (!e4.ok) log.warn('idempotency persist failed', { error: e4.error });
-    } catch (e) {
-      log.warn('idempotency persist failed', { error: String((e && e.message) || e).slice(0, 200) });
+    // Idempotency durability: the file flush is the dev/test path only. In
+    // postgres/redis mode the distributed backend is authoritative.
+    if (runStore.kind === 'file') {
+      try {
+        const recs = Array.from(idempotencyStore.records.values()).slice(-1000);
+        const e4 = store.saveIdempotency(recs);
+        if (!e4.ok) log.warn('idempotency persist failed', { error: e4.error });
+      } catch (e) {
+        log.warn('idempotency persist failed', { error: String((e && e.message) || e).slice(0, 200) });
+      }
     }
-    // Intelligence durability: learning survives restarts via FileStore.
+    // Intelligence durability: learning survives restarts via runStore.
     try {
-      const e5 = store.saveIntelligence(intelligence.dump());
+      const e5 = await runStore.saveIntelligence(intelligence.dump());
       if (!e5.ok) log.warn('intelligence persist failed', { error: e5.error });
     } catch (e) {
       log.warn('intelligence persist failed', { error: String((e && e.message) || e).slice(0, 200) });
@@ -420,17 +682,20 @@ const orchestrator = new Orchestrator({
     // Terminal runs persist immediately (not just on the 15s timer) so a
     // crash right after completion cannot lose history.
     onRunEnd(summary) {
-      try {
-        if (summary && summary.id) {
-          persistRunArtifacts(summary.id, summary);
-          const economics = economicsForRun(summary.id);
-          store.saveBilling(summary.id, billingLine(economics, { date: summary.updatedAt }));
-          store.saveEvals(evaluations.dump());
-          store.saveIntelligence(intelligence.dump());
+      (async () => {
+        try {
+          if (summary && summary.id) {
+            await persistRunArtifacts(summary.id, summary);
+            const economics = await economicsForRun(summary.id);
+            await runStore.saveBilling(summary.id, billingLine(economics, { date: summary.updatedAt }));
+            if (typeof runStore.appendEvals === 'function') await runStore.appendEvals(evaluations.dump());
+            else await runStore.saveEvals(evaluations.dump());
+            await runStore.saveIntelligence(intelligence.dump());
+          }
+        } catch (e) {
+          log.warn('run-end persist failed', { error: String((e && e.message) || e).slice(0, 200) });
         }
-      } catch (e) {
-        log.warn('run-end persist failed', { error: String((e && e.message) || e).slice(0, 200) });
-      }
+      })().catch(() => {});
     },
   },
   config: {
@@ -458,9 +723,9 @@ try { orchestrator.setRuntimeDefaults(runtimeSettings.load()); } catch {}
 // a snapshot persist, so a crash loses at most the in-flight step. Failures
 // are advisory (logged inside persistRunArtifacts), never fatal to the run.
 orchestrator.persistHook = (runId) => {
-  try { persistRunArtifacts(runId); } catch (e) {
+  persistRunArtifacts(runId).catch((e) => {
     log.warn('checkpoint persist hook failed', { runId, error: String((e && e.message) || e).slice(0, 160) });
-  }
+  });
 };
 
 const discovery = new DiscoveryService({ registry: modelRegistry, providerRegistry, config, logger: log, changeLog: modelChanges });
@@ -470,16 +735,21 @@ const discovery = new DiscoveryService({ registry: modelRegistry, providerRegist
 const applicationRoot = path.resolve(__dirname, '..');
 const configuredWorkspace = config.workspaceRoot ? path.resolve(config.workspaceRoot) : null;
 const configuredWorkspaceSafe = configuredWorkspace && configuredWorkspace !== applicationRoot && !configuredWorkspace.startsWith(`${applicationRoot}${path.sep}`);
-const productionProcess = process.env.NODE_ENV === 'production';
+const productionProcess = config.isProduction;
 const executionWorkspace = productionProcess
   ? (configuredWorkspaceSafe ? configuredWorkspace : path.join(path.resolve(config.dataDir), 'workspaces'))
   : (configuredWorkspace || process.cwd());
-try { fs.mkdirSync(executionWorkspace, { recursive: true, mode: 0o700 }); } catch (e) { if (process.env.NODE_ENV === 'production') throw e; }
+try { fs.mkdirSync(executionWorkspace, { recursive: true, mode: 0o700 }); } catch (e) { if (config.isProduction) throw e; }
 const execution = attachExecution(orchestrator, {
   workspace: executionWorkspace,
-  productionSafeToolsOnly: process.env.NODE_ENV === 'production',
-  autoVerify: !/^(0|false|no)$/i.test(process.env.SESSION3_AUTO_VERIFY || '1'),
+  productionSafeToolsOnly: config.isProduction,
+  autoVerify: config.session3AutoVerify,
 });
+// The queue is the genuine execution scheduler: run lifecycle and background
+// maintenance are consumed by these workers (in-process for `memory`,
+// durable redis-backed for `redis`). Re-wired on every queue instance
+// (including the redis upgrade above).
+wireQueueHandlers(jobQueue);
 
 // Merge live summaries over the persisted index (live wins on conflict).
 function mergeIndex(persisted, live) {
@@ -491,11 +761,6 @@ function mergeIndex(persisted, live) {
     if (run && run.id) byId.set(run.id, run);
   }
   return Array.from(byId.values()).slice(-200);
-}
-
-function persistedSummary(id) {
-  const index = store.loadRunIndex();
-  return index.find((r) => r && r.id === id) || null;
 }
 
 function economicsForRuntime(runtimeState, explicitReferenceModelId = null) {
@@ -514,10 +779,10 @@ function economicsForRuntime(runtimeState, explicitReferenceModelId = null) {
   return result;
 }
 
-function economicsForRun(id, explicitReferenceModelId = null) {
+async function economicsForRun(id, explicitReferenceModelId = null) {
   const runtimeState = (orchestrator.getRun && orchestrator.getRun(id)) || null;
   if (runtimeState) return economicsForRuntime(runtimeState, explicitReferenceModelId);
-  const persisted = store.loadSnapshot(id);
+  const persisted = await runStore.loadSnapshot(id);
   if (persisted && persisted.economics) return persisted.economics;
   // A legacy snapshot can still be inspected, but it cannot prove a modeled
   // baseline without the original execution step usage. Stay explicit.
@@ -531,27 +796,32 @@ function economicsForRun(id, explicitReferenceModelId = null) {
   };
 }
 
-function privacyModeForRun(runOrId) {
+async function privacyModeForRun(runOrId) {
   const runtime = typeof runOrId === 'string' ? orchestrator.getRun(runOrId) : runOrId;
   if (runtime?.privacyMode) return normalizePrivacyMode(runtime.privacyMode);
   const id = typeof runOrId === 'string' ? runOrId : runOrId?.id;
-  const persisted = id ? persistedSummary(id) : null;
+  const persisted = id ? await persistedSummary(id) : null;
   return normalizePrivacyMode(runOrId?.privacyMode || persisted?.privacyMode);
 }
 
-function purgeProjectContent(projectId, mode) {
+async function persistedSummary(id) {
+  const index = await runStore.loadRunIndex();
+  return index.find((r) => r && r.id === id) || null;
+}
+
+async function purgeProjectContent(projectId, mode) {
   const normalized = normalizePrivacyMode(mode);
-  const runs = store.loadRunIndex().filter((r) => r && r.projectId === projectId);
+  const runs = (await runStore.loadRunIndex()).filter((r) => r && r.projectId === projectId);
   for (const run of runs) {
     const runtime = orchestrator.getRun(run.id);
     if (runtime) runtime.privacyMode = normalized;
     if (typeof eventBus.setPrivacyMode === 'function') eventBus.setPrivacyMode(run.id, normalized);
-    const economics = runtime ? economicsForRuntime(runtime) : economicsForRun(run.id);
-    store.upsertRunSummary(persistedRunSummary({ ...run, privacyMode: normalized, economics }, normalized));
-    const events = store.loadEvents(run.id);
-    store.saveEvents(run.id, persistedEvents(events, normalized));
-    const snapshot = store.loadSnapshot(run.id);
-    if (snapshot) store.saveSnapshot(run.id, persistedSnapshot(snapshot, normalized));
+    const economics = runtime ? economicsForRuntime(runtime) : await economicsForRun(run.id);
+    await runStore.upsertRunSummary(persistedRunSummary({ ...run, privacyMode: normalized, economics }, normalized));
+    const events = await runStore.loadEvents(run.id);
+    await runStore.saveEvents(run.id, persistedEvents(events, normalized));
+    const snapshot = await runStore.loadSnapshot(run.id);
+    if (snapshot) await runStore.saveSnapshot(run.id, persistedSnapshot(snapshot, normalized));
     if (normalized === 'zero_retention') {
       try { if (cacheManager && typeof cacheManager.clearRun === 'function') cacheManager.clearRun(run.id); } catch {}
     }
@@ -560,35 +830,37 @@ function purgeProjectContent(projectId, mode) {
   try {
     if (intelligence?.semanticCache && typeof intelligence.semanticCache.clearScope === 'function') {
       intelligence.semanticCache.clearScope({ tenantId: runs[0]?.orgId || null, projectId });
-      store.saveIntelligence(intelligence.dump());
+      await runStore.saveIntelligence(intelligence.dump());
     }
   } catch {}
 }
 
-function persistRunArtifacts(runId, summary = null) {
-  const mode = privacyModeForRun(orchestrator.getRun(runId) || summary || runId);
+async function persistRunArtifacts(runId, summary = null) {
+  const mode = await privacyModeForRun(orchestrator.getRun(runId) || summary || runId);
   const runtime = orchestrator.getRun(runId);
   const terminal = ['completed', 'failed', 'cancelled'].includes(String(runtime?.status || summary?.internalStatus || summary?.status));
   const frozenEconomics = terminal && runtime ? economicsForRuntime(runtime) : null;
   if (summary) {
     const durableSummary = frozenEconomics ? { ...summary, economics: frozenEconomics } : summary;
-    const result = store.upsertRunSummary(persistedRunSummary(durableSummary, mode));
+    const result = await runStore.upsertRunSummary(persistedRunSummary(durableSummary, mode));
     if (!result.ok) log.warn('run summary persist failed', { runId, error: result.error });
   }
-  const e1 = store.saveEvents(runId, persistedEvents(eventBus.eventLogs.get(runId) || [], mode));
+  const e1 = typeof runStore.appendEvents === 'function'
+    ? await runStore.appendEvents(runId, persistedEvents(eventBus.eventLogs.get(runId) || [], mode))
+    : await runStore.saveEvents(runId, persistedEvents(eventBus.eventLogs.get(runId) || [], mode));
   if (!e1.ok) log.warn('events persist failed', { runId, error: e1.error });
   const snap = buildSnapshot(orchestrator, runId);
   if (snap) {
     if (['completed', 'failed', 'cancelled'].includes(String(snap.status))) {
       snap.economics = frozenEconomics || economicsForRuntime(orchestrator.getRun(runId));
     }
-    const e2 = store.saveSnapshot(runId, persistedSnapshot(snap, mode));
+    const e2 = await runStore.saveSnapshot(runId, persistedSnapshot(snap, mode));
     if (!e2.ok) log.warn('snapshot persist failed', { runId, error: e2.error });
   }
 }
 
-function visibleRunIndex(principal) {
-  const all = mergeIndex(store.loadRunIndex(), orchestrator.getActiveRuns());
+async function visibleRunIndex(principal) {
+  const all = mergeIndex(await runStore.loadRunIndex(), orchestrator.getActiveRuns());
   if (!authConfig.enabled || !principal || isGlobalAdmin(principal)) return all;
   return all.filter((r) => {
     const owner = r && (r.ownerId || r.owner);
@@ -616,9 +888,10 @@ const TERMINAL_SUMMARY = new Set(['completed', 'failed', 'cancelled']);
 // In-flight execution does NOT resume; runs that were active at shutdown are
 // marked interrupted (failed, honest about no resumption) instead of
 // pretending to still execute.
-(function restorePersisted() {
+(async function restorePersisted() {
   try {
-    const index = store.loadRunIndex();
+    await bootPromise;
+    const index = await runStore.loadRunIndex();
     let replayed = 0;
     let interrupted = 0;
     const rewritten = index.map((entry) => {
@@ -639,10 +912,10 @@ const TERMINAL_SUMMARY = new Set(['completed', 'failed', 'cancelled']);
       }
       return entry;
     });
-    if (interrupted) store.saveRunIndex(rewritten);
+    if (interrupted) await runStore.saveRunIndex(rewritten);
     for (const entry of rewritten.slice(-50)) {
       if (!entry || !entry.id) continue;
-      const events = store.loadEvents(entry.id);
+      const events = await runStore.loadEvents(entry.id);
       if (events && events.length && !eventBus.eventLogs.has(entry.id)) {
         eventBus.eventLogs.set(entry.id, events);
         for (const e of events) {
@@ -653,7 +926,12 @@ const TERMINAL_SUMMARY = new Set(['completed', 'failed', 'cancelled']);
     }
     if (replayed || interrupted) log.info('restored persisted state', { runs: replayed, interrupted });
   } catch (e) {
+    bootError = bootError || e;
     log.warn('persistence restore failed', { error: String((e && e.message) || e).slice(0, 200) });
+  } finally {
+    // Readiness gates on this flag: no traffic until durable history is
+    // loaded (or its failure is recorded above — failures stay visible).
+    bootDone = true;
   }
 })();
 
@@ -665,14 +943,14 @@ if (persistTimer.unref) persistTimer.unref();
 
 // Retention sweep: per-run files that are neither active nor indexed are
 // garbage-collected on a slow cadence (default hourly). Explicit,
-// configurable, observable (report logged), and safe during concurrent
-// writes (only orphaned files are eligible; active/indexed never touched).
-const RETENTION_SWEEP_INTERVAL_MS = Number(process.env.RETENTION_SWEEP_INTERVAL_MS) || 3600000;
-const RETENTION_GRACE_MS = Number(process.env.RETENTION_GRACE_MS) || 86400000;
+// configurable via config.js (RETENTION_*), observable (report logged), and
+// safe during concurrent writes (only orphaned files are eligible).
+const RETENTION_SWEEP_INTERVAL_MS = config.retentionSweepIntervalMs;
+const RETENTION_GRACE_MS = config.retentionGraceMs;
 function runRetentionSweep(reason = 'scheduled') {
   try {
     const activeIds = Array.from(orchestrator.activeRuns.keys());
-    const report = store.sweepRetention({ activeIds, graceMs: RETENTION_GRACE_MS });
+    const report = runStore.sweepRetention({ activeIds, graceMs: RETENTION_GRACE_MS });
     if ((report.deleted && report.deleted.length) || (report.errors && report.errors.length)) {
       log.info('retention sweep', {
         reason,
@@ -691,9 +969,12 @@ function runRetentionSweep(reason = 'scheduled') {
   }
 }
 // One sweep at startup (after restore) so restarted processes do not
-// accumulate orphans, then on the slow cadence.
+// accumulate orphans, then on the slow cadence via the durable queue so the
+// sweep itself exercises the same worker path as run execution.
 try { runRetentionSweep('startup'); } catch {}
-const retentionTimer = setInterval(() => runRetentionSweep('scheduled'), RETENTION_SWEEP_INTERVAL_MS);
+const retentionTimer = setInterval(() => {
+  jobQueue.enqueue({ type: 'maintenance.sweep', retryable: true, maxAttempts: 3, idempotencyKey: `sweep:${Math.floor(Date.now() / RETENTION_SWEEP_INTERVAL_MS)}` }).catch(() => {});
+}, RETENTION_SWEEP_INTERVAL_MS);
 if (retentionTimer.unref) retentionTimer.unref();
 
 let shuttingDown = false;
@@ -722,11 +1003,17 @@ async function shutdown(signal = 'shutdown') {
             rs.metadata = { ...(rs.metadata || {}), interrupted: true, interruptReason: `server_shutdown (${signal}): in-flight execution does not resume across restarts; retry the run to recover from its last checkpoint` };
           } catch {}
         }
-        persistRunArtifacts(runId);
+        try { persistRunArtifacts(runId).catch(() => {}); } catch {}
       } catch {}
     }
   } catch {}
-  try { persistActive(); } catch {}
+  try { await persistActive(); } catch {}
+  // Production infrastructure teardown (after state is durable): stop
+  // coordination/queue backends. The queue drains running jobs up to a grace
+  // period; redis-pending jobs stay durable for the next worker.
+  try { await jobQueue.close({ drain: true, graceMs: 8000 }); } catch {}
+  try { await coordinator.close(); } catch {}
+  try { if (datastore.pg) await datastore.pg.close(); } catch {}
   await new Promise((resolve) => {
     if (!server.listening) return resolve();
     server.close(() => resolve());
@@ -769,6 +1056,21 @@ function allowRequest(req, pathname) {
   return bucket.count <= limit;
 }
 
+// Distributed rate-limit check (Redis-backed when REDIS_URL is configured).
+// Local allowRequest() above remains the fast synchronous shed; this async
+// check enforces the same window across instances. Single-process
+// deployments (memory coordinator) skip the second check.
+async function allowRequestDistributed(req, pathname) {
+  try {
+    if (!distributedLimiter || !distributedLimiter.distributed) return { allowed: true, count: 0 };
+    const kind = pathname.startsWith('/api/auth/') ? 'auth' : 'api';
+    const limit = kind === 'auth' ? limits.authRequestsPerMinute : limits.requestsPerMinute;
+    return await distributedLimiter.allow({ key: `${requestAddress(req)}:${kind}`, limit, windowMs: 60000 });
+  } catch {
+    return { allowed: true, count: 0 };
+  }
+}
+
 function newRequestId() {
   return `req-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
 }
@@ -806,7 +1108,7 @@ function securityHeaders() {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
     'Content-Security-Policy': "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:5173 http://127.0.0.1:5173",
   };
-  if (process.env.NODE_ENV === 'production' || currentMode() === 'live') {
+  if (config.isProduction || currentMode() === 'live') {
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
   return headers;
@@ -867,38 +1169,56 @@ function needRole(res, principal, minRole) {
 // predictable IDs when auth is enabled). Public catalog endpoints (models,
 // tools, presets, liveness) stay open. Ownerless legacy records are
 // quarantined under authentication. Returns true when the request must stop.
-function ownedByOther(runId, principal) {
+function ownedByOtherWithIndex(runId, principal, index) {
+  if (!runId || !principal || isGlobalAdmin(principal)) return false;
+  const rs = (orchestrator.getRun && orchestrator.getRun(runId)) || orchestrator.activeRuns.get(runId) || null;
+  if (rs?.orgId && principal.orgId && rs.orgId === principal.orgId) return false;
+  const owner = (rs && rs.ownerId) || null;
+  if (owner) return owner !== principal.id;
+  const idx = (index || []).find((r) => r && r.id === runId) || null;
+  if (idx?.orgId && principal.orgId && idx.orgId === principal.orgId) return false;
+  const pOwner = (idx && (idx.ownerId || idx.owner)) || null;
+  if (pOwner) return pOwner !== principal.id;
+  return true;
+}
+async function ownedByOther(runId, principal) {
   if (!runId || !principal || isGlobalAdmin(principal)) return false;
   try {
     const rs = (orchestrator.getRun && orchestrator.getRun(runId)) || orchestrator.activeRuns.get(runId) || null;
     if (rs?.orgId && principal.orgId && rs.orgId === principal.orgId) return false;
     const owner = (rs && rs.ownerId) || null;
     if (owner) return owner !== principal.id;
-    const idx = store.loadRunIndex().find((r) => r && r.id === runId) || null;
-    if (idx?.orgId && principal.orgId && idx.orgId === principal.orgId) return false;
-    const pOwner = (idx && (idx.ownerId || idx.owner)) || null;
-    if (pOwner) return pOwner !== principal.id;
-    return true;
+    const index = await runStore.loadRunIndex();
+    return ownedByOtherWithIndex(runId, principal, index);
   } catch {
     // An ownership lookup failure is an authorization failure, never a reason
     // to serve a private run optimistically.
     return true;
   }
 }
-function guardRunRead(res, principal, runId) {
+async function guardRunRead(res, principal, runId) {
   if (!authConfig.enabled) return false;
   if (needAuth(res, principal)) return true;
-  if (ownedByOther(runId, principal)) {
+  if (await ownedByOther(runId, principal)) {
     sendError(res, 403, 'forbidden', 'not owner of this run');
     return true;
   }
   return false;
 }
-function memoryVisibleToPrincipal(item, principal) {
+// Sync visibility check for preloaded request indexes (bulk filters). Falls
+// back to the async single-item check when no index is provided.
+function memoryVisibleToPrincipal(item, principal, index = null) {
   if (!item || !principal) return false;
   if (isGlobalAdmin(principal)) return true;
   if (item.orgId) return !!principal.orgId && item.orgId === principal.orgId;
-  return !!item.runId && !ownedByOther(item.runId || item.sourceRunId, principal);
+  if (index) return !ownedByOtherWithIndex(item.runId || item.sourceRunId, principal, index);
+  return null; // unknown without an index lookup — caller must resolve async
+}
+async function memoryVisibleToPrincipalAsync(item, principal) {
+  if (!item || !principal) return false;
+  if (isGlobalAdmin(principal)) return true;
+  if (item.orgId) return !!principal.orgId && item.orgId === principal.orgId;
+  return !(await ownedByOther(item.runId || item.sourceRunId, principal));
 }
 function providerRuntimeSnapshot(principal = null) {
   return resolveProviderRuntime({
@@ -1120,7 +1440,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Authenticate every request; only non-production defaults to dev-open.
-    const principal = currentPrincipal(req);
+    // Distributed rate limit (multi-instance) runs after the fast local shed
+    // at the top of the handler; single-process deployments skip it.
+    const distLimit = await allowRequestDistributed(req, path);
+    if (!distLimit.allowed) {
+      res._retryAfter = 60;
+      return sendError(res, 429, 'rate_limited', 'too many requests; retry shortly');
+    }
+    const principal = await currentPrincipal(req);
     // Session cookies are HttpOnly and SameSite=Lax; also reject cross-origin
     // state changes when a browser supplies an Origin header. Bearer-token and
     // non-browser requests remain compatible with signed/token auth.
@@ -1143,9 +1470,12 @@ const server = http.createServer(async (req, res) => {
         }
         const metadata = eventMetadata(json);
         const key = `stripe:webhook:${metadata.eventId}`;
-        const reservation = idempotencyStore.begin(key, { op: 'stripe_webhook', state: 'running' });
+        // Distributed reservation: cross-instance safe when a remote
+        // idempotency backend is configured (Postgres/Redis); otherwise the
+        // local reservation applies and `degraded` is observable.
+        const reservation = await idempotencyStore.beginAsync(key, { op: 'stripe_webhook', state: 'running' });
         if (!reservation.fresh) return send(res, 200, { received: true, deduplicated: true, event: metadata });
-        idempotencyStore.complete(key, metadata);
+        await idempotencyStore.completeAsync(key, metadata);
         log.info('billing webhook accepted', { eventId: metadata.eventId, type: metadata.type, livemode: metadata.livemode });
         return send(res, 200, { received: true, deduplicated: false, event: metadata });
       }
@@ -1153,9 +1483,10 @@ const server = http.createServer(async (req, res) => {
       // ---------- account/session bootstrap ----------
       if (req.method === 'POST' && path === '/api/auth/signup') {
         try {
-          const created = tenants.signup({ email: json.email, password: json.password, name: json.name });
-          const session = tenants.login({ email: json.email, password: json.password });
-          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+          const created = await tenants.signup({ email: json.email, password: json.password, name: json.name });
+          const session = await tenants.login({ email: json.email, password: json.password });
+          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || config.isProduction ? '; Secure' : ''}`;
+          await auditEvent({ actor: created.user.id, action: 'auth.signup', orgId: created.user.orgId, detail: { projectId: created.project && created.project.id } });
           return send(res, 201, { user: created.user, project: created.project });
         } catch (e) {
           const code = e && e.code === 'conflict' ? 'conflict' : 'bad_request';
@@ -1164,8 +1495,9 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'POST' && path === '/api/auth/login') {
         try {
-          const session = tenants.login({ email: json.email, password: json.password });
-          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+          const session = await tenants.login({ email: json.email, password: json.password });
+          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || config.isProduction ? '; Secure' : ''}`;
+          await auditEvent({ actor: session.user.id, action: 'auth.login', orgId: session.user.orgId });
           return send(res, 200, { user: session.user });
         } catch (e) {
           return sendError(res, 401, 'unauthenticated', 'invalid email or password');
@@ -1174,7 +1506,7 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && path === '/api/auth/logout') {
         const rawCookie = String(req.headers.cookie || '').split(';').map((v) => v.trim()).find((v) => v.startsWith('oa_session='));
         if (rawCookie) {
-          try { tenants.revoke(decodeURIComponent(rawCookie.slice('oa_session='.length))); } catch {}
+          try { await tenants.revoke(decodeURIComponent(rawCookie.slice('oa_session='.length))); } catch {}
         }
         res._setCookie = 'oa_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0';
         return send(res, 200, { ok: true });
@@ -1184,12 +1516,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'GET' && path === '/api/projects') {
         if (needAuth(res, principal)) return;
-        return send(res, 200, { projects: tenants.listProjects(principal) });
+        return send(res, 200, { projects: await tenants.listProjects(principal) });
       }
       if (req.method === 'POST' && path === '/api/projects') {
         if (needAuth(res, principal)) return;
         if (needRole(res, principal, 'operator')) return;
-        const project = tenants.createProject(principal, {
+        const project = await tenants.createProject(principal, {
           name: json.name, referenceModelId: json.referenceModelId,
           policy: json.policy, privacyMode: json.privacyMode,
         });
@@ -1198,17 +1530,17 @@ const server = http.createServer(async (req, res) => {
       const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
       if (projectMatch && req.method === 'GET') {
         if (needAuth(res, principal)) return;
-        const project = tenants.getProject(decodeURIComponent(projectMatch[1]), principal);
+        const project = await tenants.getProject(decodeURIComponent(projectMatch[1]), principal);
         return project ? send(res, 200, { project }) : sendError(res, 404, 'not_found', 'project not found');
       }
       if (projectMatch && (req.method === 'PUT' || req.method === 'PATCH')) {
         if (needAuth(res, principal)) return;
         if (needRole(res, principal, 'operator')) return;
-        const before = tenants.getProject(decodeURIComponent(projectMatch[1]), principal);
+        const before = await tenants.getProject(decodeURIComponent(projectMatch[1]), principal);
         if (!before) return sendError(res, 404, 'not_found', 'project not found');
-        const project = tenants.updateProject(decodeURIComponent(projectMatch[1]), principal, json);
+        const project = await tenants.updateProject(decodeURIComponent(projectMatch[1]), principal, json);
         if (!project) return sendError(res, 403, 'forbidden', 'project is not accessible');
-        if (json.privacyMode && json.privacyMode !== before.privacyMode) purgeProjectContent(project.id, project.privacyMode);
+        if (json.privacyMode && json.privacyMode !== before.privacyMode) await purgeProjectContent(project.id, project.privacyMode);
         return send(res, 200, { project });
       }
       if (req.method === 'GET' && path === '/api/health') {
@@ -1228,9 +1560,13 @@ const server = http.createServer(async (req, res) => {
         let storageOk = true;
         let storageError = null;
         try {
-          const probe = store.saveRunIndex(store.loadRunIndex());
-          storageOk = !!probe.ok;
-          storageError = probe.error || null;
+          if (runStore.kind === 'postgres') {
+            await runStore.pg.ping();
+          } else {
+            const probe = await runStore.saveRunIndex(await runStore.loadRunIndex());
+            storageOk = !!probe.ok;
+            storageError = probe.error || null;
+          }
         } catch (e) {
           storageOk = false;
           storageError = String((e && e.message) || e).slice(0, 200);
@@ -1254,28 +1590,67 @@ const server = http.createServer(async (req, res) => {
       }
       // Readiness (distinct from liveness): initialized + storage writable.
       // A non-critical provider outage never makes the service unready.
+      // Production startup requirements (Agent 1): database, Redis
+      // coordination state, encryption config, and auth config are reported
+      // as explicit checks alongside the legacy storage/registry fields
+      // (response shape is additive — existing fields unchanged).
       if (req.method === 'GET' && (path === '/api/ready' || path === '/api/readiness')) {
         const mode = refreshRuntimeMode();
         const models = await modelRegistry.getModels().catch(() => null);
-        const storageProbe = store.saveRunIndex(store.loadRunIndex());
+        let storageProbe;
+        if (datastore.kind === 'postgres' && datastore.pg) {
+          try {
+            await datastore.pg.ping();
+            storageProbe = { ok: true };
+          } catch (e) {
+            storageProbe = { ok: false, error: String((e && e.message) || e).slice(0, 200) };
+          }
+        } else {
+          storageProbe = await runStore.saveRunIndex(await runStore.loadRunIndex());
+        }
         const registryOk = Array.isArray(models);
         // Live mode with zero models and no discovery path is not ready to
         // accept work; demo mode always has its labelled catalog.
         const discoveryPending = mode === 'live' && models && models.length === 0 && !discovery.enabled;
-        const ready = registryOk && storageProbe.ok && !discoveryPending;
+        const infra = await checkReadiness({
+          config,
+          datastoreKind: datastore.kind,
+          datastoreProbe: storageProbe,
+          redis: coordinationReady ? coordinator : {
+            backend: 'initializing',
+            degraded: true,
+            lastError: 'shared coordination is still initializing',
+          },
+          authConfig,
+        });
+        const ready = registryOk && storageProbe.ok && !discoveryPending && infra.ready && bootDone && !bootError && (!coordinationRequired || coordinationReady);
         return send(res, ready ? 200 : 503, {
           ready,
           service: 'orchestraai',
           mode,
           provider: config.provider,
           checks: {
+            boot: { ok: bootDone && !bootError, ...(bootError ? { error: String((bootError && bootError.message) || bootError).slice(0, 200) } : {}) },
             registry: { ok: registryOk, models: Array.isArray(models) ? models.length : 0 },
-            storage: { ok: storageProbe.ok, ...(storageProbe.ok ? {} : { error: storageProbe.error }) },
+            storage: { ok: storageProbe.ok, kind: datastore.kind, ...(storageProbe.ok ? {} : { error: storageProbe.error }) },
             provider: {
               configured: !!effectiveKey(config.provider),
               note: 'provider outage does not affect readiness',
             },
             discovery: discovery.lastResult || { enabled: discovery.enabled },
+            // Production infrastructure (additive).
+            datastore: infra.checks.datastore,
+            redis: infra.checks.redis,
+            encryption: infra.checks.encryption,
+            auth: infra.checks.auth,
+            coordination: {
+              locks: locks.backend,
+              rateLimits: distributedLimiter.distributed ? 'distributed' : 'process-local',
+              queue: jobQueue.provider,
+              ready: coordinationReady,
+              queueStats: (typeof jobQueue.stats === 'function' ? jobQueue.stats() : null),
+              idempotency: idempotencyStore.distributed ? 'distributed' : 'process-local',
+            },
           },
         });
       }
@@ -1468,7 +1843,8 @@ const server = http.createServer(async (req, res) => {
           importance: m.importance, confidence: m.confidence, status: m.status,
         }));
         if (authConfig.enabled && principal && !isGlobalAdmin(principal)) {
-          items = items.filter((i) => memoryVisibleToPrincipal(i, principal));
+          const visIndex = await runStore.loadRunIndex();
+          items = items.filter((i) => memoryVisibleToPrincipal(i, principal, visIndex));
         }
         if (scope) items = items.filter((i) => i.scope === scope);
         if (q) items = items.filter((i) => (i.title + i.snippet + i.source).toLowerCase().includes(q));
@@ -1478,12 +1854,13 @@ const server = http.createServer(async (req, res) => {
         const runId = u.searchParams.get('runId');
         const limit = clampInt(u.searchParams.get('limit'), 50, 1, 200);
         if (runId && !validRunId(runId)) return sendError(res, 400, 'bad_request', 'invalid runId');
-        if (runId) { if (guardRunRead(res, principal, runId)) return; }
+        if (runId) { if (await guardRunRead(res, principal, runId)) return; }
         else if (authConfig.enabled) {
           if (needAuth(res, principal)) return;
           if (!isGlobalAdmin(principal)) {
             const all = evaluations.list({ runId: null, limit: 500 });
-            return send(res, 200, { evaluations: all.filter((e) => !ownedByOther(e.runId, principal)).slice(0, limit) });
+            const evalIndex = await runStore.loadRunIndex();
+            return send(res, 200, { evaluations: all.filter((e) => !ownedByOtherWithIndex(e.runId, principal, evalIndex)).slice(0, limit) });
           }
         }
         return send(res, 200, { evaluations: evaluations.list({ runId, limit }) });
@@ -1520,7 +1897,7 @@ const server = http.createServer(async (req, res) => {
       if (routingMatch && req.method === 'GET') {
         const id = routingMatch[1];
         if (!validRunId(id)) return sendError(res, 400, 'bad_request', 'invalid run id');
-        if (guardRunRead(res, principal, id)) return;
+        if (await guardRunRead(res, principal, id)) return;
         const ctrl = orchestrator.control ? orchestrator.control(id) : null;
         if (ctrl && ctrl.routing) {
           return send(res, 200, {
@@ -1539,7 +1916,7 @@ const server = http.createServer(async (req, res) => {
             history: intelligence.routingHistory ? intelligence.routingHistory.forRun(id) : [],
           });
         }
-        const persisted = store.loadSnapshot(id);
+        const persisted = await runStore.loadSnapshot(id);
         if (persisted && persisted.routing) {
           return send(res, 200, { runId: id, persisted: true, ...persisted.routing });
         }
@@ -1550,7 +1927,7 @@ const server = http.createServer(async (req, res) => {
       if (planMatch && req.method === 'GET') {
         const id = planMatch[1];
         if (!validRunId(id)) return sendError(res, 400, 'bad_request', 'invalid run id');
-        if (guardRunRead(res, principal, id)) return;
+        if (await guardRunRead(res, principal, id)) return;
         const runtimeState = orchestrator.activeRuns.get(id);
         if (!runtimeState) return sendError(res, 404, 'not_found', 'run not found');
         const ctrl = orchestrator.control ? orchestrator.control(id) : {};
@@ -1571,12 +1948,13 @@ const server = http.createServer(async (req, res) => {
         const scopes = (u.searchParams.get('scope') || 'working,longterm').split(',').map((s) => s.trim()).filter(Boolean);
         if (!q) return sendError(res, 400, 'bad_request', 'q required');
         if (runId && !validRunId(runId)) return sendError(res, 400, 'bad_request', 'invalid runId');
-        if (runId) { if (guardRunRead(res, principal, runId)) return; }
+        if (runId) { if (await guardRunRead(res, principal, runId)) return; }
         else if (authConfig.enabled && needAuth(res, principal)) return;
         const dump = memoryManager.dumpAll();
         let pool = [...dump.working, ...dump.longterm].filter((m) => !scopes.length || scopes.includes(m.scope));
         if (authConfig.enabled && principal && !isGlobalAdmin(principal)) {
-          pool = pool.filter((m) => memoryVisibleToPrincipal(m, principal));
+          const searchIndex = await runStore.loadRunIndex();
+          pool = pool.filter((m) => memoryVisibleToPrincipal(m, principal, searchIndex));
         }
         const { rankMemories } = require('./src/intelligence/memory-intelligence');
         const ranked = rankMemories(pool.filter((m) => m.status === 'active'), q, { limit });
@@ -1596,7 +1974,7 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && path === '/api/memory/conflicts') {
         const runId = u.searchParams.get('runId');
         if (!runId || !validRunId(runId)) return sendError(res, 400, 'bad_request', 'runId required');
-        if (guardRunRead(res, principal, runId)) return;
+        if (await guardRunRead(res, principal, runId)) return;
         const runtimeState = orchestrator.activeRuns.get(runId);
         if (!runtimeState) return sendError(res, 404, 'not_found', 'run not found');
         const conflicts = typeof memoryManager.listConflicts === 'function'
@@ -1609,12 +1987,13 @@ const server = http.createServer(async (req, res) => {
         const runId = u.searchParams.get('runId');
         const limit = clampInt(u.searchParams.get('limit'), 50, 1, 200);
         if (runId && !validRunId(runId)) return sendError(res, 400, 'bad_request', 'invalid runId');
-        if (runId) { if (guardRunRead(res, principal, runId)) return; }
+        if (runId) { if (await guardRunRead(res, principal, runId)) return; }
         else if (authConfig.enabled) {
           if (needAuth(res, principal)) return;
           if (!isGlobalAdmin(principal)) {
             const all = intelligence.listOutcomes({ runId: null, limit: 500 });
-            return send(res, 200, { outcomes: all.filter((o) => !ownedByOther(o.runId, principal)).slice(0, limit), evaluatorVersion: VERSIONS.evaluator });
+            const outIndex = await runStore.loadRunIndex();
+            return send(res, 200, { outcomes: all.filter((o) => !ownedByOtherWithIndex(o.runId, principal, outIndex)).slice(0, limit), evaluatorVersion: VERSIONS.evaluator });
           }
         }
         return send(res, 200, { outcomes: intelligence.listOutcomes({ runId, limit }), evaluatorVersion: VERSIONS.evaluator });
@@ -1623,7 +2002,7 @@ const server = http.createServer(async (req, res) => {
       if (outcomeMatch && req.method === 'GET') {
         const id = outcomeMatch[1];
         if (!validRunId(id)) return sendError(res, 400, 'bad_request', 'invalid run id');
-        if (guardRunRead(res, principal, id)) return;
+        if (await guardRunRead(res, principal, id)) return;
         const outcome = intelligence.outcomeForRun(id);
         if (!outcome) return sendError(res, 404, 'not_found', 'no outcome evaluation for run');
         return send(res, 200, { outcome });
@@ -1633,7 +2012,7 @@ const server = http.createServer(async (req, res) => {
       if (decisionsMatch && req.method === 'GET') {
         const id = decisionsMatch[1];
         if (!validRunId(id)) return sendError(res, 400, 'bad_request', 'invalid run id');
-        if (guardRunRead(res, principal, id)) return;
+        if (await guardRunRead(res, principal, id)) return;
         const ctrl = orchestrator.control ? orchestrator.control(id) : null;
         if (ctrl && ctrl.decisions) {
           return send(res, 200, {
@@ -1641,7 +2020,7 @@ const server = http.createServer(async (req, res) => {
             decisions: ctrl.decisions.map((d) => (d && typeof d.toJSON === 'function' ? d.toJSON() : d)),
           });
         }
-        const persisted = store.loadSnapshot(id);
+        const persisted = await runStore.loadSnapshot(id);
         if (persisted && persisted.decisions) return send(res, 200, { runId: id, persisted: true, decisions: persisted.decisions });
         return sendError(res, 404, 'not_found', 'run not found');
       }
@@ -1659,7 +2038,7 @@ const server = http.createServer(async (req, res) => {
             context: json.context, successCriteria: json.successCriteria,
             expectedCapabilities: json.expectedCapabilities,
           });
-          try { store.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
+          try { await runStore.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
           return send(res, 201, { case: c });
         } catch (e) {
           return sendError(res, 400, (e && e.code) || 'bad_request', (e && e.message) || 'invalid benchmark case');
@@ -1677,7 +2056,7 @@ const server = http.createServer(async (req, res) => {
             outcome: json.outcome, passed: json.passed, score: json.score,
             cost: json.cost, latencyMs: json.latencyMs,
           });
-          try { store.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
+          try { await runStore.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
           return send(res, 201, { attempt: a });
         }
         if (req.method === 'GET' && !benchMatch[2]) {
@@ -1693,14 +2072,14 @@ const server = http.createServer(async (req, res) => {
         const id = feedbackMatch[1];
         if (!validRunId(id)) return sendError(res, 400, 'bad_request', 'invalid run id');
         if (needAuth(res, principal)) return;
-        if (guardRunRead(res, principal, id)) return;
+        if (await guardRunRead(res, principal, id)) return;
         const signal = typeof json.signal === 'string' ? json.signal.slice(0, 32)
           : typeof json.value === 'string' ? json.value.slice(0, 32) : null;
         if (!signal) return sendError(res, 400, 'bad_request', 'signal required');
         const fb = intelligence.recordFeedback(id, {
           signal, rating: json.rating, confidence: json.confidence,
         });
-        try { store.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
+        try { await runStore.saveIntelligence(intelligence.dump()); } catch { /* best-effort */ }
         return send(res, 200, { ok: true, runId: id, feedback: fb });
       }
       // Named control-center collections. These are view-specific projections
@@ -1708,17 +2087,17 @@ const server = http.createServer(async (req, res) => {
       // they do not introduce a second persistence or accounting model.
       if (req.method === 'GET' && path === '/api/sessions') {
         if (authConfig.enabled && needAuth(res, principal)) return;
-        return send(res, 200, { sessions: visibleRunIndex(principal).slice(-200).reverse().map((r) => ({
+        return send(res, 200, { sessions: (await visibleRunIndex(principal)).slice(-200).reverse().map((r) => ({
           sessionId: r.id, title: r.title, status: r.status,
           projectId: r.projectId || null, createdAt: r.createdAt, updatedAt: r.updatedAt,
         })) });
       }
       if (req.method === 'GET' && path === '/api/cache') {
         if (authConfig.enabled && needAuth(res, principal)) return;
-        const runs = visibleRunIndex(principal);
+        const runs = await visibleRunIndex(principal);
         let hits = 0; let misses = 0; let cachedTokens = 0;
         for (const run of runs) {
-          const snapshot = store.loadSnapshot(run.id);
+          const snapshot = await runStore.loadSnapshot(run.id);
           const cache = snapshot?.cache || {};
           hits += Number(cache.hits) || 0;
           misses += Number(cache.misses) || 0;
@@ -1738,10 +2117,87 @@ const server = http.createServer(async (req, res) => {
             title: `${provider.label} health check failed`, at: provider.lastCheckedAt,
           });
         }
-        for (const run of visibleRunIndex(principal).slice(-50)) {
+        for (const run of (await visibleRunIndex(principal)).slice(-50)) {
           if (run.status === 'failed') alerts.push({ id: `run-${run.id}`, severity: 'error', source: 'run', title: `Run failed: ${String(run.title || run.id).slice(0, 100)}`, at: run.updatedAt });
         }
         return send(res, 200, { alerts: alerts.slice(-100).reverse(), note: 'Alerts are factual runtime signals; no alert is emitted without an observed failure.' });
+      }
+      // ---------- Orchestra Intelligence analytics APIs ----------
+      // Reusable analytics contracts over canonical economics + observed
+      // telemetry. The backend is authoritative; the frontend never prices
+      // independently and never fabricates thin slices (INSUFFICIENT_DATA).
+      const INTELLIGENCE_SECTIONS = {
+        '/api/analytics/intelligence': null,
+        '/api/analytics/models': 'topModels',
+        '/api/analytics/leaderboard': 'leaderboard',
+        '/api/analytics/tasks': 'tasks',
+        '/api/analytics/cost': 'cost',
+        '/api/analytics/market-share': 'marketShare',
+        '/api/analytics/benchmarks': 'benchmarks',
+        '/api/analytics/latency': 'latency',
+        '/api/analytics/context': 'context',
+        '/api/analytics/tools': 'tools',
+        '/api/analytics/workloads': 'workloads',
+        '/api/analytics/languages': 'languages',
+        '/api/analytics/images': 'images',
+        '/api/analytics/execution-flow': 'executionFlow',
+      };
+      if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(INTELLIGENCE_SECTIONS, path)) {
+        if (authConfig.enabled && needAuth(res, principal)) return;
+        const granularity = ['daily', 'weekly', 'monthly'].includes(u.searchParams.get('granularity')) ? u.searchParams.get('granularity') : 'daily';
+        const range = u.searchParams.get('range') || '30d';
+        const from = u.searchParams.get('from') || null;
+        const to = u.searchParams.get('to') || null;
+        const filters = {
+          model: u.searchParams.get('model') || null,
+          provider: u.searchParams.get('provider') || null,
+          taskCategory: u.searchParams.get('taskCategory') || u.searchParams.get('task') || null,
+          projectId: u.searchParams.get('projectId') || u.searchParams.get('project') || null,
+        };
+        const allRuns = await visibleRunIndex(principal);
+        const economicsByRun = new Map();
+        const snapshotsByRun = new Map();
+        for (const run of allRuns) {
+          try {
+            const economics = await economicsForRun(run.id, u.searchParams.get('referenceModel') || null);
+            economicsByRun.set(run.id, economics);
+          } catch { /* per-run economics must not fail the whole surface */ }
+          try {
+            const live = orchestrator.getRun ? orchestrator.getRun(run.id) : null;
+            if (live) {
+              const snap = buildSnapshot(orchestrator, run.id);
+              if (snap) snapshotsByRun.set(run.id, snap);
+            } else {
+              const persisted = await runStore.loadSnapshot(run.id);
+              if (persisted) snapshotsByRun.set(run.id, persisted);
+            }
+          } catch { /* snapshot failure is non-fatal */ }
+        }
+        let registryModels = [];
+        try { registryModels = await modelRegistry.getModels(); } catch { registryModels = []; }
+        const observedByModel = new Map();
+        try {
+          if (typeof modelRegistry.getObserved === 'function') {
+            for (const m of registryModels) {
+              const obs = modelRegistry.getObserved(m.id);
+              if (obs) observedByModel.set(m.id, obs);
+            }
+          }
+        } catch { /* observed enrichment is best-effort */ }
+        // currentMode() is deployment-level; per-tenant LIVE requires the
+        // tenant's own credential (modeForPrincipal). Prefer the stricter
+        // per-principal view so demo tenants never see LIVE provenance.
+        let intelMode = currentMode();
+        try { if (principal) intelMode = modeForPrincipal(principal); } catch { /* keep deployment mode */ }
+        const full = buildIntelligence({
+          runs: allRuns, economicsByRun, snapshotsByRun,
+          models: registryModels, observedByModel, intelligence,
+          mode: intelMode,
+          options: { granularity, range, from, to, filters },
+        });
+        const sectionKey = INTELLIGENCE_SECTIONS[path];
+        if (!sectionKey) return send(res, 200, { intelligence: full });
+        return send(res, 200, { meta: full.meta, section: sectionKey, data: full[sectionKey] || null });
       }
       // ---------- canonical economics / analytics / billing APIs ----------
       // All three surfaces consume the same SavingsEngine result. There is no
@@ -1750,12 +2206,12 @@ const server = http.createServer(async (req, res) => {
         if (authConfig.enabled && needAuth(res, principal)) return;
         const from = u.searchParams.get('from') || null;
         const to = u.searchParams.get('to') || null;
-        const runs = visibleRunIndex(principal).filter((r) => ['completed', 'failed', 'cancelled'].includes(String(r.status)));
+        const runs = (await visibleRunIndex(principal)).filter((r) => ['completed', 'failed', 'cancelled'].includes(String(r.status)));
         const lines = [];
         const displayRuns = [];
         const economicsByRun = new Map();
         for (const run of runs) {
-          const economics = economicsForRun(run.id, u.searchParams.get('referenceModel') || null);
+          const economics = await economicsForRun(run.id, u.searchParams.get('referenceModel') || null);
           economicsByRun.set(run.id, economics);
           if (withinDateRange(run, from, to)) {
             // Keep every terminal outcome visible in history, including
@@ -1770,7 +2226,7 @@ const server = http.createServer(async (req, res) => {
             });
           }
           if (withinDateRange(run, from, to)) {
-            lines.push({ runId: run.id, title: run.title || 'Untitled task', date: run.updatedAt || run.createdAt, savings: economics, snapshot: store.loadSnapshot(run.id) });
+            lines.push({ runId: run.id, title: run.title || 'Untitled task', date: run.updatedAt || run.createdAt, savings: economics, snapshot: await runStore.loadSnapshot(run.id) });
           }
         }
         if (path === '/api/billing') {
@@ -1781,7 +2237,8 @@ const server = http.createServer(async (req, res) => {
           });
         }
         if (path === '/api/analytics/overview') {
-          const analyticsRuns = runs.map((r) => ({ ...r, snapshot: store.loadSnapshot(r.id) }));
+          const analyticsRuns = [];
+          for (const r of runs) analyticsRuns.push({ ...r, snapshot: await runStore.loadSnapshot(r.id) });
           return send(res, 200, { analytics: buildAnalytics(analyticsRuns, economicsByRun, { from, to }) });
         }
         const summary = aggregateBilling(lines);
@@ -1807,7 +2264,7 @@ const server = http.createServer(async (req, res) => {
         // only their own tenant's runs. Ownerless legacy records are
         // quarantined rather than treated as public.
         if (authConfig.enabled && needAuth(res, principal)) return;
-        const all = mergeIndex(store.loadRunIndex(), orchestrator.getActiveRuns());
+        const all = mergeIndex(await runStore.loadRunIndex(), orchestrator.getActiveRuns());
         if (authConfig.enabled && principal && !isGlobalAdmin(principal)) {
           return send(res, 200, { runs: all.filter((r) => {
             const owner = (r && (r.ownerId || r.owner)) || null;
@@ -1824,7 +2281,7 @@ const server = http.createServer(async (req, res) => {
         if (errors.length) return sendError(res, 400, 'bad_request', errors[0]);
         const title = String(json.title || 'New Task').slice(0, limits.maxTitleChars);
         const taskMode = json.taskMode || 'general';
-        const project = json.projectId ? tenants.getProject(String(json.projectId), principal) : null;
+        const project = json.projectId ? await tenants.getProject(String(json.projectId), principal) : null;
         if (json.projectId && !project) return sendError(res, 403, 'forbidden', 'project is not accessible');
         const defaults = runtimeSettings.load();
         const preset = getPreset(typeof json.preset === 'string' && validPreset(json.preset) ? json.preset : defaults.defaultPreset);
@@ -1911,8 +2368,8 @@ const server = http.createServer(async (req, res) => {
         const [idA, idB] = [cmp[1], cmp[2]];
         if (!validRunId(idA) || !validRunId(idB)) return sendError(res, 400, 'bad_request', 'invalid run id');
         if (authConfig.enabled && needAuth(res, principal)) return;
-        if (guardRunRead(res, principal, idA) || guardRunRead(res, principal, idB)) return;
-        const result = compareRuns(orchestrator, store, eventBus, idA, idB);
+        if ((await guardRunRead(res, principal, idA)) || (await guardRunRead(res, principal, idB))) return;
+        const result = await compareRuns(orchestrator, runStore, eventBus, idA, idB);
         if (!result) return sendError(res, 404, 'not_found', 'one or both runs not found');
         return send(res, 200, result);
       }
@@ -1942,7 +2399,7 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { run: runSummary(orchestrator, id) });
           }
           // Terminated history stays queryable after restart.
-          const persisted = persistedSummary(id);
+          const persisted = await persistedSummary(id);
           if (persisted) {
             if (authConfig.enabled && !canAccessRun(principal, persisted)) return sendError(res, 403, 'forbidden', 'not owner of this run');
             return send(res, 200, { run: persisted, persisted: true });
@@ -1957,7 +2414,7 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { state });
           }
           // Terminated runs: serve the last persisted snapshot (read-only history).
-          const persisted = store.loadSnapshot(id);
+          const persisted = await runStore.loadSnapshot(id);
           if (persisted) {
             if (authConfig.enabled && !canAccessRun(principal, persisted)) return sendError(res, 403, 'forbidden', 'not owner of this run');
             return send(res, 200, { state: persisted, persisted: true });
@@ -1965,10 +2422,35 @@ const server = http.createServer(async (req, res) => {
           return sendError(res, 404, 'not_found', 'run not found');
         }
         if (req.method === 'GET' && sub === 'events') {
-          if (guardRunRead(res, principal, id)) return;
+          if (await guardRunRead(res, principal, id)) return;
+          // Multi-instance replay: ?since= and Last-Event-ID are equivalent
+          // cursors (CONTRACTS.md shape unchanged). The durable event log
+          // merges this instance's bus with durable storage so a client that
+          // reconnects to a different instance still replays without loss.
           const rawSince = Number(u.searchParams.get('since'));
-          const since = Number.isFinite(rawSince) && rawSince > 0 ? Math.floor(rawSince) : 0;
-          const served = serveRunEvents({ eventBus, store, sseLine }, req, res, {
+          const since = parseCursor({ since: rawSince, lastEventId: parseLastEventIdHeader(req) });
+          if (datastore.kind === 'postgres') {
+            const replay = await readDurableSince({ eventBus, store: runStore, runId: id, since });
+            const hasLive = eventBus.eventLogs.has(id) || (replay.latestSeq || 0) > 0;
+            if (!hasLive && !replay.events.length && !replay.latestSeq) return sendError(res, 404, 'not_found', 'run not found');
+            res.writeHead(200, {
+              ...securityHeaders(),
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+              ...(res._cors || {}),
+              ...((res._cors || {})['Access-Control-Allow-Origin'] ? { 'Access-Control-Allow-Credentials': 'true' } : {}),
+            });
+            res.write(`: connected run=${id}\n\n`);
+            if (replay.gap) {
+              res.write(`event: gap\ndata: ${JSON.stringify({ runId: id, since, oldestSeq: replay.oldestSeq, message: 'event window truncated; resync via GET state' })}\n\n`);
+            }
+            for (const msg of replay.events || []) res.write(sseLine(msg));
+            if (isLive) eventBus.subscribe(id, res);
+            else res.end();
+            return;
+          }
+          const served = await serveRunEvents({ eventBus, store: runStore, sseLine }, req, res, {
             runId: id, since, live: isLive,
             corsHeaders: res._cors || {},
             securityHeaders: securityHeaders(),
@@ -1990,7 +2472,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (req.method === 'GET' && sub === 'savings') {
           if (!runtimeState) {
-            const persisted = store.loadSnapshot(id);
+            const persisted = await runStore.loadSnapshot(id);
             if (!persisted) return sendError(res, 404, 'not_found', 'run not found');
             runtimeState = persisted;
           }
@@ -2034,29 +2516,41 @@ const server = http.createServer(async (req, res) => {
 
           eventBus.emit(id, EventType.TASK_UPDATED, { userText: content });
 
+          // Genuine execution path: API -> enqueue run.execute -> worker
+          // claims -> executes (start or same-run continuation episode) ->
+          // persists -> emits. 202 means a worker claimed the run (or settled
+          // it instantly); late outcomes travel over SSE/run state. Duplicate
+          // delivery while the run is executing is rejected as busy (never
+          // double-executed). Run execution is non-retryable: unknown side
+          // effects are never blindly re-run.
           try {
-            await orchestrator.startRun(id, content);
+            const claimed = await jobQueue.enqueueAndClaim({
+              type: 'run.execute',
+              runId: id,
+              payload: { runId: id, content },
+              idempotencyKey: `run-execute:${id}`,
+              retryable: false,
+              maxAttempts: 1,
+              timeoutMs: Math.min((config.runTimeoutMs || 300000) + 60000, 600000),
+            }, { waitMs: 15000 });
+            persistActive();
+            log.info('run message accepted', { requestId, runId: id, userId: principal && principal.id });
+            if (claimed && claimed.settled && claimed.result && claimed.result.continued) {
+              return send(res, 202, { accepted: true, continued: true, episodeId: claimed.result.episodeId });
+            }
+            return send(res, 202, { accepted: true });
           } catch (e) {
-            if (e && e.code === 'busy') return sendError(res, 409, 'busy', 'Run is already executing; wait for it to finish.');
-            // Session 3: a message to a COMPLETED run continues the SAME run
-            // as a new execution episode (never an unrelated run).
+            if (e && (e.code === 'duplicate' || e.code === 'busy')) {
+              return sendError(res, 409, 'busy', 'Run is already executing; wait for it to finish.');
+            }
             if (e && e.code === 'terminal') {
-              try {
-                const cont = await execution.continueRun(id, content);
-                if (cont && cont.ok) {
-                  persistActive();
-                  return send(res, 202, { accepted: true, continued: true, episodeId: cont.episode.episodeId });
-                }
-              } catch (ce) {
-                return sendError(res, 409, 'terminal', String((ce && ce.message) || ce));
-              }
-              return sendError(res, 409, 'terminal', String(e.message));
+              return sendError(res, 409, 'terminal', String((e && e.message) || e).slice(0, 220));
+            }
+            if (e && (e.code === 'claim_timeout' || e.code === 'wait_timeout' || e.code === 'timed_out' || e.code === 'queue_closed' || e.code === 'worker_lost')) {
+              return sendError(res, 503, 'execution_unavailable', 'Execution worker did not claim the run in time; the run state is durable — retry the message or check run state.');
             }
             throw e;
           }
-          persistActive();
-          log.info('run message accepted', { requestId, runId: id, userId: principal && principal.id });
-          return send(res, 202, { accepted: true });
         }
         if (req.method === 'POST' && sub === 'cancel') {
           if (needAuth(res, principal)) return;
@@ -2065,11 +2559,11 @@ const server = http.createServer(async (req, res) => {
           if (authConfig.enabled && !ownsRun()) return sendError(res, 403, 'forbidden', 'not owner of this run');
           const ok = await orchestrator.cancelRun(id);
           persistActive();
-          const summary = runSummary(orchestrator, id) || persistedSummary(id) || { id, status: TaskStatus.CANCELLED };
+          const summary = runSummary(orchestrator, id) || await persistedSummary(id) || { id, status: TaskStatus.CANCELLED };
           log.info('run cancel requested', { requestId, runId: id, userId: principal && principal.id, ok });
           return send(res, 200, { run: summary, cancelled: ok });
         }
-        if (req.method === 'POST' && sub === 'retry') {
+if (req.method === 'POST' && sub === 'retry') {
           if (needAuth(res, principal)) return;
           if (needRole(res, principal, 'operator')) return;
           if (!runtimeState) return sendError(res, 404, 'not_found', 'run not found');
@@ -2081,12 +2575,41 @@ const server = http.createServer(async (req, res) => {
             const plan = (orchestrator.lastRecoveryPlan && orchestrator.lastRecoveryPlan(id)) || null;
             return sendError(res, 409, 'retry_rejected', plan && plan.reason
               ? `Retry refused: ${String(plan.reason).slice(0, 220)}`
-              : 'Retry is only available for failed runs with remaining budget.',
-              plan ? { recoveryAction: plan.action, checkpointId: plan.checkpointId } : undefined);
+              : 'Retry is only available for failed runs with remaining budget.', plan ? { recoveryAction: plan.action, checkpointId: plan.checkpointId } : undefined);
           }
           persistActive();
           log.info('run retry accepted', { requestId, runId: id, userId: principal && principal.id });
           return send(res, 202, { accepted: true });
+        }
+        if (req.method === 'POST' && sub === 'fork') {
+          if (needAuth(res, principal)) return;
+          if (needRole(res, principal, 'operator')) return;
+          if (!runtimeState) return sendError(res, 404, 'not_found', 'run not found');
+          if (authConfig.enabled && !ownsRun()) return sendError(res, 403, 'forbidden', 'not owner of this run');
+          try {
+            const newRunId = await orchestrator.forkRun(id);
+            persistActive();
+            log.info('run fork accepted', { requestId, runId: id, newRunId, userId: principal && principal.id });
+            return send(res, 202, { accepted: true, newRunId });
+          } catch (e) {
+            log.warn('run fork failed', { requestId, runId: id, error: String((e && e.message) || e).slice(0, 200) });
+            return sendError(res, 409, 'fork_refused', String((e && e.message) || e).slice(0, 220));
+          }
+        }
+        if (req.method === 'POST' && sub === 'duplicate') {
+          if (needAuth(res, principal)) return;
+          if (needRole(res, principal, 'operator')) return;
+          if (!runtimeState) return sendError(res, 404, 'not_found', 'run not found');
+          if (authConfig.enabled && !ownsRun()) return sendError(res, 403, 'forbidden', 'not owner of this run');
+          try {
+            const newRunId = await orchestrator.duplicateRun(id);
+            persistActive();
+            log.info('run duplicate accepted', { requestId, runId: id, newRunId, userId: principal && principal.id });
+            return send(res, 202, { accepted: true, newRunId });
+          } catch (e) {
+            log.warn('run duplicate failed', { requestId, runId: id, error: String((e && e.message) || e).slice(0, 220) });
+            return sendError(res, 409, 'duplicate_refused', String((e && e.message) || e).slice(0, 220));
+          }
         }
       }
 
@@ -2110,7 +2633,7 @@ const server = http.createServer(async (req, res) => {
           // Same quarantine rule as guardRunRead/ownedByOther: ownerless
           // legacy runs are NOT implicitly shared with every authenticated
           // user. One rule everywhere, no IDOR drift between route groups.
-          if (s3run && !isGlobalAdmin(principal) && ownedByOther(id, principal)) {
+          if (s3run && !isGlobalAdmin(principal) && (await ownedByOther(id, principal))) {
             return sendError(res, 403, 'forbidden', 'not owner of this run');
           }
         }
@@ -2123,12 +2646,12 @@ const server = http.createServer(async (req, res) => {
           (req.method === 'GET' && (resource === 'execution' || resource === 'result' || resource === 'episodes'))
         );
         if (liveOnly && !orchestrator.activeRuns.get(id)) {
-          const persisted = persistedSummary(id);
+          const persisted = await persistedSummary(id);
           if (!persisted) return sendError(res, 404, 'not_found', 'run not found');
           return sendError(res, 410, 'gone', 'run is persisted history; execution APIs need a live run');
         }
         if (!liveOnly && !orchestrator.activeRuns.get(id) && !(orchestrator.getRun && orchestrator.getRun(id))) {
-          const persisted = persistedSummary(id);
+          const persisted = await persistedSummary(id);
           if (!persisted) return sendError(res, 404, 'not_found', 'run not found');
           return sendError(res, 410, 'gone', 'run is persisted history; execution APIs need a live run');
         }
@@ -2308,4 +2831,7 @@ if (require.main === module) {
   server.listen(config.port, () => log.info('runtime listening', { port: config.port, mode: config.mode, provider: config.provider }));
 }
 
-module.exports = { server, orchestrator, execution, config, providerRegistry, discovery, store, tenants, evaluations, intelligence, corsHeaders, resolveCorsOrigin, credentials, runtimeSettings, modelChanges, providerStatus, currentMode, refreshRuntimeMode, enrichModel, shutdown };
+module.exports = { server, orchestrator, execution, config, providerRegistry, discovery, store, tenants, evaluations, intelligence, corsHeaders, resolveCorsOrigin, credentials, runtimeSettings, modelChanges, providerStatus, currentMode, refreshRuntimeMode, enrichModel, shutdown,
+  // Agent 1 production infrastructure handles (additive exports for tests and
+  // the final integrator; existing exports unchanged).
+  datastore, coordinator: () => coordinator, locks: () => locks, jobQueue: () => jobQueue, idempotencyStore, allowRequestDistributed };
