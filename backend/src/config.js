@@ -81,6 +81,32 @@ function loadConfig(env = process.env) {
     dataDir: str(env, 'RUNTIME_DATA_DIR', 'backend/.runtime-data'),
     dataEncryptionKey: str(env, 'DATA_ENCRYPTION_KEY', ''),
     logLevel: str(env, 'LOG_LEVEL', 'info'),
+    nodeEnv: str(env, 'NODE_ENV', 'development'),
+    // --- Agent 1 production infrastructure (all env access stays here) ---
+    // Datastore: 'auto' (postgres iff DATABASE_URL is set, else file),
+    // 'postgres' (durable relational state), or 'file' (explicit dev/test adapter).
+    datastoreProvider: str(env, 'DATASTORE_PROVIDER', 'auto').toLowerCase(),
+    databaseUrl: str(env, 'DATABASE_URL', ''),
+    dbSsl: bool(env, 'DATABASE_SSL', false),
+    dbPoolMax: num(env, 'DATABASE_POOL_MAX', 10),
+    dbStatementTimeoutMs: num(env, 'DATABASE_STATEMENT_TIMEOUT_MS', 10000),
+    // Redis: transient coordination (locks, rate limits, hot cache, ephemeral
+    // runtime coordination). Absent = explicit in-memory dev/test adapter.
+    redisUrl: str(env, 'REDIS_URL', ''),
+    redisRequired: bool(env, 'REDIS_REQUIRED', false),
+    // Queue/job adapter: 'memory' (default, single-process) or 'redis'
+    // (durable scheduling via Redis streams/list; BullMQ-compatible later).
+    queueProvider: str(env, 'QUEUE_PROVIDER', 'memory').toLowerCase(),
+    queueConcurrency: num(env, 'QUEUE_CONCURRENCY', 4),
+    // Operational tunables previously scattered as process.env reads.
+    retentionSweepIntervalMs: num(env, 'RETENTION_SWEEP_INTERVAL_MS', 3600000),
+    retentionGraceMs: num(env, 'RETENTION_GRACE_MS', 86400000),
+    session3AutoVerify: !/^(0|false|no)$/i.test(str(env, 'SESSION3_AUTO_VERIFY', '1')),
+    isProduction: String(env.NODE_ENV || '').toLowerCase() === 'production',
+    // Explicit opt-in to run the file adapter in production (single-node or
+    // test harness). Without this, production + file datastore is a loud
+    // operational warning (never a silent multi-instance claim).
+    allowFileDatastoreInProduction: bool(env, 'ALLOW_FILE_DATASTORE_IN_PRODUCTION', false),
   };
 }
 
@@ -126,6 +152,21 @@ function validateConfig(config, env = process.env) {
   if (!(config.maxSteps >= 1 && config.maxSteps <= 50)) problems.push('RUN_MAX_STEPS must be 1..50');
   if (!(config.maxToolCalls >= 1 && config.maxToolCalls <= 100)) problems.push('RUN_MAX_TOOL_CALLS must be 1..100');
   if (!config.dataDir || typeof config.dataDir !== 'string') problems.push('RUNTIME_DATA_DIR is required');
+  if (!['auto', 'file', 'postgres'].includes(String(config.datastoreProvider || 'auto'))) {
+    problems.push(`DATASTORE_PROVIDER must be auto|file|postgres (got ${JSON.stringify(config.datastoreProvider)})`);
+  }
+  if (String(config.datastoreProvider) === 'postgres' && !config.databaseUrl) {
+    problems.push('DATASTORE_PROVIDER=postgres requires DATABASE_URL');
+  }
+  if (!['memory', 'redis'].includes(String(config.queueProvider || 'memory'))) {
+    problems.push(`QUEUE_PROVIDER must be memory|redis (got ${JSON.stringify(config.queueProvider)})`);
+  }
+  if (String(config.queueProvider) === 'redis' && !config.redisUrl) {
+    problems.push('QUEUE_PROVIDER=redis requires REDIS_URL');
+  }
+  if (config.redisRequired && !config.redisUrl) {
+    problems.push('REDIS_REQUIRED=true requires REDIS_URL');
+  }
 
   if (isProd) {
     // Secrets must never have accidental hardcoded production values, and
@@ -139,6 +180,18 @@ function validateConfig(config, env = process.env) {
     if (String(env.AUTH_ENABLED || '').toLowerCase() === 'false' && !env.API_TOKEN && !env.OPERATOR_TOKEN && !env.AUTH_TOKENS) {
       warnings.push('AUTH_ENABLED=false in production with no API tokens: bearer auth is open; prefer session auth + tokens');
     }
+    // Production datastore posture: file persistence is a single-process
+    // dev/test adapter. Running it in production without an explicit opt-in
+    // is allowed for backwards compatibility (existing tests/harnesses) but
+    // is always a loud warning — never a silent multi-instance claim.
+    const usesFileStore = String(config.datastoreProvider || 'auto') === 'file'
+      || (String(config.datastoreProvider || 'auto') === 'auto' && !config.databaseUrl);
+    if (usesFileStore && !config.allowFileDatastoreInProduction) {
+      warnings.push('production uses file datastore (single-process JSON): set DATABASE_URL + DATASTORE_PROVIDER=postgres for durable multi-instance state, or ALLOW_FILE_DATASTORE_IN_PRODUCTION=true to acknowledge single-node mode');
+    }
+    if (!config.redisUrl && !config.redisRequired) {
+      warnings.push('REDIS_URL is unset: distributed locks/rate-limits use in-memory single-process adapters; multi-instance coordination is disabled');
+    }
   }
 
   if (problems.length) {
@@ -150,4 +203,15 @@ function validateConfig(config, env = process.env) {
   return { warnings };
 }
 
-module.exports = { loadConfig, validateConfig, redact, SECRET_KEYS };
+module.exports = { loadConfig, validateConfig, redact, SECRET_KEYS, resolvedDatastoreKind };
+
+// Effective durable-store kind after 'auto' resolution. 'postgres' iff a
+// DATABASE_URL is configured (or explicitly requested); otherwise 'file'.
+// Callers must never silently downgrade postgres->file when a DATABASE_URL
+// was configured: that path throws (see infrastructure/datastore.js).
+function resolvedDatastoreKind(config) {
+  const explicit = String((config && config.datastoreProvider) || 'auto').toLowerCase();
+  if (explicit === 'postgres') return 'postgres';
+  if (explicit === 'file') return 'file';
+  return config && config.databaseUrl ? 'postgres' : 'file';
+}
