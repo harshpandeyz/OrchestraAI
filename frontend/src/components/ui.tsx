@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useRuntime } from '../state/store';
+import { IconChevronDown } from './icons';
 
 export function Section({ id, title, children, defaultOpen, count, flashKey }: { id: string; title: string; children: React.ReactNode; defaultOpen?: boolean; count?: number | string; flashKey?: string | number }) {
   const { state, dispatch } = useRuntime();
@@ -11,7 +12,7 @@ export function Section({ id, title, children, defaultOpen, count, flashKey }: {
   // Anchor id for inspector quick-nav
   return (
     <section className={`card${isFlash ? ' flash' : ''}`} aria-label={title} id={`sec-${id}`}>
-      <h3>{title}{count !== undefined && count !== '' ? <span className="cnt">{count}</span> : null}<button aria-label={`${open ? 'Collapse' : 'Expand'} ${title}`} aria-expanded={open} onClick={() => dispatch({ type: 'ui/toggle', key: id })}>{open ? '–' : '+'}</button></h3>
+      <h3>{title}{count !== undefined && count !== '' ? <span className="cnt">{count}</span> : null}<button aria-label={`${open ? 'Collapse' : 'Expand'} ${title}`} aria-expanded={open} onClick={() => dispatch({ type: 'ui/toggle', key: id })}><span className={open ? 'sec-chev open' : 'sec-chev'} aria-hidden="true"><IconChevronDown size={14} /></span></button></h3>
       {open && <div>{children}</div>}
     </section>
   );
@@ -85,7 +86,7 @@ export function CopyButton({ text, label }: { text: string; label?: string }) {
   return (
     <button className="copybtn" aria-label={label || 'Copy to clipboard'} title="Copy"
       onClick={async (e) => { e.stopPropagation(); try { await navigator.clipboard.writeText(text); setOk(true); setTimeout(() => setOk(false), 1200); } catch { /* clipboard unavailable */ } }}>
-      {ok ? '✓ Copied' : 'Copy'}
+      {ok ? 'Copied' : 'Copy'}
     </button>
   );
 }

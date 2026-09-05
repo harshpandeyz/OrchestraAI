@@ -3,7 +3,12 @@ import './Center.css';
 import { api } from '../api/client';
 import { useRuntime } from '../state/store';
 import { CopyButton, elapsed, fmtTime, usd } from './ui';
-import type { ChatMessage } from '../types';
+import { ExecutionTimeline } from './execution/ExecutionTimeline';
+import { ResourceBar } from './execution/ResourceBar';
+import { OutcomeCard } from './outcome/OutcomeCard';
+import { Tip } from './Tooltip';
+import { IconCheck, IconRetry, IconSend, IconStop, IconX } from './icons';
+import type { ChatMessage, Run, RuntimeSnapshot } from '../types';
 
 function roleLabel(m: ChatMessage) {
   if (m.role === 'user') return 'You';
@@ -271,7 +276,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
           aria-label={copied ? 'Code copied to clipboard' : `Copy ${lang || 'code'} block to clipboard`}
           title="Copy code"
         >
-          {copied ? '✓ COPIED' : 'COPY'}
+          {copied ? 'COPIED' : 'COPY'}
         </button>
       </div>
       <pre tabIndex={0} aria-label={lang ? `${lang} code block` : 'Code block'}><code>{code}</code></pre>
@@ -330,14 +335,14 @@ const Markdown = memo(function Markdown({ source }: { source: string }) {
 // Five honest milestones, each derived from real snapshot state only:
 // Task (a user message exists) → Context (tokens built) → Model (selected) →
 // Execute (assistant responded) → Done (terminal). Never invented.
-export function journeySteps(snap: any): { label: string; state: 'done' | 'active' | 'todo' | 'failed' }[] {
-  const status = String(snap?.status || '');
+export function journeySteps(snap: RuntimeSnapshot): { label: string; state: 'done' | 'active' | 'todo' | 'failed' }[] {
+  const status = String(snap.status || '');
   const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
-  const msgs = snap?.messages || [];
-  const hasUser = msgs.some((m: any) => m.role === 'user');
-  const hasAssistant = msgs.some((m: any) => m.role === 'assistant' && String(m.content || '').trim());
-  const hasContext = (snap?.context?.usedTokens || 0) > 0;
-  const hasModel = !!snap?.activeModelId;
+  const msgs = snap.messages;
+  const hasUser = msgs.some((m) => m.role === 'user');
+  const hasAssistant = msgs.some((m) => m.role === 'assistant' && String(m.content || '').trim());
+  const hasContext = snap.context.usedTokens > 0;
+  const hasModel = !!snap.activeModelId;
   const busy = status === 'running' || status === 'planning' || status === 'waiting';
   const steps = [
     { label: 'Task', done: hasUser },
@@ -360,7 +365,7 @@ export function journeySteps(snap: any): { label: string; state: 'done' | 'activ
   }));
 }
 
-function RunJourney({ snap }: { snap: any }) {
+function RunJourney({ snap }: { snap: RuntimeSnapshot }) {
   const steps = journeySteps(snap);
   return (
     <div className="journey" role="list" aria-label="Runtime progress">
@@ -374,7 +379,7 @@ function RunJourney({ snap }: { snap: any }) {
             className={`jstep ${s.state}`}
             title={`${s.label} — ${s.state}`}
           >
-            <span className="jdot" aria-hidden="true">{s.state === 'done' ? '✓' : s.state === 'failed' ? '✕' : i + 1}</span>
+            <span className="jdot" aria-hidden="true">{s.state === 'done' ? <IconCheck size={12} /> : s.state === 'failed' ? <IconX size={12} /> : i + 1}</span>
             <span className="jlabel">{s.label}</span>
           </span>
         </React.Fragment>
@@ -384,16 +389,17 @@ function RunJourney({ snap }: { snap: any }) {
 }
 
 // ---------- Run status ----------
+// One primary runtime status. Secondary technical states live in the inspector.
 type RunKey = 'READY' | 'RUNNING' | 'STOPPING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'RETRYING' | 'UNKNOWN';
-const RUN_META: Record<RunKey, { icon: string; pill: string }> = {
-  READY: { icon: '○', pill: 'neutral' },
-  RUNNING: { icon: '●', pill: 'info' },
-  STOPPING: { icon: '◐', pill: 'warn' },
-  COMPLETED: { icon: '✓', pill: 'ok' },
-  FAILED: { icon: '✕', pill: 'err' },
-  CANCELLED: { icon: '⊘', pill: 'neutral' },
-  RETRYING: { icon: '↻', pill: 'warn' },
-  UNKNOWN: { icon: '?', pill: 'neutral' },
+const RUN_META: Record<RunKey, { pill: string }> = {
+  READY: { pill: 'neutral' },
+  RUNNING: { pill: 'info' },
+  STOPPING: { pill: 'warn' },
+  COMPLETED: { pill: 'ok' },
+  FAILED: { pill: 'err' },
+  CANCELLED: { pill: 'neutral' },
+  RETRYING: { pill: 'warn' },
+  UNKNOWN: { pill: 'neutral' },
 };
 function resolveStatus(raw: string | undefined | null, stopping: boolean, retrying: boolean): RunKey {
   if (stopping) return 'STOPPING';
@@ -411,12 +417,12 @@ const BUSY = new Set(['running', 'planning', 'waiting']);
 
 // ---------- Tool parsing ----------
 type ToolState = 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CANCELLED' | 'UNKNOWN';
-const TOOL_META: Record<ToolState, { icon: string; pill: string; label: string }> = {
-  RUNNING: { icon: '●', pill: 'warn', label: 'Running' },
-  SUCCESS: { icon: '✓', pill: 'ok', label: 'Completed' },
-  FAILED: { icon: '✕', pill: 'err', label: 'Failed' },
-  CANCELLED: { icon: '⊘', pill: 'neutral', label: 'Cancelled' },
-  UNKNOWN: { icon: '○', pill: 'neutral', label: 'Tool' },
+const TOOL_META: Record<ToolState, { pill: string; label: string }> = {
+  RUNNING: { pill: 'warn', label: 'Running' },
+  SUCCESS: { pill: 'ok', label: 'Completed' },
+  FAILED: { pill: 'err', label: 'Failed' },
+  CANCELLED: { pill: 'neutral', label: 'Cancelled' },
+  UNKNOWN: { pill: 'neutral', label: 'Tool' },
 };
 function parseTool(content: string): { name: string; state: ToolState; duration: string | null; detail: string } {
   const text = String(content || '');
@@ -454,7 +460,7 @@ function RunningElapsed({ sinceTs }: { sinceTs: string }) {
 
 // ---------- Message items ----------
 const MsgItem = memo(function MsgItem({ m }: { m: ChatMessage }) {
-  const meta = (m.meta || {}) as any;
+  const meta = m.meta || {};
   const streaming = !!meta.streaming;
   if (m.role === 'user') {
     return (
@@ -480,7 +486,7 @@ const MsgItem = memo(function MsgItem({ m }: { m: ChatMessage }) {
         <div className="oa-tool-row">
           <span className="oa-tool-name" title={parsed.name}>{parsed.name}</span>
           <span className={`pill sm ${tm.pill}`} title={`Tool ${tm.label}`}>
-            <span aria-hidden="true">{tm.icon}</span> {parsed.state}
+            {parsed.state}
           </span>
           {parsed.state === 'RUNNING' ? (
             <RunningElapsed sinceTs={m.ts} />
@@ -515,7 +521,7 @@ const MsgItem = memo(function MsgItem({ m }: { m: ChatMessage }) {
     return (
       <div className="msg system oa-system" role="note" data-testid={`msg-${m.id}`}>
         <span className="who">
-          <span aria-hidden="true">ℹ</span> Runtime · <time dateTime={m.ts}>{fmtTime(m.ts)}</time>
+          Runtime · <time dateTime={m.ts}>{fmtTime(m.ts)}</time>
           <CopyButton text={m.content} label="Copy runtime notice" />
         </span>
         <div className="oa-sys-body">{m.content}</div>
@@ -536,7 +542,7 @@ const MsgItem = memo(function MsgItem({ m }: { m: ChatMessage }) {
         {typeof meta.tokens === 'number' ? (
           <span className="oa-mono" title="Tokens">{meta.tokens} tok</span>
         ) : null}
-        {streaming && <span className="pill sm info"><span aria-hidden="true">●</span> STREAMING</span>}
+        {streaming && <span className="pill sm info"><span className="oa-livedot" aria-hidden="true" /> STREAMING</span>}
         <CopyButton text={m.content} label="Copy assistant message" />
       </span>
       <div className="md oa-md">
@@ -586,12 +592,12 @@ export function MessageList({ messages }: { messages: ChatMessage[] }) {
     el.scrollTop = el.scrollHeight;
   }, []);
 
-  const streaming = useMemo(() => messages.some(m => !!((m.meta as any)?.streaming)), [messages]);
+  const streaming = useMemo(() => messages.some(m => !!m.meta?.streaming), [messages]);
   const runningTool = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m.role === 'tool' && /RUNNING/i.test(m.content)) return parseTool(m.content).name;
-      if (m.role === 'assistant' && !((m.meta as any)?.streaming)) break;
+      if (m.role === 'assistant' && !m.meta?.streaming) break;
     }
     return null;
   }, [messages]);
@@ -635,17 +641,24 @@ export function MessageList({ messages }: { messages: ChatMessage[] }) {
   const snapStatus = String(snap?.status || '');
   const showError = snapStatus === 'failed';
   const showCancelled = snapStatus === 'cancelled';
+  const showTimeline = !!snap && Array.isArray(snap.trace) && snap.trace.length > 0;
 
   return (
     <div className="oa-feedwrap">
       <div className="feed oa-feed" ref={ref} role="log" aria-label="Agent conversation" aria-live="polite">
+        {showTimeline && (
+          <details className="oa-timeline-wrap" open={snapStatus !== 'completed'}>
+            <summary>Execution timeline — {snap!.trace.length} step{snap!.trace.length === 1 ? '' : 's'}</summary>
+            <ExecutionTimeline trace={snap!.trace} status={snapStatus} />
+          </details>
+        )}
         {messages.length > visible.length && (
           <div className="banner info oa-range" role="note">Showing latest {visible.length} of {messages.length} messages.</div>
         )}
         {visible.map(m => <MsgItem key={m.id} m={m} />)}
         {showError && (
           <div className="oa-inline-error" role="alert" data-testid="run-error-card">
-            <div className="oa-inline-error-head"><span aria-hidden="true">✕</span><b>Provider unavailable</b></div>
+            <div className="oa-inline-error-head"><b>Provider unavailable</b></div>
             <p>The model provider did not respond. Your conversation is preserved — review the last step, then retry when ready.</p>
             <div className="oa-inline-error-actions">
               <button
@@ -654,7 +667,7 @@ export function MessageList({ messages }: { messages: ChatMessage[] }) {
                 onClick={() => snap && state.server.activeRunId && api.retryRun(state.server.activeRunId).catch(() => {})}
                 aria-label="Retry run"
               >
-                ↻ Retry
+                <IconRetry size={14} /> Retry
               </button>
               <details className="oa-details">
                 <summary>Technical details</summary>
@@ -665,8 +678,18 @@ export function MessageList({ messages }: { messages: ChatMessage[] }) {
         )}
         {showCancelled && !showError && (
           <div className="oa-inline-cancel" role="status" data-testid="run-cancelled-card">
-            <span aria-hidden="true">⊘</span><b>Cancelled.</b><span> State is preserved — press New Run to start another task.</span>
+            <b>Cancelled.</b><span> State is preserved — press New Run to start another task.</span>
           </div>
+        )}
+        {snapStatus === 'completed' && snap && (
+          <>
+            <OutcomeCard
+              snap={snap}
+              onReviewChanges={() => document.getElementById('sec-changes')?.scrollIntoView({ behavior: 'smooth' })}
+              onViewEvidence={() => document.getElementById('sec-evidence')?.scrollIntoView({ behavior: 'smooth' })}
+            />
+            <RunOutcome snap={snap} run={state.server.runs.find(r => r.id === state.server.activeRunId)} />
+          </>
         )}
       </div>
       {activity && (
@@ -678,7 +701,7 @@ export function MessageList({ messages }: { messages: ChatMessage[] }) {
       )}
       {showJump && (
         <button type="button" className="oa-jump" onClick={jumpToLatest} aria-label="Jump to latest messages">
-          ↓ Jump to latest
+          Jump to latest
         </button>
       )}
     </div>
@@ -690,17 +713,11 @@ export function RunHeader() {
   const snap = state.server.snapshot;
   const [stopping, setStopping] = useState(false);
   const [retrying, setRetrying] = useState(false);
-  const [, tick] = useState(0);
 
   const rawStatus = String(snap?.status || '');
   const busy = !!snap && BUSY.has(rawStatus);
   useEffect(() => { if (!busy) setStopping(false); }, [busy]);
   useEffect(() => { if (rawStatus === 'running' || rawStatus === 'planning' || rawStatus === 'waiting') setRetrying(false); }, [rawStatus]);
-  useEffect(() => {
-    if (!busy) return;
-    const t = setInterval(() => tick(n => n + 1), 1000);
-    return () => clearInterval(t);
-  }, [busy]);
 
   if (!snap) {
     return (
@@ -709,31 +726,18 @@ export function RunHeader() {
           <h1>Agent Run</h1>
           <span className="sub">UNKNOWN — waiting for runtime</span>
         </div>
-        <span className="pill neutral"><span aria-hidden="true">?</span> UNKNOWN</span>
+        <span className="pill neutral">UNKNOWN</span>
       </div>
     );
   }
 
   const run = state.server.runs.find(r => r.id === state.server.activeRunId);
-  const model = state.server.models.find(m => m.id === snap.activeModelId);
   const key = resolveStatus(snap.status, stopping, retrying);
   const meta = RUN_META[key];
   const label = key === 'UNKNOWN' ? (String(snap.status || 'UNKNOWN').toUpperCase() || 'UNKNOWN') : key;
 
-  const spent = snap.cost?.spentUsd;
-  const budget = snap.cost?.budgetUsd;
-  const hasBudget = typeof spent === 'number' && typeof budget === 'number' && Number.isFinite(spent) && Number.isFinite(budget) && budget > 0;
-  const pct = hasBudget ? Math.min(1, (spent as number) / Math.max(1e-9, budget as number)) : 0;
-  const budgetState = !hasBudget ? 'unknown' : pct >= 1 ? 'exhausted' : pct >= 0.8 ? 'warning' : 'ok';
-  const barCls = pct >= 1 ? 'crit' : pct >= 0.8 ? 'hot' : '';
-  const done = ['completed', 'failed', 'cancelled'].includes(rawStatus);
   const canStop = busy && !stopping;
   const canRetry = !busy && !retrying && (rawStatus === 'failed' || rawStatus === 'completed' || rawStatus === 'cancelled');
-
-  const modelFull = model ? `${model.name} · ${model.provider}` : (snap.activeModelId || 'no model');
-  const modelShort = model ? model.name : (snap.activeModelId || 'no model');
-  const usedTok = snap.context?.usedTokens;
-  const winTok = snap.context?.windowTokens;
 
   const doStop = async () => {
     const id = state.server.activeRunId;
@@ -748,75 +752,44 @@ export function RunHeader() {
     try { await api.retryRun(id); } catch { setRetrying(false); }
   };
 
+  // Center answers WHAT AM I WORKING ON: title + one status + progress.
+  // A secondary resource line (cost/time/tokens) stays subtle and never
+  // competes with the outcome; full detail lives in the inspector.
+  const preset = snap.meta?.preset;
+  const mode = snap.meta?.mode;
   return (
     <div className="run-header oa-run-header">
       <div className="rh-title oa-rh-title">
         <h1 title={run?.title || 'Agent Run'}>{run?.title || 'Agent Run'}</h1>
-        <span className="sub">{run ? `${relRunMeta(run)}` : 'runtime session'}</span>
+        <span className="sub">{run ? `${relRunMeta(run)}` : 'runtime session'}{preset ? ` · ${preset}` : ''}{mode ? ` · ${mode}` : ''}</span>
+        <ResourceBar snap={snap} run={run} />
       </div>
       <span className={`pill ${meta.pill}`} role="status" aria-label={`Run status ${label}`} title={label === 'RUNNING' ? 'Agent is executing' : label}>
-        <span aria-hidden="true">{meta.icon}</span> {label}
+        {label === 'RUNNING' && <span className="oa-livedot" aria-hidden="true" />}
+        {label === 'COMPLETED' && <IconCheck size={13} />}
+        {label === 'FAILED' && <IconX size={13} />}
+        {label}
       </span>
       <span className="sr-only" role="status">Run {label}</span>
-      {snap.meta && (
-        <span className={`pill ${snap.meta.mode === 'live' ? 'ok' : 'neutral'}`}
-          title={snap.meta.mode === 'live' ? `Live provider${snap.meta.provider ? `: ${snap.meta.provider}` : ''}` : 'Demo mode: mock provider, no real model calls'}>
-          {snap.meta.mode === 'live' ? 'LIVE' : 'DEMO'}
-        </span>
-      )}
-      <span
-        className="pill info oa-model-badge"
-        title={model ? `${model.name} · ${model.provider} · ${(model.contextWindow / 1000).toFixed(0)}k context · ${model.status}` : String(modelFull)}
-        aria-label={`Active model ${modelFull}`}
-      >
-        <span aria-hidden="true" className="oa-model-dot" />
-        <span className="oa-truncate">{modelShort}</span>
-      </span>
-      {hasBudget ? (
-        <div
-          className={`budget-wrap oa-budget oa-budget-${budgetState}`}
-          title={`Spent ${usd(spent)} of ${usd(budget)} · projected ${usd(snap.cost?.projectedUsd)} · ${(pct * 100).toFixed(0)}% used`}
-        >
-          <div className={`budget-bar ${barCls}`} role="img" aria-label={`Budget spent ${usd(spent)} of ${usd(budget)}, ${(pct * 100).toFixed(0)} percent used${budgetState === 'warning' ? ', near budget' : budgetState === 'exhausted' ? ', budget exhausted' : ''}`}>
-            <i style={{ width: `${pct * 100}%` }} />
-          </div>
-          <span className="budget-txt oa-mono">{usd(spent)} / {usd(budget)}</span>
-          {budgetState !== 'ok' && (
-            <span className={`pill sm ${budgetState === 'exhausted' ? 'err' : 'warn'}`} title={budgetState === 'exhausted' ? 'Budget exhausted' : 'Near budget limit'}>
-              {budgetState === 'exhausted' ? 'EXHAUSTED' : `${Math.round(pct * 100)}% USED`}
-            </span>
-          )}
-        </div>
-      ) : (
-        <div className="budget-wrap oa-budget oa-budget-unknown" title="Budget unavailable">
-          <span className="budget-txt oa-mono">UNKNOWN budget</span>
-        </div>
-      )}
-      <div className="run-stats oa-run-stats" aria-label="Run statistics">
-        <span className="oa-mono" title={run?.createdAt ? `Started ${new Date(run.createdAt).toLocaleString()}` : 'Elapsed'}>
-          ⏱ {run?.createdAt ? elapsed(run.createdAt, done ? snap.updatedAt : undefined) : '—'}
-        </span>
-        {typeof usedTok === 'number' && typeof winTok === 'number' && winTok > 0 ? (
-          <span className="oa-mono oa-ctx-line" title={`Context ${(usedTok / 1000).toFixed(1)}k of ${(winTok / 1000).toFixed(0)}k tokens`}>
-            {(usedTok / 1000).toFixed(1)}k/{(winTok / 1000).toFixed(0)}k tok
-          </span>
-        ) : null}
-      </div>
       <div className="run-actions oa-run-actions">
         {canStop && (
-          <button className="icon-btn danger" onClick={doStop} disabled={stopping} aria-label="Stop run">
-            ■ Stop
-          </button>
+          <Tip label="Interrupt this run" shortcut="Esc">
+            <button className="icon-btn danger" onClick={doStop} disabled={stopping} aria-label="Stop run">
+              <IconStop size={14} /> Stop
+            </button>
+          </Tip>
         )}
         {stopping && busy && (
           <button className="icon-btn danger" disabled aria-label="Stopping run">
-            ◐ Stopping…
+            Stopping…
           </button>
         )}
         {canRetry && (
-          <button className="icon-btn" onClick={doRetry} disabled={retrying} aria-label="Retry run">
-            {retrying ? '↻ Retrying…' : '↻ Retry'}
-          </button>
+          <Tip label="Resume from the last checkpoint">
+            <button className="icon-btn" onClick={doRetry} disabled={retrying} aria-label="Retry run">
+              <IconRetry size={14} /> {retrying ? 'Retrying…' : 'Retry'}
+            </button>
+          </Tip>
         )}
       </div>
       <RunJourney snap={snap} />
@@ -829,9 +802,9 @@ function relRunMeta(run: { taskMode: string; createdAt: string }): string {
   catch { return run.taskMode; }
 }
 
-type ComposerState = 'READY' | 'RUNNING' | 'STOPPING' | 'ERROR' | 'DONE';
-const COMPOSER_PLACEHOLDER = 'Ask OrchestraAI to plan, investigate, execute, or analyze...';
+const COMPOSER_PLACEHOLDER = 'What do you want OrchestraAI to do?';
 const TASK_MODE_HINTS: Record<string, string> = {
+  auto: 'Auto: let OrchestraAI choose the approach',
   debug: 'Debug: diagnose failures and trace causes',
   code: 'Code: implement and edit with runtime context',
   research: 'Research: investigate across code and docs',
@@ -848,15 +821,12 @@ export function Composer() {
   const status = String(snap?.status || '');
   const busy = !!snap && BUSY.has(status);
   const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  const failed = status === 'failed';
   const terminalHint = status === 'failed'
     ? 'This run failed — use Retry above to resume from the last checkpoint.'
     : status === 'cancelled'
       ? 'This run was cancelled — press New Run above to start another task.'
       : 'This run is complete — press New Run above to start another task.';
-  const cstate: ComposerState = !snap ? 'READY' : sendError ? 'ERROR' : stopping && busy ? 'STOPPING' : busy ? 'RUNNING' : status === 'failed' ? 'ERROR' : terminal ? 'DONE' : 'READY';
-  const model = state.server.models.find(m => m.id === snap?.activeModelId);
-  const modelLabel = model ? model.name : (snap?.activeModelId || 'no model');
-  const modelTitle = model ? `${model.provider} · ${(model.contextWindow / 1000).toFixed(0)}k` : (snap?.activeModelId || 'No model selected');
 
   useEffect(() => { if (!busy) setStopping(false); }, [busy]);
 
@@ -912,6 +882,9 @@ export function Composer() {
     return () => window.removeEventListener('keydown', h);
   }, [state.ui.paletteOpen]);
 
+  // Composer stays simple: task + primary action. Model, cost, tokens and
+  // latency live in the inspector — never duplicated here. Task mode shapes
+  // routing for a fresh task, so it stays as one compact contextual control.
   return (
     <div className="composer oa-composer">
       <div className="composer-box oa-composer-box">
@@ -939,27 +912,19 @@ export function Composer() {
         />
         <span id="composer-hint" className="sr-only">Press Enter to send, Shift Enter for a new line, Escape to leave the input.</span>
         <div className="composer-row oa-composer-row">
-          <span className="pill neutral oa-model-badge oa-model-badge-sm" title={modelTitle} aria-label={`Active model ${modelTitle}`}>
-            <span className="oa-truncate">{modelLabel}</span>
-          </span>
-          <span className="pill neutral" title={`Spent ${usd(snap?.cost.spentUsd)} of ${usd(snap?.cost.budgetUsd)}`}>
-            <span className="oa-mono">💰 {usd(snap?.cost.spentUsd)} / {usd(snap?.cost.budgetUsd)}</span>
-          </span>
           <label className="sr-only" htmlFor="taskmode">Task mode</label>
-          <select
-            id="taskmode"
-            className="icon-btn oa-taskmode"
-            aria-label="Task mode"
-            title={TASK_MODE_HINTS[state.ui.taskMode] || 'Task mode: how the agent should approach your request'}
-            value={state.ui.taskMode}
-            disabled={busy || terminal}
-            onChange={e => dispatch({ type: 'ui/set', patch: { taskMode: e.target.value } })}
-          >
-            <option value="debug">debug</option><option value="code">code</option><option value="research">research</option><option value="general">general</option>
-          </select>
-          <span className={`composer-status oa-cstate ${cstate.toLowerCase()}`} role="status" aria-label={`Composer ${cstate}`}>
-            <span className="sdot" aria-hidden="true" />{cstate}
-          </span>
+          <Tip label={TASK_MODE_HINTS[state.ui.taskMode] || 'How the agent should approach your request'}>
+            <select
+              id="taskmode"
+              className="icon-btn oa-taskmode"
+              aria-label="Task mode"
+              value={state.ui.taskMode}
+              disabled={busy || terminal}
+              onChange={e => dispatch({ type: 'ui/set', patch: { taskMode: e.target.value } })}
+            >
+              <option value="auto">auto</option><option value="debug">debug</option><option value="code">code</option><option value="research">research</option><option value="general">general</option>
+            </select>
+          </Tip>
           {sendError && (
             <button type="button" className="oa-retry-link" role="alert" title={sendError} onClick={() => void submit()} aria-label={`Send failed: ${sendError}. Activate to retry.`}>
               Send failed — retry
@@ -967,22 +932,49 @@ export function Composer() {
           )}
           <span style={{ flex: 1 }} />
           {busy ? (
-            <button className="icon-btn danger" onClick={stop} disabled={stopping} aria-label="Stop run">{stopping ? '◐ Stopping…' : '■ Stop'}</button>
-          ) : cstate === 'ERROR' && !sendError ? (
+            <Tip label="Interrupt this run" shortcut="Esc">
+              <button className="icon-btn danger" onClick={stop} disabled={stopping} aria-label="Stop run"><IconStop size={14} /> {stopping ? 'Stopping…' : 'Stop'}</button>
+            </Tip>
+          ) : failed ? (
             <button
               className="icon-btn"
               onClick={() => state.server.activeRunId && api.retryRun(state.server.activeRunId).catch(() => {})}
               aria-label="Retry run"
             >
-              ↻ Retry
+              <IconRetry size={14} /> Retry
             </button>
           ) : (
-            <button className="send-btn" onClick={() => void submit()} disabled={!text.trim() || state.server.sending || !snap || terminal} aria-label="Send message">
-              {state.server.sending ? 'Sending…' : 'Send ⏎'}
-            </button>
+            <Tip label="Send to OrchestraAI" shortcut="Enter">
+              <button className="send-btn" onClick={() => void submit()} disabled={!text.trim() || state.server.sending || !snap || terminal} aria-label="Send message">
+                {state.server.sending ? 'Sending…' : (<><IconSend size={15} /> Send</>)}
+              </button>
+            </Tip>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** End-of-run outcome: concise, real numbers only. Never invented. */
+export function RunOutcome({ snap, run }: { snap: RuntimeSnapshot | null; run?: Pick<Run, 'createdAt'> | null }) {
+  if (!snap || String(snap.status) !== 'completed') return null;
+  const parts: string[] = [];
+  try {
+    if (run?.createdAt && snap.updatedAt) parts.push(elapsed(run.createdAt, snap.updatedAt));
+  } catch { /* omit */ }
+  const spent = typeof snap.cost?.spentUsd === 'number' && Number.isFinite(snap.cost.spentUsd) ? usd(snap.cost.spentUsd) : null;
+  if (spent && spent !== '—') parts.push(spent);
+  const toolCalls = snap.tools.reduce((a, t) => a + (t.calls || 0), 0);
+  if (toolCalls > 0) parts.push(`${toolCalls} tool${toolCalls === 1 ? '' : 's'}`);
+  const switches = snap.decisions.filter((d) => d.kind === 'model_switch').length;
+  if (switches > 0) parts.push(`${switches} model switch${switches === 1 ? '' : 'es'}`);
+  if (!parts.length) return null;
+  return (
+    <div className="oa-outcome" role="status" aria-label={`Run completed: ${parts.join(', ')}`}>
+      <IconCheck size={15} />
+      <b>Completed</b>
+      <span>{parts.join(' · ')}</span>
     </div>
   );
 }

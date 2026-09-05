@@ -1,0 +1,170 @@
+/* New Run dialog */
+.nr-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 14, 12, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 16px 16px;
+  z-index: 80;
+}
+.nr-dialog {
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  width: min(560px, 100%);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 18px 18px 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.28);
+}
+.nr-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.nr-head h2 {
+  margin: 0 0 2px;
+  font-size: 17px;
+}
+.nr-head p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.nr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.nr-field input,
+.nr-field select {
+  font: inherit;
+  font-weight: 400;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  width: 100%;
+}
+.nr-field input:focus-visible,
+.nr-field select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.nr-modes {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.nr-modes .chip.on {
+  border-color: var(--accent);
+  background: var(--accent-soft, var(--panel2));
+}
+.nr-hint {
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 12px;
+}
+.nr-adv-toggle {
+  margin: 4px 0 0;
+}
+.nr-advanced {
+  border-top: 1px solid var(--border-soft);
+  margin-top: 8px;
+  padding-top: 4px;
+}
+.nr-check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  margin: 10px 0;
+  cursor: pointer;
+}
+.nr-check input {
+  margin-top: 3px;
+}
+.nr-check small {
+  display: block;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.nr-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* Onboarding steps */
+.ob-steps {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ob-steps li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px 4px 5px;
+}
+.ob-steps li.active {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.ob-steps li.done {
+  color: var(--muted);
+}
+.ob-num {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+.ob-steps li.active .ob-num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.ob-steps li.done .ob-num {
+  background: var(--ok-soft, var(--panel2));
+}
+
+/* Success banner (ok variant missing from base styles) */
+.banner.ok {
+  border-color: var(--ok-dim, var(--accent-dim));
+  background: var(--ok-soft, var(--accent-soft));
+  color: var(--ok, var(--accent));
+  margin-left: 0;
+  margin-right: 0;
+}
+.nr-dialog .banner {
+  margin-left: 0;
+  margin-right: 0;
+}
+@media (max-width: 480px) {
+  .nr-overlay {
+    padding: 4vh 10px 10px;
+  }
+}

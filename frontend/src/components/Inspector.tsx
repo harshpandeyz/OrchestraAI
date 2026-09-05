@@ -1,10 +1,19 @@
 import React, { memo, useMemo, useState } from 'react';
+import { api } from '../api/client';
 import { useRuntime } from '../state/store';
-import { Empty, KV, Section, StatusDot, displaySnippet, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from './ui';
-import type { RuntimeSnapshot } from '../types';
+import { Empty, KV, Section, StatusDot, displaySnippet, elapsed, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from './ui';
+import { Tip } from './Tooltip';
+import { IconAlert, IconArrowDown, IconCheck, IconChevronLeft, IconChevronRight, IconX } from './icons';
+import { ApprovalCenter } from './execution/ApprovalCenter';
+import { EvidencePanel } from './outcome/EvidencePanel';
+import { WhyContextItem, WhyMemoryItem } from './decisions/WhyPanels';
+import type { CompareResponse, RuntimeSnapshot } from '../types';
 
 const SEG_COLORS = ['#0C7A5C', '#2F9E7E', '#2F7AC2', '#D9A62E', '#7C8B84', '#4FB3A9'];
-const NAV = [['model', 'Model'], ['why', 'Why?'], ['switch', 'Switch'], ['context', 'Context'], ['cache', 'Cache'], ['memory', 'Memory'], ['tools', 'Tools'], ['cost', 'Cost'], ['latency', 'Latency'], ['routing', 'Routing'], ['trace', 'Trace'], ['decisions', 'Decisions'], ['changes', 'Changes']];
+// Quick-nav covers the high-value runtime story only. Low-frequency detail
+// (switches, routing, cache, memory, latency, history, decisions) stays
+// reachable by scrolling or expanding — never competing for attention.
+const NAV = [['health', 'Health'], ['model', 'Model'], ['why', 'Why?'], ['context', 'Context'], ['cost', 'Cost'], ['tools', 'Tools'], ['changes', 'Changes'], ['trace', 'Trace']];
 
 function freshnessLabel(status: string | null, lastUpdate: string | null): 'LIVE' | 'STALE' | 'DISCONNECTED' | 'UNKNOWN' {
   if (status === 'connected') {
@@ -32,40 +41,162 @@ function ConnStatusBadge({ status, lastUpdate, terminal }: { status: string | nu
   );
 }
 
+export type InspectorTab = 'overview' | 'decisions' | 'resources' | 'evidence' | 'technical';
+
+const TABS: { id: InspectorTab; label: string }[] = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'decisions', label: 'Decisions' },
+  { id: 'resources', label: 'Resources' },
+  { id: 'evidence', label: 'Evidence' },
+  { id: 'technical', label: 'Technical' },
+];
+
 export function RuntimeInspector() {
   const { state, dispatch } = useRuntime();
   const snap = state.server.snapshot;
+  const [tab, setTab] = useState<InspectorTab>('overview');
   if (!snap) return <aside className="right" aria-label="Runtime inspector"><Empty what="Runtime state" hint="Select a run to inspect live runtime telemetry." /></aside>;
   const open = state.ui.rightOpen;
   const snapTerminal = !!snap && ['completed', 'failed', 'cancelled'].includes(String(snap.status));
   return (
     <aside className={`right ${open ? 'open' : ''}`} aria-label="Runtime inspector">
       {!open && (
-        <button className="inspector-fab" onClick={() => dispatch({ type: 'ui/set', patch: { rightOpen: true } })} aria-label="Open runtime inspector">◀ Inspector</button>
+        <Tip label="Open runtime inspector" side="left">
+          <button className="inspector-fab" onClick={() => dispatch({ type: 'ui/set', patch: { rightOpen: true } })} aria-label="Open runtime inspector"><IconChevronLeft size={15} /> Inspector</button>
+        </Tip>
       )}
       <div className="inspector-head">
-        <span className="inspector-title">Runtime Inspector</span>
+        <span className="inspector-title">Runtime</span>
         <ConnStatusBadge status={state.server.conn.status} lastUpdate={state.server.conn.lastUpdate} terminal={snapTerminal} />
-        <button className="icon-btn sm" aria-label="Close inspector" onClick={() => dispatch({ type: 'ui/set', patch: { rightOpen: false } })}>▶</button>
+        <Tip label="Collapse runtime inspector">
+          <button className="icon-btn sm icon-only" aria-label="Collapse runtime inspector" onClick={() => dispatch({ type: 'ui/set', patch: { rightOpen: false } })}><IconChevronRight size={15} /></button>
+        </Tip>
       </div>
-      <nav className="inspector-nav" aria-label="Inspector sections">
-        {NAV.map(([id, label]) => <a key={id} href={`#sec-${id}`}>{label}</a>)}
-      </nav>
-      <CurrentModel snap={snap} />
-      <WhyModel snap={snap} />
-      <ModelSwitch snap={snap} />
-      <ContextPanel snap={snap} />
-      <CachePanel snap={snap} />
-      <MemoryPanel snap={snap} />
-      <ToolsPanel snap={snap} />
-      <CostPanel snap={snap} />
-      <LatencyPanel snap={snap} />
-      <RoutingPanel snap={snap} />
-      <HistoryPanel snap={snap} />
-      <TracePanel />
-      <DecisionsPanel snap={snap} />
-      <ChangesPanel snap={snap} />
+      <div className="inspector-mode-note" role="note">
+        {snapTerminal ? 'Final state · read-only history' : 'Live · updating as the run executes'}
+      </div>
+      <div className="inspector-tabs" role="tablist" aria-label="Inspector views">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            aria-controls={`inspanel-${t.id}`}
+            id={`instab-${t.id}`}
+            className={`inspector-tab${tab === t.id ? ' on' : ''}`}
+            onClick={() => setTab(t.id)}
+            onKeyDown={(e) => {
+              if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+              e.preventDefault();
+              const idx = TABS.findIndex((x) => x.id === t.id);
+              const next = e.key === 'ArrowRight' ? TABS[(idx + 1) % TABS.length] : TABS[(idx - 1 + TABS.length) % TABS.length];
+              setTab(next.id);
+              document.getElementById(`instab-${next.id}`)?.focus();
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div id={`inspanel-${tab}`} role="tabpanel" aria-labelledby={`instab-${tab}`}>
+        {tab === 'overview' && (
+          <>
+            {snapTerminal && <RunOutcomePanel snap={snap} />}
+            {!snapTerminal && <FocusCard snap={snap} />}
+            <HealthPanel snap={snap} />
+            <CurrentModel snap={snap} />
+            <CostPanel snap={snap} />
+            <ToolsPanel snap={snap} />
+            <Section id="approvals" title="Approvals"><ApprovalCenter snap={snap} /></Section>
+          </>
+        )}
+        {tab === 'decisions' && (
+          <>
+            <WhyModel snap={snap} />
+            <RoutingPanel snap={snap} />
+            <ModelSwitch snap={snap} />
+            <DecisionsPanel snap={snap} />
+          </>
+        )}
+        {tab === 'resources' && (
+          <>
+            <ContextPanel snap={snap} />
+            <CachePanel snap={snap} />
+            <MemoryPanel snap={snap} />
+            <LatencyPanel snap={snap} />
+            <HistoryPanel snap={snap} />
+          </>
+        )}
+        {tab === 'evidence' && (
+          <>
+            <Section id="evidence" title="Evidence">
+              <EvidencePanel snap={snap} />
+            </Section>
+            <ChangesPanel snap={snap} />
+            {snapTerminal && <ReplayPanel snap={snap} />}
+            {snapTerminal && <ComparePanel snap={snap} />}
+          </>
+        )}
+        {tab === 'technical' && (
+          <>
+            <TracePanel />
+            <Section id="runtime" title="Runtime state">
+              <KV k="Status" v={String(snap.status)} />
+              <KV k="Internal" v={String(snap.internalStatus || snap.status)} />
+              <KV k="Run" v={snap.runId} />
+              <KV k="Sequence" v={String(snap.lastSeq)} />
+              <KV k="Updated" v={snap.updatedAt ? fmtTime(snap.updatedAt) : '—'} />
+              <KV k="Model" v={snap.activeModelId || '—'} />
+            </Section>
+          </>
+        )}
+      </div>
     </aside>
+  );
+}
+
+// ---------- 0. Runtime health ----------
+// One high-level status so the user never has to synthesize latency + cost +
+// provider + model + tools into a conclusion themselves.
+function healthOf(snap: RuntimeSnapshot): { label: string; pill: string; detail: string } {
+  const status = String(snap.status || '');
+  const spent = snap.cost?.spentUsd, budget = snap.cost?.budgetUsd;
+  const overBudget = typeof spent === 'number' && typeof budget === 'number' && budget > 0 && spent >= budget;
+  const nearBudget = typeof spent === 'number' && typeof budget === 'number' && budget > 0 && spent / budget >= 0.8;
+  const toolFailed = snap.tools.some(t => ['failed', 'timed_out', 'cancelled'].includes(String(t.lastStatus)));
+  if (status === 'failed') return { label: 'Needs attention', pill: 'err', detail: 'The run failed. Review the trace, then retry from the last checkpoint.' };
+  if (status === 'cancelled') return { label: 'Stopped', pill: 'neutral', detail: 'The run was cancelled. State is preserved.' };
+  if (status === 'completed') return { label: 'Completed', pill: 'ok', detail: 'The run finished. Outcome and cost are final.' };
+  if (overBudget) return { label: 'Blocked', pill: 'err', detail: 'Budget exhausted — the runtime stopped safely.' };
+  if (nearBudget) return { label: 'Attention needed', pill: 'warn', detail: 'Spend is near budget. The runtime is constraining work.' };
+  if (toolFailed) return { label: 'Attention needed', pill: 'warn', detail: 'A tool failed but the run continues. See Tools.' };
+  if (['running', 'planning', 'waiting'].includes(status)) {
+    const runningTool = snap.tools.find(t => t.lastStatus === 'running');
+    if (runningTool) return { label: 'Working', pill: 'info', detail: `Running tool ${runningTool.name}…` };
+    return { label: 'Working', pill: 'info', detail: 'The agent is executing.' };
+  }
+  return { label: 'Ready', pill: 'neutral', detail: 'Idle — describe a task to start.' };
+}
+
+function HealthPanel({ snap }: { snap: RuntimeSnapshot }) {
+  const h = healthOf(snap);
+  const lastTrace = snap.trace[snap.trace.length - 1];
+  return (
+    <Section id="health" title="Runtime health">
+      <div className={`health-hero health-${h.pill}`}>
+        <span className={`pill ${h.pill}`} role="status" aria-label={`Runtime health: ${h.label}`}>
+          {h.pill === 'ok' ? <IconCheck size={13} /> : h.pill === 'err' || h.pill === 'warn' ? <IconAlert size={13} /> : null}
+          {h.label}
+        </span>
+        <p className="health-detail">{h.detail}</p>
+        {lastTrace && (
+          <div className="health-step" title={`${lastTrace.type} · ${lastTrace.ts}`}>
+            <span className="eyebrow">Current step</span>
+            <span className="health-step-label">{lastTrace.label}</span>
+          </div>
+        )}
+      </div>
+    </Section>
   );
 }
 
@@ -74,23 +205,24 @@ function CurrentModel({ snap }: { snap: RuntimeSnapshot }) {
   const { state } = useRuntime();
   const model = state.server.models.find(m => m.id === snap.activeModelId);
   const util = snap.context.windowTokens ? snap.context.usedTokens / snap.context.windowTokens : null;
+  const terminal = ['completed', 'failed', 'cancelled'].includes(String(snap.status));
   if (!model && !snap.activeModelId) {
     return <Section id="model" title="Current model"><Empty what="Active model" hint="No model selected yet for this run." /></Section>;
   }
   return (
     <Section id="model" title="Current model" flashKey={snap.activeModelId || ''}>
       <div className="model-hero">
-        <div className="eyebrow">ACTIVE {snap.meta?.mode === 'live' ? `· LIVE ${snap.meta.provider || ''}` : '· DEMO'}</div>
+        <div className="eyebrow">{terminal ? 'FINAL' : 'ACTIVE'} {snap.meta?.mode === 'live' ? `· LIVE ${snap.meta.provider || ''}` : '· DEMO'}</div>
         <div className="name">
           <StatusDot status={model?.status || 'active'} />
           <span title={snap.activeModelId || ''}>{model?.name || snap.activeModelId}</span>
         </div>
-        <div className="prov">{model ? `${model.provider} · ${model.status}` : 'provider unknown'}</div>
+        <div className="prov">{model ? `${model.provider} · ${model.status}` : 'provider unknown'}{snap.meta?.preset ? ` · ${snap.meta.preset} preset` : ''}</div>
         <div className="grid">
           <div className="stat"><div className="l">Context</div><div className="n">{util === null ? '—' : `${fmtK(snap.context.usedTokens, 1)} / ${fmtK(snap.context.windowTokens, 0)}`}</div><div className="s">{util === null ? 'window unknown' : fmtPct(util, 1)}</div></div>
-          <div className="stat"><div className="l">Health</div><div className="n">{model ? fmtPct(model.reliability, 1) : '—'}</div><div className="s">{model?.status || 'unknown'}</div></div>
+          <div className="stat"><div className="l">Health</div><div className="n">{model && model.reliability !== null && model.reliability !== undefined ? fmtPct(model.reliability, 1) : '—'}</div><div className="s">{model?.status || 'unknown'}</div></div>
           <div className="stat"><div className="l">Latency</div><div className="n">{model ? fmtSec(model.avgLatencyMs) : fmtSec(snap.latency.modelMs)}</div><div className="s">avg model</div></div>
-          <div className="stat"><div className="l">Quality</div><div className="n">{model ? model.quality.toFixed(2) : '—'}</div><div className="s">registry score</div></div>
+          <div className="stat"><div className="l">Quality</div><div className="n">{model && model.quality !== null && model.quality !== undefined ? model.quality.toFixed(2) : '—'}</div><div className="s">{model && model.qualitySource === 'observed' ? 'observed' : model && model.qualitySource === 'demo' ? 'demo sample' : 'not measured'}</div></div>
         </div>
       </div>
     </Section>
@@ -122,7 +254,7 @@ function WhyModel({ snap }: { snap: RuntimeSnapshot }) {
           <div className="eyebrow">FACTORS</div>
           {d.factors.map(f => (
             <div key={f.key} className="factor">
-              <span className={`mk ${f.status}`}>{f.status === 'pass' ? '✓' : f.status === 'warn' ? '!' : '✕'}</span>
+              <span className={`mk ${f.status}`} aria-hidden="true">{f.status === 'pass' ? <IconCheck size={11} /> : f.status === 'warn' ? '!' : <IconX size={11} />}</span>
               <span>{f.label}{f.detail ? <span className="fd"> — {f.detail}</span> : null}</span>
             </div>
           ))}
@@ -132,12 +264,12 @@ function WhyModel({ snap }: { snap: RuntimeSnapshot }) {
         <>
           <div className="eyebrow">ALTERNATIVES</div>
           {alts.map(a => {
-            const saving = current ? current.costUsd - a.costUsd : 0;
+            const saving = current && current.costUsd !== null && a.costUsd !== null ? current.costUsd - a.costUsd : null;
             return (
               <div key={a.modelId} className="cand alt">
                 <div className="kv"><span className="k"><b style={{ color: 'var(--text)' }}>{nameOf(a.modelId)}</b></span><span className="v">score {a.score.toFixed(2)}</span></div>
                 <div className="kv"><span className="k">{usd(a.costUsd)} · {fmtSec(a.latencyMs)}</span>
-                  <span className="v">{saving > 0.0000005 ? `saves ${usd(saving)}` : saving < -0.0000005 ? `+${usd(-saving).slice(1)}` : ''}</span></div>
+                  <span className="v">{saving === null ? 'cost unknown' : saving > 0.0000005 ? `saves ${usd(saving)}` : saving < -0.0000005 ? `+${usd(-saving).slice(1)}` : ''}</span></div>
                 <div className="scorebar" role="img" aria-label={`${a.modelId} score ${a.score}`}><i style={{ width: `${Math.min(100, a.score * 100)}%` }} /></div>
               </div>
             );
@@ -186,7 +318,7 @@ function ModelSwitch({ snap }: { snap: RuntimeSnapshot }) {
       ) : (
         <div key={i} className="switch-banner" role="status">
           <b>MODEL SWITCH</b>
-          <div className="switch-flow"><span className="old">{shortModel(s.from)}</span><span className="arrow" aria-hidden="true">↓</span><span className="new">{shortModel(s.to)}</span></div>
+          <div className="switch-flow"><span className="old">{shortModel(s.from)}</span><span className="arrow" aria-hidden="true"><IconArrowDown size={14} /></span><span className="new">{shortModel(s.to)}</span></div>
           <KV k="Trigger" v={s.reason || '—'} />
           {s.cost !== undefined && <KV k="Switching cost" v={usd(s.cost)} />}
           <div className="meta">{fmtTime(s.ts)}</div>
@@ -238,6 +370,7 @@ function ContextPanel({ snap }: { snap: RuntimeSnapshot }) {
         <div key={it.id} className="ctx-item">
           <span className={`tag ${it.status}`}>{it.status}</span>{' '}<b>{it.title}</b>
           <div className="kv"><span className="k">{it.kind} · {it.source}</span><span className="v">{fmtK(it.tokens)} · rel {Number(it.relevance).toFixed(2)}</span></div>
+          <WhyContextItem item={it} />
         </div>
       ))}
       {snap.context.items.length > 6 && (
@@ -288,8 +421,8 @@ function CachePanel({ snap }: { snap: RuntimeSnapshot }) {
 function MemoryPanel({ snap }: { snap: RuntimeSnapshot }) {
   return (
     <Section id="memory" title="Memory" count={snap.memory.working.length + snap.memory.longterm.length}>
-      <MemoryList title="Working" items={snap.memory.working} emptyHint="No persistent working memories yet." />
-      <MemoryList title="Long-term" items={snap.memory.longterm} emptyHint="No persistent long-term memories yet." />
+      <MemoryList title="Working" items={snap.memory.working} emptyHint="No working memories for this run yet. Working memory is per-run and process-local." />
+      <MemoryList title="Long-term" items={snap.memory.longterm} emptyHint="No long-term memories yet. Long-term memory is process-local; learned model performance persists separately via intelligence." />
     </Section>
   );
 }
@@ -307,6 +440,7 @@ function MemoryList({ title, items, emptyHint }: { title: string; items: Runtime
             <b>{m.title}</b><span className="v">{m.status}</span>
           </button>
           <div className="kv"><span className="k">{m.source || 'unknown source'}</span><span className="v">rel {Number(m.importance).toFixed(2)}</span></div>
+          <WhyMemoryItem item={m} />
           {openId === m.id && (
             <div className="memdetail">
               {displaySnippet(m.snippet) || 'No summary available.'}
@@ -338,7 +472,7 @@ function ToolsPanel({ snap }: { snap: RuntimeSnapshot }) {
       <div className="tool-group"><div className="eyebrow">AVAILABLE ({snap.tools.length})</div>
         {snap.tools.slice(0, 8).map(t => (
           <div key={t.name} className="toolrow">
-            <StatusDot status={t.status === 'enabled' ? (t.lastStatus === 'failed' ? 'failed' : 'idle') : 'down'} />
+            <StatusDot status={t.status === 'enabled' ? (['failed', 'timed_out', 'cancelled'].includes(String(t.lastStatus)) ? 'failed' : 'idle') : 'down'} />
             <span className="tname" title={t.description || t.name}>{t.name}</span>
             {t.status !== 'enabled' && <span className="pill err sm">BLOCKED</span>}
             <span className="v">×{t.calls} · {fmtSec(t.avgLatencyMs)} · {fmtPct(t.successRate, 0)}</span>
@@ -349,7 +483,7 @@ function ToolsPanel({ snap }: { snap: RuntimeSnapshot }) {
         <div className="tool-group"><div className="eyebrow">RECENT</div>
           {recent.map(t => (
             <div key={t.name} className="kv">
-              <span className="k"><StatusDot status={t.lastStatus === 'failed' ? 'failed' : 'success'} />{t.name}</span>
+              <span className="k"><StatusDot status={['failed', 'timed_out', 'cancelled'].includes(String(t.lastStatus)) ? 'failed' : 'success'} />{t.name}</span>
               <span className="v">{t.lastStatus} · {fmtSec(t.avgLatencyMs)}</span>
             </div>
           ))}
@@ -599,3 +733,216 @@ export function SvgLine({ values, height = 44, format, threshold, label }: { val
 }
 
 
+
+// ---------- Adaptive focus ----------
+// One contextual highlight chosen by current state — never a static stack of
+// equally-weighted cards. Priority: budget block > context pressure >
+// active tool > routing decision > latest runtime change > current step.
+function FocusCard({ snap }: { snap: RuntimeSnapshot }) {
+  const { state } = useRuntime();
+  const spent = snap.cost?.spentUsd;
+  const budget = snap.cost?.budgetUsd;
+  const overBudget = typeof spent === 'number' && typeof budget === 'number' && budget > 0 && spent >= budget;
+  const nearBudget = typeof spent === 'number' && typeof budget === 'number' && budget > 0 && spent / budget >= 0.8;
+  const util = snap.context.windowTokens ? snap.context.usedTokens / snap.context.windowTokens : null;
+  const contextHot = util !== null && util >= 0.8;
+  const runningTool = snap.tools.find((t) => t.lastStatus === 'running');
+  const decision = snap.routing.decision;
+  const lastChange = snap.changes[snap.changes.length - 1];
+  const lastTrace = snap.trace[snap.trace.length - 1];
+
+  let title = 'Current step';
+  let body: React.ReactNode = lastTrace ? lastTrace.label : 'Waiting for the run to start.';
+  let meta: string | null = lastTrace ? `${fmtTime(lastTrace.ts)} · ${lastTrace.type}` : null;
+
+  if (overBudget || nearBudget) {
+    title = overBudget ? 'Budget exhausted' : 'Budget warning';
+    body = `${usd(spent)} of ${usd(budget)} used${overBudget ? ' — the runtime stopped safely.' : ' — the runtime is constraining work.'}`;
+    meta = 'See Cost for the breakdown';
+  } else if (contextHot && util !== null) {
+    title = 'Context pressure';
+    body = `${fmtK(snap.context.usedTokens, 1)} / ${fmtK(snap.context.windowTokens, 0)} (${fmtPct(util, 0)}) — optimization triggers automatically.`;
+    meta = 'See Context for composition';
+  } else if (runningTool) {
+    title = `Tool running: ${runningTool.name}`;
+    body = runningTool.description || 'Executing tool…';
+    meta = `×${runningTool.calls} calls · ${fmtSec(runningTool.avgLatencyMs)} avg`;
+  } else if (decision) {
+    const nameOf = (id: string) => state.server.models.find((m) => m.id === id)?.name || id;
+    const current = snap.routing.currentId || snap.activeModelId || '';
+    title = 'Latest routing decision';
+    body = decision.decision;
+    meta = `${nameOf(current)} · ${relTime(decision.timestamp)}`;
+  } else if (lastChange && /switch|compress|invalidat|exceed|warning/i.test(lastChange.label)) {
+    title = 'Latest runtime change';
+    body = lastChange.label;
+    meta = relTime(lastChange.ts);
+  }
+
+  return (
+    <Section id="focus" title="Now">
+      <div className="focus-card" role="status" aria-label={`Current focus: ${title}`}>
+        <div className="eyebrow">{title}</div>
+        <div>{body}</div>
+        {meta && <div className="meta">{meta}</div>}
+      </div>
+    </Section>
+  );
+}
+
+// ---------- Run outcome (terminal runs first) ----------
+// Concise, real numbers only: duration, cost, tools, switches + the runtime
+// optimizations that actually happened. Empty categories render nothing.
+function RunOutcomePanel({ snap }: { snap: RuntimeSnapshot }) {
+  const { state } = useRuntime();
+  const run = state.server.runs.find((r) => r.id === snap.runId);
+  const status = String(snap.status);
+  const toolCalls = snap.tools.reduce((a, t) => a + (t.calls || 0), 0);
+  const switches = snap.decisions.filter((d) => d.kind === 'model_switch').length;
+  const failedTools = snap.trace.filter((t) => t.type === 'tool.failed').length;
+  const compressions = snap.changes.filter((c) => /compress/i.test(c.label));
+  const cacheSaved = snap.cache.savedUsd > 0 ? snap.cache.savedUsd : null;
+
+  const stats: { l: string; n: string }[] = [];
+  if (run?.createdAt && snap.updatedAt && elapsed(run.createdAt, snap.updatedAt) !== '—') {
+    stats.push({ l: 'Duration', n: elapsed(run.createdAt, snap.updatedAt) });
+  }
+  stats.push({ l: 'Cost', n: usd(snap.cost.spentUsd) });
+  if (toolCalls > 0) stats.push({ l: 'Tool calls', n: String(toolCalls) });
+  if (switches > 0) stats.push({ l: 'Switches', n: String(switches) });
+  stats.push({ l: 'Status', n: status.toUpperCase() });
+
+  const optims: string[] = [];
+  for (const c of compressions.slice(-2)) optims.push(`Context optimized — ${c.label}`);
+  if (cacheSaved !== null) optims.push(`Cache reuse saved ${usd(cacheSaved)}`);
+  if (switches > 0) {
+    const last = snap.decisions.filter((d) => d.kind === 'model_switch').slice(-1)[0];
+    if (last) optims.push(`Model switch — ${last.decision.slice(0, 100)}`);
+  }
+  if (failedTools > 0 && status === 'completed') {
+    optims.push(`Recovered from ${failedTools} tool failure${failedTools === 1 ? '' : 's'} — run still completed`);
+  }
+
+  return (
+    <Section id="outcome" title="Outcome">
+      <div className="outcome-grid">
+        {stats.map((s) => (
+          <div key={s.l} className="outcome-stat">
+            <div className="l">{s.l}</div>
+            <div className="n">{s.n}</div>
+          </div>
+        ))}
+      </div>
+      {optims.length > 0 && (
+        <>
+          <div className="eyebrow">RUNTIME OPTIMIZATION</div>
+          {optims.map((o, i) => (
+            <div key={i} className="optim-row"><IconCheck size={13} /><span>{o}</span></div>
+          ))}
+        </>
+      )}
+      <KV k="Cost basis" v={snap.cost.source || 'unknown'} />
+    </Section>
+  );
+}
+
+// ---------- Run replay (read-only timeline scrub) ----------
+function ReplayPanel({ snap }: { snap: RuntimeSnapshot }) {
+  const trace = snap.trace;
+  const [pos, setPos] = useState(trace.length);
+  React.useEffect(() => { setPos(trace.length); }, [snap.runId, trace.length]);
+  if (!trace.length) {
+    return <Section id="replay" title="Replay"><Empty what="Replay" hint="No execution steps were recorded for this run." /></Section>;
+  }
+  const idx = Math.max(1, Math.min(trace.length, pos));
+  const ev = trace[idx - 1];
+  return (
+    <Section id="replay" title="Replay" count={trace.length}>
+      <div className="replay-controls">
+        <button className="icon-btn sm" disabled={idx <= 1} onClick={() => setPos(idx - 1)} aria-label="Previous step">‹</button>
+        <input type="range" min={1} max={trace.length} value={idx} aria-label={`Replay step ${idx} of ${trace.length}`}
+          onChange={(e) => setPos(Number(e.target.value))} />
+        <button className="icon-btn sm" disabled={idx >= trace.length} onClick={() => setPos(idx + 1)} aria-label="Next step">›</button>
+        <span className="mono" aria-live="polite">{idx}/{trace.length}</span>
+      </div>
+      <div className="replay-event" role="status" aria-label={`Step ${idx}: ${ev.label}`}>
+        <b>{ev.label}</b>
+        <div className="mono">{fmtTime(ev.ts)} · {ev.type} · {ev.status}{ev.durationMs ? ` · ${fmtSec(ev.durationMs)}` : ''}{ev.costUsd ? ` · ${usd(ev.costUsd)}` : ''}</div>
+      </div>
+      <div className="nr-hint">Read-only — replay inspects history, it never re-executes tools or models.</div>
+    </Section>
+  );
+}
+
+// ---------- Run comparison ----------
+function ComparePanel({ snap }: { snap: RuntimeSnapshot }) {
+  const { state } = useRuntime();
+  const candidates = state.server.runs.filter((r) => r.id !== snap.runId).slice(0, 50);
+  const [otherId, setOtherId] = useState('');
+  const [result, setResult] = useState<CompareResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const compare = async (id: string) => {
+    if (!id) { setResult(null); return; }
+    setLoading(true);
+    setError(null);
+    try {
+      setResult(await api.compareRuns(snap.runId, id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Comparison failed');
+      setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!candidates.length) {
+    return <Section id="compare" title="Compare"><Empty what="Comparison" hint="Run another task first — comparison needs two runs." /></Section>;
+  }
+  const fmtDur = (ms: number | null) => (ms === null || ms === undefined ? '—' : fmtSec(ms));
+  const row = (label: string, a: string, b: string, better?: 'a' | 'b' | null) => (
+    <tr key={label}>
+      <th scope="row">{label}</th>
+      <td className={`mono${better === 'a' ? ' win' : ''}`}>{a}</td>
+      <td className={`mono${better === 'b' ? ' win' : ''}`}>{b}</td>
+    </tr>
+  );
+  const num = (v: number | null | undefined) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return (
+    <Section id="compare" title="Compare">
+      <label className="nr-field" style={{ marginTop: 0 }}>
+        <span>Compare this run with</span>
+        <select value={otherId} aria-label="Other run to compare"
+          onChange={(e) => { setOtherId(e.target.value); void compare(e.target.value); }}>
+          <option value="">Select a run…</option>
+          {candidates.map((r) => (
+            <option key={r.id} value={r.id}>{r.title} · {r.status}</option>
+          ))}
+        </select>
+      </label>
+      {loading && <div className="settings-row"><span className="settings-row-desc">Comparing…</span></div>}
+      {error && <div className="banner err" role="alert"><span>{error}</span></div>}
+      {result && (
+        <div className="compare-table-wrap">
+          <table className="compare-table">
+            <thead><tr><th scope="col">Metric</th><th scope="col">This run</th><th scope="col">Other run</th></tr></thead>
+            <tbody>
+              {row('Status', String(result.a.status), String(result.b.status))}
+              {row('Duration', fmtDur(result.a.durationMs), fmtDur(result.b.durationMs),
+                num(result.a.durationMs) !== null && num(result.b.durationMs) !== null
+                  ? (result.a.durationMs! <= result.b.durationMs! ? 'a' : 'b') : null)}
+              {row('Cost', usd(result.a.costUsd), usd(result.b.costUsd),
+                num(result.a.costUsd) !== null && num(result.b.costUsd) !== null
+                  ? (result.a.costUsd! <= result.b.costUsd! ? 'a' : 'b') : null)}
+              {row('Tool calls', String(result.a.toolCalls ?? '—'), String(result.b.toolCalls ?? '—'))}
+              {row('Model switches', String(result.a.switches ?? '—'), String(result.b.switches ?? '—'))}
+              {row('Model path', (result.a.modelPath || []).join(' → ') || '—', (result.b.modelPath || []).join(' → ') || '—')}
+              {row('Cost basis', String(result.a.costSource || '—'), String(result.b.costSource || '—'))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Section>
+  );
+}

@@ -32,16 +32,28 @@ function Seed({ children }: { children: React.ReactNode }) {
 }
 
 describe('inspector + layout', () => {
-  it('renders three-panel inspector sections with live backend data', async () => {
+  it('renders tabbed inspector with live backend data', async () => {
+    const { fireEvent: fire } = await import('@testing-library/react');
     render(<RuntimeProvider><Seed><RuntimeInspector /></Seed></RuntimeProvider>);
     expect(await screen.findByLabelText('Runtime inspector')).toBeInTheDocument();
+    expect(screen.getByRole('tablist', { name: 'Inspector views' })).toBeInTheDocument();
+    // Overview: outcome story first.
     expect(screen.getByLabelText('Current model')).toBeInTheDocument();
-    expect(screen.getByLabelText('Why this model?')).toBeInTheDocument();
-    expect(screen.getByLabelText('Context')).toBeInTheDocument();
+    expect(screen.getByLabelText('Approvals')).toBeInTheDocument();
+    expect((await screen.findAllByText(/Nemotron X/)).length).toBeGreaterThan(0);
+    // Decisions tab.
+    fire.click(screen.getByRole('tab', { name: 'Decisions' }));
+    expect(await screen.findByLabelText('Why this model?')).toBeInTheDocument();
     expect(screen.getByLabelText('Model routing')).toBeInTheDocument();
     expect(screen.getByLabelText('Model switches')).toBeInTheDocument();
-    expect(screen.getByLabelText('What changed?')).toBeInTheDocument();
-    expect((await screen.findAllByText(/Nemotron X/)).length).toBeGreaterThan(0);
+    // Evidence tab.
+    fire.click(screen.getByRole('tab', { name: 'Evidence' }));
+    expect(await screen.findByRole('tabpanel')).toBeInTheDocument();
+    expect(document.getElementById('sec-evidence')).not.toBeNull();
+    expect(document.getElementById('sec-changes')).not.toBeNull();
+    // Technical tab.
+    fire.click(screen.getByRole('tab', { name: 'Technical' }));
+    expect(await screen.findByLabelText('Execution trace')).toBeInTheDocument();
   });
   it('api client exposes typed surface (no scattered fetch)', () => {
     for (const k of ['getRuns', 'getRun', 'getModels', 'getTools', 'getMemory', 'getState', 'sendMessage', 'cancelRun', 'retryRun']) {
@@ -69,7 +81,7 @@ describe('inspector + layout', () => {
     expect(container.querySelector('table')).not.toBeNull();
   });
   it('model switch banner renders from switch decisions', async () => {
-    const { render: r, screen: scr } = await import('@testing-library/react');
+    const { render: r, screen: scr, fireEvent } = await import('@testing-library/react');
     const { RuntimeProvider: P, useRuntime: useR } = await import('../state/store');
     const { useEffect: ue } = await import('react');
     const { RuntimeInspector: RI } = await import('../components/Inspector');
@@ -81,6 +93,11 @@ describe('inspector + layout', () => {
       return <>{children}</>;
     }
     r(React.createElement(P, null, React.createElement(Seed2, null, React.createElement(RI, null))));
+    // Switches live under the Decisions tab — select it, then expand.
+    const tab = await scr.findByRole('tab', { name: 'Decisions' });
+    fireEvent.click(tab);
+    const toggle = await scr.findByRole('button', { name: /expand model switches/i });
+    fireEvent.click(toggle);
     expect(await scr.findByText('MODEL SWITCH')).toBeInTheDocument();
   });
 });

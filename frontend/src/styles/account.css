@@ -1,0 +1,18 @@
+.account-page { max-width: 1120px; margin: 0 auto; }
+.account-note { margin: 0 0 18px; padding: 14px 16px; border: 1px solid var(--accent-dim); border-radius: 14px; background: var(--accent-soft); color: var(--muted); }
+.account-note b { color: var(--text); }
+.billing-list, .project-list { display: grid; gap: 8px; }
+.billing-row, .project-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-soft); color: var(--muted); }
+.billing-row:last-child, .project-row:last-child { border-bottom: 0; }
+.billing-row b, .project-row b { color: var(--text); }
+.project-row { grid-template-columns: 1fr auto; }
+.project-row div { display: grid; gap: 4px; }
+.project-row small, .billing-row small { color: var(--faint); }
+.inline-form { display: flex; gap: 10px; margin-top: 18px; }
+.inline-form input { min-width: 0; flex: 1; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; color: var(--text); background: var(--panel2); }
+.operations-card h3 { max-width: 720px; line-height: 1.5; font-size: 16px; font-weight: 550; }
+.cache-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 24px; }
+.cache-tiles div { padding: 16px; border-radius: 12px; background: var(--panel2); border: 1px solid var(--border-soft); display: grid; gap: 8px; }
+.cache-tiles span { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.cache-tiles b { font-size: 20px; color: var(--text); }
+@media (max-width: 680px) { .billing-row { grid-template-columns: 1fr auto; } .billing-row small { grid-column: 2; } .cache-tiles { grid-template-columns: 1fr; } .inline-form { align-items: stretch; flex-direction: column; } }

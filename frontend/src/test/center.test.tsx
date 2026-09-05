@@ -190,11 +190,15 @@ describe('Center: run header + states', () => {
     const pill = screen.getByRole('status', { name: `Run status ${label}` });
     expect(pill).toHaveTextContent(label);
   });
-  it('shows run title, model, budget, elapsed without hardcoding', () => {
+  it('shows run title + status + journey with a secondary resource line (detail stays in inspector)', () => {
     renderWith(baseSnap(), <RunHeader />);
     expect(screen.getByTitle('Fix authentication issue')).toHaveTextContent('Fix authentication issue');
-    expect(screen.getByLabelText(/Active model/)).toHaveTextContent('Nemotron X');
-    expect(screen.getByText('$0.034 / $0.500')).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: 'Run status RUNNING' })).toBeInTheDocument();
+    expect(screen.getByRole('list', { name: 'Runtime progress' })).toBeInTheDocument();
+    // Hierarchy: a subtle secondary resource summary is allowed in the
+    // header; full model/budget/token/latency detail lives in the inspector.
+    expect(screen.getByRole('status', { name: 'Run resources' })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Active model/)).toBeNull();
   });
   it('exposes Stop only while running and disables duplicate stops', async () => {
     const spy = vi.spyOn(api, 'cancelRun').mockResolvedValue({ run: {} } as any);
@@ -213,22 +217,30 @@ describe('Center: run header + states', () => {
     expect(screen.queryByRole('button', { name: 'Retry run' })).toBeNull();
     expect(spy).not.toHaveBeenCalled();
   });
-  it('warns near budget and flags exhausted, omits nothing invented when missing', () => {
+  it('keeps the header focused: no budget bars or model pills in the center', () => {
     const { unmount } = renderWith(baseSnap({ cost: { spentUsd: 0.45, budgetUsd: 0.5, projectedUsd: 0.5, breakdown: [] } }), <RunHeader />);
-    expect(screen.getByText('90% USED')).toBeInTheDocument();
+    // Budget urgency belongs to the inspector cost panel — the header shows
+    // status + progress only.
+    expect(screen.queryByText('90% USED')).toBeNull();
     unmount();
     const r2 = renderWith(baseSnap({ cost: { spentUsd: 0.6, budgetUsd: 0.5, projectedUsd: 0.6, breakdown: [] } }), <RunHeader />);
-    expect(r2.getByText('EXHAUSTED')).toBeInTheDocument();
+    expect(r2.queryByText('EXHAUSTED')).toBeNull();
     r2.unmount();
   });
-  it('truncates very long model names but keeps full value in tooltip', () => {
-    const longName = 'extremely-long-organization-prefix-nemotron-super-reasoning-128k-instruct-v99-extended-context-turbo-2026-09-03';
-    renderWith(baseSnap({ activeModelId: 'long-1' }), <RunHeader />, {
-      models: [{ ...modelList[0], id: 'long-1', name: longName, provider: 'very-long-provider-name' }],
+  it('shows a concise outcome summary on completion with real numbers only', async () => {
+    const { RunOutcome } = await import('../components/Center');
+    const snap = baseSnap({
+      status: 'completed',
+      cost: { spentUsd: 0.014, budgetUsd: 0.05, projectedUsd: 0.014, breakdown: [] },
+      tools: [{ name: 'search', description: 't', status: 'enabled', calls: 2, avgLatencyMs: 100, successRate: 1 }],
+      decisions: [{ kind: 'model_switch', decision: 'SWITCH a → b', timestamp: new Date().toISOString(), factors: [] }],
     });
-    const badge = screen.getByLabelText(/Active model/);
-    expect(badge).toHaveAttribute('title', expect.stringContaining(longName));
-    expect(badge.querySelector('.oa-truncate')).not.toBeNull();
+    const run = { createdAt: new Date(Date.now() - 18400).toISOString() } as any;
+    const { container } = render(<RuntimeProvider><RunOutcome snap={snap} run={run} /></RuntimeProvider>);
+    expect(container.textContent).toMatch(/Completed/);
+    expect(container.textContent).toMatch(/\$0\.014/);
+    expect(container.textContent).toMatch(/2 tools/);
+    expect(container.textContent).toMatch(/1 model switch/);
   });
   it('renders UNKNOWN quietly when snapshot is missing', () => {
     render(<RuntimeProvider><RunHeader /></RuntimeProvider>);
@@ -258,12 +270,14 @@ describe('Center: error / cancel behavior', () => {
 });
 
 describe('Center: composer', () => {
-  it('uses the OrchestraAI placeholder and exposes task mode + model + budget compactly', () => {
+  it('stays simple: task input + task mode + primary action only', () => {
     renderWith(baseSnap({ status: 'idle' }), <Composer />);
-    expect(screen.getByPlaceholderText('Ask OrchestraAI to plan, investigate, execute, or analyze...')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('What do you want OrchestraAI to do?')).toBeInTheDocument();
     expect(screen.getByLabelText('Task mode')).toBeInTheDocument();
     expect(screen.getByLabelText('Message the agent')).toBeInTheDocument();
-    expect(screen.getByRole('status', { name: 'Composer READY' })).toBeInTheDocument();
+    // Model, cost and status readouts belong to the inspector — not the composer.
+    expect(screen.queryByLabelText(/Active model/)).toBeNull();
+    expect(screen.queryByRole('status', { name: /Composer/ })).toBeNull();
   });
   it('Enter sends, Shift+Enter creates newline', async () => {
     const spy = vi.spyOn(api, 'sendMessage').mockResolvedValue({ accepted: true } as any);
@@ -277,15 +291,15 @@ describe('Center: composer', () => {
     expect(spy).toHaveBeenCalledTimes(1);
     expect(ta.value).toContain('line one');
   });
-  it('shows RUNNING with Stop, STOPPING disabled, ERROR with retry affordance', () => {
+  it('shows Stop while running, Retry when failed — contextual actions only', () => {
     vi.spyOn(api, 'cancelRun').mockResolvedValue({ run: {} } as any);
     const { unmount } = renderWith(baseSnap({ status: 'running' }), <Composer />);
-    expect(screen.getByRole('status', { name: 'Composer RUNNING' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Stop run' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry run' })).toBeNull();
     unmount();
     renderWith(baseSnap({ status: 'failed' }), <Composer />);
-    expect(screen.getByRole('status', { name: 'Composer ERROR' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Retry run' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Stop run' })).toBeNull();
   });
   it('disables input while running and surfaces send errors with retry', async () => {
     vi.spyOn(api, 'sendMessage').mockRejectedValueOnce(new Error('backend unavailable'));

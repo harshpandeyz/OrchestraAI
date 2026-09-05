@@ -52,22 +52,41 @@ export function CommandPalette() {
     const ql = q.toLowerCase();
     const match = (s: string) => !ql || s.toLowerCase().includes(ql);
     const out: Entry[] = [];
+    const mac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+    const modN = mac ? '⌘N' : 'Ctrl+N';
 
+    // Navigation: no invented shortcuts. Only genuinely useful shortcuts
+    // (New Run, Focus composer, palette) carry a hint.
     out.push(
-      { group: 'Navigation', label: 'Runs', sub: 'conversation history', shortcut: '1', run: () => dispatch({ type: 'ui/set', patch: { view: 'run' } }) },
-      { group: 'Navigation', label: 'Models', sub: 'model intelligence', shortcut: '2', run: () => dispatch({ type: 'ui/set', patch: { view: 'models' } }) },
-      { group: 'Navigation', label: 'Tools', sub: 'execution capabilities', shortcut: '3', run: () => dispatch({ type: 'ui/set', patch: { view: 'tools' } }) },
-      { group: 'Navigation', label: 'Memory', sub: 'agent knowledge', shortcut: '4', run: () => dispatch({ type: 'ui/set', patch: { view: 'memory' } }) },
-      { group: 'Navigation', label: 'Evaluations', sub: 'runtime quality', shortcut: '5', run: () => dispatch({ type: 'ui/set', patch: { view: 'evals' } }) },
-      { group: 'Navigation', label: 'Settings', sub: 'system control', shortcut: '6', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: null } }) },
+      { group: 'Navigation', label: 'Runs', sub: 'conversation history', run: () => dispatch({ type: 'ui/set', patch: { view: 'run' } }) },
+      { group: 'Navigation', label: 'Models', sub: 'model intelligence', run: () => dispatch({ type: 'ui/set', patch: { view: 'models' } }) },
+      { group: 'Navigation', label: 'Tools', sub: 'execution capabilities', run: () => dispatch({ type: 'ui/set', patch: { view: 'tools' } }) },
+      { group: 'Navigation', label: 'Memory', sub: 'agent knowledge', run: () => dispatch({ type: 'ui/set', patch: { view: 'memory' } }) },
+      { group: 'Navigation', label: 'Evaluations', sub: 'runtime quality', run: () => dispatch({ type: 'ui/set', patch: { view: 'evals' } }) },
+      { group: 'Navigation', label: 'Settings', sub: 'preferences + providers', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: null } }) },
     );
 
     out.push(
-      { group: 'Actions', label: 'New Run', sub: 'create conversation', run: async () => { try { const { run } = await api.createRun('New agent run', state.ui.taskMode); const { runs } = await api.getRuns(); dispatch({ type: 'runs/set', runs }); dispatch({ type: 'runs/active', id: run.id }); dispatch({ type: 'ui/set', patch: { view: 'run' } }); } catch { /* banner */ } } },
+      { group: 'Actions', label: 'New Run', sub: 'start a task', shortcut: modN, run: () => dispatch({ type: 'ui/set', patch: { newRunOpen: true, view: 'run' } }) },
       { group: 'Actions', label: 'Focus Composer', sub: 'type a message', shortcut: '/', run: () => { dispatch({ type: 'ui/set', patch: { view: 'run' } }); setTimeout(() => (document.getElementById('prompt') as HTMLTextAreaElement | null)?.focus(), 50); } },
       { group: 'Actions', label: state.ui.rightOpen ? 'Hide Inspector' : 'Show Inspector', sub: 'toggle panel', run: () => dispatch({ type: 'ui/set', patch: { rightOpen: !state.ui.rightOpen } }) },
-      { group: 'Actions', label: `Switch to ${state.ui.theme === 'dark' ? 'Light' : 'Dark'} Theme`, sub: 'appearance', shortcut: 'T', run: () => dispatch({ type: 'ui/set', patch: { theme: state.ui.theme === 'dark' ? 'light' : 'dark' } }) },
+      { group: 'Actions', label: 'Connect Provider', sub: 'keys, verification, health', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: 'providers' } }) },
+      { group: 'Actions', label: 'Runtime Settings', sub: 'presets and defaults', run: () => dispatch({ type: 'ui/set', patch: { view: 'settings', settingsAnchor: 'runtime' } }) },
+      { group: 'Actions', label: 'Refresh Model Catalog', sub: 'discover new models', run: () => { dispatch({ type: 'ui/set', patch: { view: 'models' } }); void api.refreshModels().then(() => api.getModels().then(({ models }) => dispatch({ type: 'models/set', models }))).catch(() => {}); } },
+      { group: 'Actions', label: `Switch to ${state.ui.theme === 'dark' ? 'Light' : 'Dark'} Theme`, sub: 'appearance', run: () => dispatch({ type: 'ui/set', patch: { theme: state.ui.theme === 'dark' ? 'light' : 'dark' } }) },
     );
+
+    // Contextual actions appear only when relevant — never a dead button.
+    const snapStatus = String(state.server.snapshot?.status || '');
+    const busy = ['running', 'planning', 'waiting'].includes(snapStatus);
+    if (busy && state.server.activeRunId) {
+      const id = state.server.activeRunId;
+      out.push({ group: 'Actions', label: 'Stop Run', sub: 'interrupt execution', shortcut: 'Esc', run: () => { void api.cancelRun(id).catch(() => {}); } });
+    }
+    if (snapStatus === 'failed' && state.server.activeRunId) {
+      const id = state.server.activeRunId;
+      out.push({ group: 'Actions', label: 'Retry Run', sub: 'resume from checkpoint', run: () => { void api.retryRun(id).catch(() => {}); } });
+    }
 
     state.server.runs.filter(r => match(r.title + ' ' + r.id + ' ' + r.status)).slice(0, 6).forEach(r =>
       out.push({ group: 'Runs', label: r.title, sub: `run \u00b7 ${r.status}`, run: () => { dispatch({ type: 'runs/active', id: r.id }); dispatch({ type: 'ui/set', patch: { view: 'run' } }); } }));
@@ -83,7 +102,7 @@ export function CommandPalette() {
 
     if (ql) return out.filter(e => match(e.label + ' ' + e.sub + ' ' + e.group));
     return out;
-  }, [q, state.server.runs, state.server.models, state.server.tools, state.server.memItems, state.ui.rightOpen, state.ui.theme, state.ui.taskMode, dispatch]);
+  }, [q, state.server.runs, state.server.models, state.server.tools, state.server.memItems, state.server.snapshot, state.server.activeRunId, state.ui.rightOpen, state.ui.theme, state.ui.taskMode, dispatch]);
 
   useEffect(() => setSel(0), [q]);
 
@@ -106,7 +125,6 @@ export function CommandPalette() {
   }, [entries, sel, close]);
 
   if (!open) return null;
-
   const groups: { name: string; items: { e: Entry; idx: number }[] }[] = [];
   entries.slice(0, 40).forEach((e, idx) => {
     let g = groups.find(g => g.name === e.group);
@@ -120,9 +138,6 @@ export function CommandPalette() {
     return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
   });
 
-  const os = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-  const modKey = os ? '\u2318' : 'Ctrl+';
-
   return (
     <div className="palette-overlay" onClick={close} role="presentation">
       <div
@@ -133,7 +148,6 @@ export function CommandPalette() {
         onClick={e => e.stopPropagation()}
       >
         <div className="palette-input-wrap">
-          <span className="palette-search-icon" aria-hidden="true">&#x1F50D;</span>
           <input
             ref={inputRef}
             placeholder="Search runs, models, tools, memories…"
@@ -165,7 +179,7 @@ export function CommandPalette() {
                 >
                   <span className="palette-item-label">{e.label}</span>
                   <span className="palette-item-sub">{e.sub}</span>
-                  {e.shortcut && <kbd className="palette-item-shortcut">{modKey}{e.shortcut}</kbd>}
+                  {e.shortcut && <kbd className="palette-item-shortcut">{e.shortcut}</kbd>}
                 </button>
               ))}
             </div>

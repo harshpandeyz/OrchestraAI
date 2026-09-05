@@ -91,4 +91,38 @@ describe('streaming events', () => {
     s = applyEventToSnapshot(s, env(5, 'run.cancelled', {}));
     expect(s.status).toBe('cancelled');
   });
+  it('unknown future events are traced, never crash, and still advance the cursor', () => {
+    let s = snap();
+    s = applyEventToSnapshot(s, env(4, 'future.event', { anything: [1, 2, { deep: true }] }));
+    expect(s.lastSeq).toBe(4);
+    expect(s.trace.length).toBeGreaterThan(0);
+    expect(s.trace[s.trace.length - 1].type).toBe('future.event');
+  });
+  it('snapshot replacement resyncs state and cursor after a gap', () => {
+    const s0 = { ...initial, server: { ...initial.server, snapshot: snap(), conn: { status: 'connected' as const, lastSeq: 3, lastUpdate: new Date().toISOString() } } };
+    const fresh = { ...snap(), lastSeq: 40, status: 'running' as const, context: { ...snap().context, usedTokens: 9000 } };
+    const s1 = reducer(s0, { type: 'snap/set', snap: fresh });
+    expect(s1.server.snapshot!.lastSeq).toBe(40);
+    expect(s1.server.conn.lastSeq).toBe(40);
+    expect(s1.server.snapshot!.context.usedTokens).toBe(9000);
+  });
+  it('events for other runs and stale seqs are ignored', () => {
+    const s0 = { ...initial, server: { ...initial.server, snapshot: snap(), conn: { status: 'connected' as const, lastSeq: 10, lastUpdate: new Date().toISOString() } } };
+    const foreign = reducer(s0, { type: 'event/apply', env: { ...env(11, 'task.updated', {}), runId: 'run-2' } });
+    expect(foreign).toBe(s0);
+    const stale = reducer(s0, { type: 'event/apply', env: env(9, 'task.updated', {}) });
+    expect(stale).toBe(s0);
+    // A newer seq after a gap is still applied (server sends gap + resync separately).
+    const jumped = reducer(s0, { type: 'event/apply', env: env(25, 'task.updated', { userText: 'hi' }) });
+    expect(jumped.server.conn.lastSeq).toBe(25);
+  });
+  it('recovery lifecycle events render actionable trace entries', () => {
+    let s = snap();
+    s = applyEventToSnapshot(s, env(4, 'execution.recovery_started', {}));
+    s = applyEventToSnapshot(s, env(5, 'execution.recovered', { action: 'resume', cursor: 2 }));
+    s = applyEventToSnapshot(s, env(6, 'execution.recovery_blocked', { reason: 'unknown side effects' }));
+    expect(s.trace.length).toBe(3);
+    expect(s.trace[2].status).toBe('error');
+    expect(s.changes.length).toBe(1);
+  });
 });
