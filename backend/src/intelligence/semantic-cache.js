@@ -40,11 +40,15 @@ class SemanticCacheIndex {
       modelId: entry.modelId || null,
       tools: Array.isArray(entry.tools) ? entry.tools.slice(0, 20) : [],
       result: entry.result !== undefined ? entry.result : null,
-      createdAt: entry.createdAt || new Date().toISOString(),
+      createdAt: entry.createdAt || entry.cachedAt || new Date().toISOString(),
       workspaceRev: entry.workspaceRev || null,
       tenantId: entry.tenantId || null,
       projectId: entry.projectId || null,
       runId: entry.runId || null,
+      // Reuse-gate provenance (additive; absent on legacy entries):
+      pureAnswer: entry.pureAnswer === true,
+      compatibleModels: Array.isArray(entry.compatibleModels) ? entry.compatibleModels.slice(0, 20) : null,
+      maxAgeMs: Number.isFinite(Number(entry.maxAgeMs)) && Number(entry.maxAgeMs) > 0 ? Number(entry.maxAgeMs) : null,
     };
     this.entries.push(e);
     if (this.entries.length > this.max) this.entries.splice(0, this.entries.length - this.max);
@@ -73,14 +77,15 @@ class SemanticCacheIndex {
       return { hit: false, reason: `similarity ${similarity} < threshold ${this.similarityThreshold}`, similarity };
     }
     const ageMs = nowMs - (Date.parse(best.createdAt) || nowMs);
-    if (ageMs > this.maxAgeMs) {
-      return { hit: false, reason: `stale (age ${Math.round(ageMs / 60000)}m > max ${Math.round(this.maxAgeMs / 60000)}m)`, similarity, freshness: 0 };
+    const entryMaxAge = Number.isFinite(Number(best.maxAgeMs)) && Number(best.maxAgeMs) > 0 ? Number(best.maxAgeMs) : this.maxAgeMs;
+    if (ageMs > entryMaxAge) {
+      return { hit: false, reason: `stale (age ${Math.round(ageMs / 60000)}m > max ${Math.round(entryMaxAge / 60000)}m)`, similarity, freshness: 0 };
     }
     // Context drift: same words but different selected context -> risky reuse.
     if (query.fingerprint && best.fingerprint && query.fingerprint !== best.fingerprint) {
       return {
         hit: false, reason: 'context fingerprint changed since cached entry (codebase/context drift)',
-        similarity, freshness: Math.round(Math.max(0, 1 - ageMs / this.maxAgeMs) * 1000) / 1000,
+        similarity, freshness: Math.round(Math.max(0, 1 - ageMs / entryMaxAge) * 1000) / 1000,
       };
     }
     // Workspace revision change invalidates tool-dependent answers.
@@ -99,7 +104,7 @@ class SemanticCacheIndex {
     return {
       hit: true,
       similarity,
-      freshness: Math.round(Math.max(0, 1 - ageMs / this.maxAgeMs) * 1000) / 1000,
+      freshness: Math.round(Math.max(0, 1 - ageMs / entryMaxAge) * 1000) / 1000,
       sourceTask: best.taskText.slice(0, 200),
       modelUsed: best.modelId,
       runId: best.runId || null,
@@ -107,6 +112,8 @@ class SemanticCacheIndex {
       contextFingerprint: best.fingerprint,
       createdAt: best.createdAt,
       result: best.result,
+      pureAnswer: best.pureAnswer === true,
+      compatibleModels: best.compatibleModels || null,
       cacheVersion: VERSIONS.semanticCache,
     };
   }
