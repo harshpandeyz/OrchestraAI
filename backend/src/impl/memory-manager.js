@@ -7,6 +7,7 @@ const { generateId, now } = require('../state/runtime-state');
 // conflict representation. Run isolation + event shapes unchanged.
 const memoryIntel = require('../intelligence/memory-intelligence');
 const { classifyTask } = require('../intelligence/task-classifier');
+const { redactSecrets, classifyMemoryCandidate } = memoryIntel;
 
 class InMemoryMemoryManager extends MemoryManager {
   constructor(eventBus = null, options = {}) {
@@ -34,14 +35,19 @@ class InMemoryMemoryManager extends MemoryManager {
 
   // Run isolation: items are tagged with the writing run's ID. Reads return the
   // run's own items first, then shared seed knowledge (runId 'shared'/missing).
-  // Runs never see each other's working memory.
+  // Runs never see each other's working memory. Owner/user isolation is
+  // fail-open: it applies only when both the record and the runtime carry an
+  // identity (unit/demo runtimes without identities keep historical behavior).
   _visibleItems(store, runtimeOrRunId) {
     const runtime = runtimeOrRunId && typeof runtimeOrRunId === 'object' ? runtimeOrRunId : { runId: runtimeOrRunId };
     const runId = runtime.runId;
     const orgId = runtime.orgId || null;
     const projectId = runtime.projectId || null;
+    const userId = runtime.userId || runtime.ownerId || null;
     const items = Array.from(store.values()).filter((item) => item.status === 'active');
     return items.filter((i) => {
+      const owner = i.userId || i.ownerId || null;
+      if (owner && userId && owner !== userId) return false;
       if (i.runId === runId) return true;
       if (i.runId && i.runId !== 'shared') return i.orgId === orgId && (!projectId || !i.projectId || i.projectId === projectId);
       return !i.orgId || !orgId || i.orgId === orgId;
@@ -70,15 +76,23 @@ class InMemoryMemoryManager extends MemoryManager {
     });
     const byId = new Map(ranked.map((r) => [r.memory.id, r]));
     // Stable, explainable order: hybrid score desc, own-run first on ties.
+    // Conflicted records are demoted (×0.7): contradictory memories stay
+    // visible but never outrank their uncontested peers.
     return items
       .map((item) => ({ item, r: byId.get(item.id) }))
       .filter((x) => x.r && x.r.s.score > 0)
-      .sort((a, b) => b.r.s.score - a.r.s.score
+      .map((x) => {
+        const conflicted = !!(x.item.conflictWith || x.item.conflict);
+        const score = conflicted ? Math.round(x.r.s.score * 0.7 * 1000) / 1000 : x.r.s.score;
+        return { ...x, score, conflicted };
+      })
+      .sort((a, b) => b.score - a.score
         || ((b.item.runId === opts.runId ? 1 : 0) - (a.item.runId === opts.runId ? 1 : 0))
         || String(a.item.id).localeCompare(String(b.item.id)))
       .map((x) => {
-        x.item._retrievalScore = x.r.s.score;
-        x.item._retrievalExplanation = x.r.s.explanation;
+        x.item._retrievalScore = x.score;
+        x.item._retrievalExplanation = x.r.s.explanation + (x.conflicted ? ' + demoted: contradicted by another record' : '');
+        x.item._conflicted = x.conflicted;
         return x.item;
       });
   }
@@ -144,10 +158,15 @@ class InMemoryMemoryManager extends MemoryManager {
   async writeWorkingMemory(runtimeState, item) {
     runtimeState.memory.recordWrite();
 
-    const memoryItem = this._toRecord(item, 'working', runtimeState.runId, runtimeState);
+    // Snippets are safe for display by construction: secrets redacted first.
+    const clean = this._sanitizeInput(item);
+    const classification = classifyMemoryCandidate({ ...clean, source: item.source });
+    const memoryItem = this._toRecord({ ...clean, confidence: clean.confidence ?? classification.confidence }, 'working', runtimeState.runId, runtimeState);
     // Legacy-compatible aliases:
-    memoryItem.title = item.title;
-    memoryItem.snippet = item.snippet;
+    memoryItem.title = clean.title;
+    memoryItem.snippet = clean.snippet;
+    memoryItem.candidateKind = classification.kind;
+    memoryItem.candidateConfidence = classification.confidence;
     
     this.workingMemory.set(memoryItem.id, memoryItem);
     
@@ -166,12 +185,100 @@ class InMemoryMemoryManager extends MemoryManager {
     return memoryItem;
   }
 
-  async writeLongTermMemory(runtimeState, item) {
+  // Candidate-memory flow (explicit and trustworthy):
+  //   propose -> classify -> confidence -> policy/visibility -> persist.
+  // Returns { action, record, classification, reasons } without persisting.
+  // Actions: persist_working | persist_longterm | quarantine | reject.
+  proposeMemory(runtimeState, item, opts = {}) {
+    const target = opts.target === 'working' ? 'working' : 'longterm';
+    const clean = this._sanitizeInput(item || {});
+    if (!clean.title && !clean.snippet) {
+      return { action: 'reject', record: null, classification: null, reasons: ['empty candidate: no title or snippet'] };
+    }
+    const explicit = opts.explicit === true || item.durable === true || item.candidateApproved === true;
+    const classification = classifyMemoryCandidate({ ...clean, source: item.source, explicit });
+    const reasons = [...classification.reasons];
+    const policy = (runtimeState && runtimeState.policy) || {};
+    // A direct call to the long-term API is an explicit persist intent and is
+    // honored — EXCEPT for unvetted model/system output, secret-bearing
+    // content, or an explicit policy ban. Those quarantine to working memory
+    // until approved, so keyword-like model output can never silently become
+    // durable project memory.
+    if (target === 'longterm' && !explicit) {
+      if (policy.allowDurableMemory === false) {
+        reasons.push('policy forbids durable writes (allowDurableMemory=false); quarantined to working memory');
+        return { action: 'quarantine', record: null, classification, reasons, sanitized: clean };
+      }
+      if (classification.kind === 'secret_or_unsafe') {
+        reasons.push('secret-bearing candidate quarantined (redacted) until explicitly approved');
+        return { action: 'quarantine', record: null, classification, reasons, sanitized: clean };
+      }
+      if (classification.kind === 'unvetted_model_output') {
+        reasons.push('unvetted model output quarantined to working memory until approved');
+        return { action: 'quarantine', record: null, classification, reasons, sanitized: clean };
+      }
+    }
+    return { action: target === 'working' ? 'persist_working' : 'persist_longterm', record: null, classification, reasons, sanitized: clean };
+  }
+
+  // Promote a quarantined/working candidate to long-term memory after human
+  // or policy approval. The approval itself is recorded as provenance.
+  async approveMemoryCandidate(runtimeState, item, opts = {}) {
+    const approved = { ...(item || {}), candidateApproved: true, approvedBy: opts.approvedBy || 'operator', approvedAt: new Date().toISOString() };
+    return this.writeLongTermMemory(runtimeState, approved, { explicit: true });
+  }
+
+  _sanitizeInput(item) {
+    const clean = { ...(item || {}) };
+    if (typeof clean.title === 'string') clean.title = redactSecrets(clean.title).slice(0, 300);
+    if (typeof clean.snippet === 'string') clean.snippet = redactSecrets(clean.snippet).slice(0, 2000);
+    if (typeof clean.content === 'string') clean.content = redactSecrets(clean.content).slice(0, 4000);
+    return clean;
+  }
+
+  async writeLongTermMemory(runtimeState, item, opts = {}) {
     runtimeState.memory.recordWrite();
 
-    const memoryItem = this._toRecord(item, 'longterm', runtimeState.runId, runtimeState);
-    memoryItem.title = item.title;
-    memoryItem.snippet = item.snippet;
+    // Keyword-like model output never becomes durable automatically: without
+    // an explicit durability signal it quarantines to working memory.
+    const proposal = this.proposeMemory(runtimeState, item, {
+      target: 'longterm',
+      explicit: (opts && opts.explicit === true) || item.durable === true || item.candidateApproved === true,
+    });
+    if (proposal.action === 'reject') {
+      throw Object.assign(new Error('memory candidate rejected: empty title and snippet'), { code: 'empty_memory' });
+    }
+    if (proposal.action === 'quarantine') {
+      const quarantined = this._toRecord(
+        { ...proposal.sanitized, confidence: Math.min(Number(item.confidence ?? 0.5), proposal.classification.confidence) },
+        'working', runtimeState.runId, runtimeState,
+      );
+      quarantined.title = proposal.sanitized.title;
+      quarantined.snippet = proposal.sanitized.snippet;
+      quarantined.quarantined = true;
+      quarantined.quarantinedFrom = 'longterm';
+      quarantined.quarantineReasons = proposal.reasons;
+      quarantined.candidateKind = proposal.classification.kind;
+      quarantined.candidateConfidence = proposal.classification.confidence;
+      this.workingMemory.set(quarantined.id, quarantined);
+      if (this.eventBus) {
+        this.eventBus.emit(runtimeState.runId, EventType.MEMORY_WRITTEN, {
+          scope: 'working',
+          itemId: quarantined.id,
+          title: quarantined.title,
+          quarantined: true,
+          candidateKind: proposal.classification.kind,
+        });
+      }
+      return quarantined;
+    }
+
+    const clean = proposal.sanitized;
+    const memoryItem = this._toRecord({ ...clean, confidence: clean.confidence ?? proposal.classification.confidence }, 'longterm', runtimeState.runId, runtimeState);
+    memoryItem.title = clean.title;
+    memoryItem.snippet = clean.snippet;
+    memoryItem.candidateKind = proposal.classification.kind;
+    memoryItem.candidateConfidence = proposal.classification.confidence;
     
     this.longTermMemory.set(memoryItem.id, memoryItem);
     
@@ -302,6 +409,8 @@ class InMemoryMemoryManager extends MemoryManager {
     }).map((r) => ({
       id: r.memory.id, scope: r.memory.scope, title: r.memory.title,
       score: r.s.score, components: r.s.components, explanation: r.s.explanation,
+      conflicted: !!(r.memory.conflictWith || r.memory.conflict),
+      projectId: r.memory.projectId || null,
     }));
   }
 
