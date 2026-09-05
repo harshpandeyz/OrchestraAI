@@ -11,6 +11,7 @@ const { generateId, now } = require('../state/runtime-state');
 // without observations is unchanged; observations adjust it.
 const { classifyTask } = require('../intelligence/task-classifier');
 const routerIntel = require('../intelligence/router-intelligence');
+const routingObjective = require('../decisions/routing-objective');
 const { VERSIONS } = require('../intelligence/versions');
 
 class InMemoryModelRouter extends ModelRouter {
@@ -52,6 +53,200 @@ class InMemoryModelRouter extends ModelRouter {
     };
   }
 
+  // Canonical eligibility pipeline (single pass, no re-entry):
+  //   availability -> provider mapping -> pricing validity
+  //   -> capability/context constraints -> quality/latency/reliability
+  //   -> budget -> scoring -> selection.
+  // Once a model is excluded at any stage it never re-enters a later stage:
+  // every subsequent filter operates on the surviving pool only.
+  runEligibility(list, runtimeState, runPolicy) {
+    const log = [];
+    const stage = (name, pool, excluded) => {
+      log.push({ stage: name, survivors: pool.map((m) => m.id), excluded: excluded.map((m) => ({ id: m.id, reason: m._excl || name })) });
+      return pool;
+    };
+    let pool = list.slice();
+    // 1. availability: registry-marked unavailable models can never succeed.
+    {
+      const survivors = [];
+      const excluded = [];
+      for (const m of pool) {
+        if (m.status === 'unavailable') { m._excl = 'marked unavailable'; excluded.push(m); }
+        else survivors.push(m);
+      }
+      pool = stage('availability', survivors, excluded);
+    }
+    if (pool.length === 0) {
+      const err = Object.assign(
+        new Error(`No available models: all ${list.length} candidate(s) are marked unavailable`),
+        { code: 'no_models' },
+      );
+      err.eligibility = log;
+      throw err;
+    }
+    // 2. provider mapping: a routable model needs a known provider route.
+    //Honest default: unknown provider stays eligible (flagged) unless the
+    // policy explicitly requires a known provider.
+    {
+      const survivors = [];
+      const excluded = [];
+      const requireProvider = runPolicy.requireKnownProvider === true;
+      for (const m of pool) {
+        if ((!m.provider || String(m.provider).trim() === '') && requireProvider) {
+          m._excl = 'unknown provider (policy requires known provider)'; excluded.push(m);
+        } else survivors.push(m);
+      }
+      pool = stage('provider', survivors, excluded);
+    }
+    // 3. pricing validity: unknown commercial pricing is not optimizer input.
+    const cachedForRouting = Math.max(0, Number(runtimeState.context.cacheablePrefixTokens) || 0);
+    const hasOptimizerPricing = (model) => {
+      const knownRate = (value) => value !== null && value !== undefined && value !== ''
+        && Number.isFinite(Number(value)) && Number(value) >= 0;
+      return knownRate(model.inputPer1k) && knownRate(model.outputPer1k)
+        && (cachedForRouting <= 0 || knownRate(model.cachedPer1k));
+    };
+    const allowUnknownPricing = runPolicy.allowUnknownPricing === true;
+    {
+      const survivors = [];
+      const excluded = [];
+      for (const m of pool) {
+        if (!allowUnknownPricing && !hasOptimizerPricing(m)) { m._excl = 'incomplete pricing'; excluded.push(m); }
+        else survivors.push(m);
+      }
+      pool = stage('pricing', survivors, excluded);
+    }
+    if (pool.length === 0) {
+      const err = Object.assign(new Error('No available models have complete pricing for optimization'), {
+        code: 'insufficient_pricing',
+      });
+      err.eligibility = log;
+      throw err;
+    }
+    // 4. capability/context constraints.
+    const needTokens = runtimeState.context.currentTokens || 0;
+    {
+      const survivors = [];
+      const excluded = [];
+      const requiredCaps = Array.isArray(runPolicy.requiredCapabilities) ? runPolicy.requiredCapabilities : [];
+      for (const m of pool) {
+        const window = m.contextWindow || 0;
+        if (window > 0 && needTokens > 0 && needTokens > window) {
+          m._excl = `context window too small (need ~${needTokens}, window ${window})`; excluded.push(m); continue;
+        }
+        const missing = requiredCaps.filter((c) => !(Array.isArray(m.capabilities) && m.capabilities.includes(c)));
+        if (missing.length) { m._excl = `missing capabilities: ${missing.join(', ')}`; excluded.push(m); continue; }
+        survivors.push(m);
+      }
+      // Context overflow never strands the run when NOTHING fits: fall back to
+      // the pre-context pool so the orchestrator's larger-context failover can
+      // still report honestly (historical behavior preserved).
+      const contextExcludedAll = survivors.length === 0 && excluded.length > 0
+        && excluded.every((m) => String(m._excl || '').startsWith('context window'));
+      if (contextExcludedAll) {
+        pool = stage('capability_context', pool, []);
+      } else {
+        pool = stage('capability_context', survivors, excluded);
+      }
+    }
+    // 5. quality/latency/reliability constraints — eligibility gates on the
+    // surviving pool only (never reconstructed from a broader pool).
+    const qualityFloor = Number(runPolicy.qualityFloor);
+    if (Number.isFinite(qualityFloor) && qualityFloor > 0) {
+      const survivors = [];
+      const excluded = [];
+      for (const m of pool) {
+        if (Number.isFinite(Number(m.quality)) && Number(m.quality) >= qualityFloor) survivors.push(m);
+        else { m._excl = `quality ${m.quality} below floor ${qualityFloor}`; excluded.push(m); }
+      }
+      if (!survivors.length) {
+        const err = Object.assign(new Error(`No available models satisfy quality floor ${qualityFloor}`), { code: 'quality_constraint' });
+        err.eligibility = log;
+        throw err;
+      }
+      pool = stage('quality', survivors, excluded);
+    } else {
+      pool = stage('quality', pool, []);
+    }
+    const latencyTargetMs = Number(runPolicy.latencyTargetMs);
+    if (Number.isFinite(latencyTargetMs) && latencyTargetMs > 0) {
+      const survivors = [];
+      const excluded = [];
+      for (const m of pool) {
+        if (Number.isFinite(Number(m.avgLatencyMs)) && Number(m.avgLatencyMs) <= latencyTargetMs) survivors.push(m);
+        else { m._excl = `latency ${m.avgLatencyMs}ms above target ${latencyTargetMs}ms`; excluded.push(m); }
+      }
+      if (!survivors.length) {
+        const err = Object.assign(new Error(`No available models satisfy latency target ${latencyTargetMs}ms`), { code: 'latency_constraint' });
+        err.eligibility = log;
+        throw err;
+      }
+      pool = stage('latency', survivors, excluded);
+    } else {
+      pool = stage('latency', pool, []);
+    }
+    const minRel = Number(runPolicy.minReliability);
+    if (Number.isFinite(minRel) && minRel > 0) {
+      const preferredId = typeof runPolicy.preferredModel === 'string' ? runPolicy.preferredModel : null;
+      const survivors = [];
+      const excluded = [];
+      for (const m of pool) {
+        if (Number(m.reliability) >= minRel || m.id === preferredId) survivors.push(m);
+        else { m._excl = `reliability ${m.reliability} below floor ${minRel}`; excluded.push(m); }
+      }
+      if (survivors.length) pool = stage('reliability', survivors, excluded);
+      else pool = stage('reliability', pool, []);
+    } else {
+      pool = stage('reliability', pool, []);
+    }
+    // 6. budget: hard budget excludes; soft budget stays eligible with a
+    // penalty applied at scoring/objective time.
+    {
+      const remaining = runtimeState.budget && typeof runtimeState.budget.getRemainingBudget === 'function'
+        ? runtimeState.budget.getRemainingBudget() : null;
+      const hasRemaining = remaining !== null && remaining !== undefined && remaining !== '' && Number.isFinite(Number(remaining));
+      const rem = hasRemaining ? Number(remaining) : null;
+      const hard = runPolicy.hardBudget === true || runPolicy.budgetEnforcement === 'hard' || (rem !== null && rem <= 0.01);
+      const survivors = [];
+      const excluded = [];
+      const inputTokens = Math.max(0, Number(runtimeState.context.currentTokens) || 0);
+      const cachedTokens = Math.max(0, Math.min(inputTokens, Number(runtimeState.context.cacheablePrefixTokens) || 0));
+      for (const m of pool) {
+        const est = routingObjective.estimateProviderCostUsd(m, { inputTokens, outputTokens: 1000, cachedTokens });
+        if (rem !== null && est !== null && est > rem && hard) {
+          m._excl = `expected $${est} exceeds remaining $${rem}`; excluded.push(m); continue;
+        }
+        survivors.push(m);
+      }
+      if (!survivors.length && pool.length) {
+        const err = Object.assign(new Error('No available models fit the remaining budget'), { code: 'budget_constraint' });
+        err.eligibility = log;
+        throw err;
+      }
+      pool = stage('budget', survivors.length ? survivors : pool, excluded);
+    }
+    for (const m of pool) delete m._excl;
+    return { pool, log };
+  }
+
+  // Real expected total cost for one model definition (pinned/retained paths
+  // must never report $0). Null only when pricing itself is unknown.
+  realExpectedCostFor(model, runtimeState, extraSwitchUsd = 0) {
+    try {
+      const inputTokens = Math.max(0, Number(runtimeState.context.currentTokens) || 0);
+      const cachedTokens = Math.max(0, Math.min(inputTokens, Number(runtimeState.context.cacheablePrefixTokens) || 0));
+      const provider = routingObjective.estimateProviderCostUsd(model, { inputTokens, outputTokens: 1000, cachedTokens });
+      if (provider === null) return null;
+      const maxRetries = Math.max(0, Math.min(5, Number(runtimeState.policy?.maxRetries ?? this.config.maxRetries ?? 2)));
+      const retry = routingObjective.estimateRetryCostUsd(provider, model.reliability, maxRetries) ?? 0;
+      const tool = routingObjective.estimateToolContinuationCostUsd((runtimeState && runtimeState.policy) || {}).cost;
+      const total = provider + retry + Math.max(0, Number(extraSwitchUsd) || 0) + tool;
+      return Number.isFinite(total) ? Math.round(Math.max(0, total) * 1e6) / 1e6 : null;
+    } catch {
+      return null;
+    }
+  }
+
   async route(task, runtimeState, candidates, policy) {
     const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
     if (list.length === 0) {
@@ -65,113 +260,183 @@ class InMemoryModelRouter extends ModelRouter {
     const preferredId = typeof runPolicy.preferredModel === 'string' && runPolicy.preferredModel
       ? runPolicy.preferredModel : null;
     let preferred = null;
-    // Context incompatibility eliminates a candidate: a model whose window
-    // cannot hold the current context is never selected (the orchestrator's
-    // pre-call guard + larger-context failover handle the overflow honestly).
-    const needTokens = runtimeState.context.currentTokens || 0;
-    const compatible = list.filter((m) => {
-      const window = m.contextWindow || 0;
-      return !(window > 0 && needTokens > 0 && needTokens > window);
-    });
-    const pool = compatible.length > 0 ? compatible : list;
-    const eliminated = list.length - pool.length;
-    // Availability eliminates a candidate whenever it is known: a model the
-    // registry marks unavailable (explicit state, or a prior request-time
-    // model_unavailable failure recorded by the orchestrator) is never
-    // selected. Unlike context overflow this never falls back to the excluded
-    // set — selecting a known-inaccessible model cannot succeed.
-    const availablePool = pool.filter((m) => m.status !== 'unavailable');
-    const excludedUnavailable = pool.length - availablePool.length;
-    if (availablePool.length === 0) {
-      throw Object.assign(new Error(`No available models: all ${pool.length} candidate(s) are marked unavailable`), { code: 'no_models' });
-    }
-    const cachedForRouting = Math.max(0, Number(runtimeState.context.cacheablePrefixTokens) || 0);
-    const hasOptimizerPricing = (model) => {
-      const knownRate = (value) => value !== null && value !== undefined && value !== ''
-        && Number.isFinite(Number(value)) && Number(value) >= 0;
-      return knownRate(model.inputPer1k) && knownRate(model.outputPer1k)
-        && (cachedForRouting <= 0 || knownRate(model.cachedPer1k));
-    };
-    const unpriced = availablePool.filter((m) => !hasOptimizerPricing(m));
-    const allowUnknownPricing = runPolicy.allowUnknownPricing === true;
-    let scoredPool = allowUnknownPricing
-      ? availablePool
-      : availablePool.filter(hasOptimizerPricing);
-    if (scoredPool.length === 0) {
-      throw Object.assign(new Error('No available models have complete pricing for optimization'), {
-        code: 'insufficient_pricing',
-      });
-    }
+    const { pool: scoredPool, log: eligibilityLog } = this.runEligibility(list, runtimeState, runPolicy);
+    const excludedByStage = {};
+    for (const s of eligibilityLog) excludedByStage[s.stage] = (s.excluded || []).length;
     preferred = preferredId
       ? scoredPool.find((m) => m.id === preferredId && m.status !== 'unavailable') || null
       : null;
-    const excludedPricing = allowUnknownPricing ? 0 : unpriced.length;
-    // Hard quality/latency constraints are eligibility gates, not score
-    // nudges. Unknown evidence cannot prove a candidate safe for an explicit
-    // floor/target, so it is rejected rather than silently treated as good.
-    const qualityFloor = Number(runPolicy.qualityFloor);
-    if (Number.isFinite(qualityFloor) && qualityFloor > 0) {
-      const passing = availablePool.filter((m) => Number.isFinite(Number(m.quality)) && Number(m.quality) >= qualityFloor);
-      if (!passing.length) {
-        throw Object.assign(new Error(`No available models satisfy quality floor ${qualityFloor}`), { code: 'quality_constraint' });
-      }
-      scoredPool = passing;
-    }
-    const latencyTargetMs = Number(runPolicy.latencyTargetMs);
-    if (Number.isFinite(latencyTargetMs) && latencyTargetMs > 0) {
-      const passing = scoredPool.filter((m) => Number.isFinite(Number(m.avgLatencyMs)) && Number(m.avgLatencyMs) <= latencyTargetMs);
-      if (!passing.length) {
-        throw Object.assign(new Error(`No available models satisfy latency target ${latencyTargetMs}ms`), { code: 'latency_constraint' });
-      }
-      scoredPool = passing;
-    }
-    // Reliability floor from preset/policy (never empties the pool alone).
-    const minRel = Number(runPolicy.minReliability);
-    if (Number.isFinite(minRel) && minRel > 0) {
-      const passing = scoredPool.filter((m) => Number(m.reliability) >= minRel || m.id === preferred?.id);
-      if (passing.length) scoredPool = passing;
-    }
+    const preferredExcluded = preferredId && !preferred
+      ? (eligibilityLog.flatMap((s) => s.excluded || []).find((e) => e.id === preferredId) || null)
+      : null;
 
     const evaluation = await this.evaluateCandidates(task, runtimeState, scoredPool);
     evaluation.excludedCandidates = {
-      context: eliminated,
-      unavailable: excludedUnavailable,
-      unpriced: excludedPricing,
+      availability: excludedByStage.availability || 0,
+      provider: excludedByStage.provider || 0,
+      unpriced: (excludedByStage.pricing || 0),
+      context: (eligibilityLog.find((s) => s.stage === 'capability_context') || { excluded: [] }).excluded.length,
+      quality: excludedByStage.quality || 0,
+      latency: excludedByStage.latency || 0,
+      reliability: excludedByStage.reliability || 0,
+      budget: excludedByStage.budget || 0,
     };
+    evaluation.eligibility = eligibilityLog;
     if (!evaluation.candidates.length) {
       throw Object.assign(new Error('No routable models after scoring'), { code: 'no_models' });
     }
+    // Objective layer (separate from scoring): expected total task cost per
+    // candidate. Selection minimizes the objective; the weighted score stays
+    // as the explainable ranking signal and tie-break.
+    try {
+      const switchCosts = {};
+      for (const c of evaluation.candidates) {
+        if (c.modelId === runtimeState.model.currentModel) { switchCosts[c.modelId] = 0; continue; }
+        try {
+          const sc = this.switchingCostCalculator.calculate(
+            runtimeState.context, runtimeState.model,
+            runtimeState.model.currentModel, c.modelId,
+            { toProvider: c.provider, toModelLatency: c.avgLatencyMs },
+          );
+          switchCosts[c.modelId] = Number.isFinite(sc.total) ? Math.max(0, sc.total) : 0;
+        } catch { switchCosts[c.modelId] = 0; }
+      }
+      evaluation.candidates = routingObjective.attachObjectives(evaluation.candidates, {
+        switchCosts, policy: runPolicy,
+      });
+      evaluation.objective = {
+        formula: routingObjective.OBJECTIVE_FORMULA,
+        unit: 'USD per expected success (lower wins)',
+      };
+    } catch { /* objective is advisory; score ordering preserved */ }
 
     const currentModel = runtimeState.model.currentModel;
-    // Preferred-model override: explicit user choice, recorded honestly.
+    const eligibilityFactors = () => {
+      const out = [];
+      for (const s of eligibilityLog) {
+        for (const e of (s.excluded || [])) {
+          out.push({ key: `eligibility:${s.stage}`, label: `Excluded at ${s.stage}: ${e.id}`, status: 'warn', detail: e.reason || s.stage });
+        }
+      }
+      return out.slice(0, 12);
+    };
+    const objectiveFactors = (c) => {
+      if (!c || !c.objective) return [];
+      const o = c.objective;
+      const fmtUsd = (v) => (v === null || v === undefined ? 'unknown' : `$${Number(v).toFixed(6)}`);
+      return [
+        { key: 'objective', label: 'Expected total task cost', status: o.expectedTotalCostUsd === null ? 'warn' : 'pass', detail: fmtUsd(o.expectedTotalCostUsd) },
+        { key: 'objective_success', label: 'Predicted success for objective', status: 'pass', detail: `${o.successUsed === null ? 'unknown' : `${(o.successUsed * 100).toFixed(0)}%`} (${o.successBasis})` },
+        ...(o.costPerSuccessUsd !== null ? [{ key: 'objective_per_success', label: 'Expected cost per success', status: 'pass', detail: fmtUsd(o.costPerSuccessUsd) }] : []),
+      ];
+    };
+    // Preferred-model override: explicit user choice bypasses optimization,
+    // but it must still report the REAL expected cost (never $0).
     if (preferred && (!currentModel || preferred.id !== currentModel)) {
+      const pinned = evaluation.candidates.find((c) => c.modelId === preferred.id) || { modelId: preferred.id };
+      const pinnedCost = this.realExpectedCostFor(preferred, runtimeState, 0);
       const decision = this.decisionEngine.createDecision(
         DecisionType.MODEL_SELECTION,
         `SELECT ${preferred.id}`,
         `run:${runtimeState.runId}`,
         {
           candidates: evaluation.candidates,
-          selectedCandidate: evaluation.candidates.find((c) => c.modelId === preferred.id) || { modelId: preferred.id },
-          score: (evaluation.candidates.find((c) => c.modelId === preferred.id) || {}).score || 0,
+          selectedCandidate: pinned,
+          score: pinned.score || 0,
           factors: [
             { key: 'user_preference', label: 'Preferred model chosen by user', status: 'pass', detail: preferred.id },
+            { key: 'optimization', label: 'Cost optimization bypassed by user preference', status: 'warn', detail: 'selectionReason=user_preference' },
+            { key: 'expected_cost', label: 'Real expected cost (bypass still priced)', status: pinnedCost === null ? 'warn' : 'pass', detail: pinnedCost === null ? 'pricing unknown' : `$${pinnedCost.toFixed(6)}` },
           ],
           reason: 'User pinned a preferred model for this run',
-          expectedCost: 0,
+          expectedCost: pinnedCost,
           expectedLatency: preferred.avgLatencyMs,
           expectedQuality: preferred.quality,
           switchingCost: 0,
           confidence: 1,
         }
       );
+      decision.selectionReason = 'user_preference';
+      decision.optimizationBypassed = true;
+      if (pinned.objective) {
+        for (const f of objectiveFactors(pinned)) decision.factors.push(f);
+      }
       return this._finalizeRouting(task, runtimeState, evaluation, preferred.id, decision);
     }
-    const bestCandidate = preferred && currentModel === preferred.id
-      ? evaluation.candidates.find((c) => c.modelId === preferred.id) || evaluation.candidates[0]
-      : evaluation.candidates[0];
+    // Objective winner (lowest expected cost per success); falls back to the
+    // score leader when objectives are unknown/tied.
+    const scoreLeader = evaluation.candidates[0];
+    const objectiveWinner = routingObjective.selectByObjective(evaluation.candidates) || scoreLeader;
+    const preferredHold = !!(preferred && currentModel === preferred.id);
+    // Challenger selection (deterministic):
+    // - preferred hold -> the pinned model;
+    // - objective winner differs from incumbent -> it challenges (switch path);
+    // - incumbent wins on cost but the score leader differs -> the score
+    //   leader is recorded as the challenger and retention is decided on
+    //   expected-cost grounds (no hysteresis needed when nothing cheaper
+    //   proposes a switch).
+    let bestCandidate;
+    let costRetention = false;
+    if (preferredHold) {
+      bestCandidate = evaluation.candidates.find((c) => c.modelId === preferred.id) || evaluation.candidates[0];
+    } else if (currentModel && objectiveWinner && objectiveWinner.modelId !== currentModel) {
+      bestCandidate = objectiveWinner;
+    } else if (currentModel && scoreLeader && scoreLeader.modelId !== currentModel
+        && objectiveWinner && objectiveWinner.modelId === currentModel) {
+      bestCandidate = scoreLeader;
+      costRetention = true;
+    } else {
+      bestCandidate = objectiveWinner || evaluation.candidates[0];
+    }
+
+    const incumbentDefSafe = () => scoredPool.find((m) => m.id === currentModel)
+      || list.find((m) => m.id === currentModel) || { id: currentModel };
+
+    // Cost-based retention: the challenger leads on score, but the incumbent
+    // wins on expected total task cost — no switch is proposed, so hysteresis
+    // never engages. Recorded as retention with both sides of the comparison.
+    if (costRetention) {
+      const toChallenger = this.switchingCostCalculator.calculate(
+        runtimeState.context, runtimeState.model, currentModel, bestCandidate.modelId,
+        { toProvider: bestCandidate.provider, toModelLatency: bestCandidate.avgLatencyMs },
+      );
+      const incumbentCand = evaluation.candidates.find((c) => c.modelId === currentModel) || null;
+      const incObj = incumbentCand && incumbentCand.objective ? incumbentCand.objective.objectiveValue : null;
+      const chalObj = bestCandidate.objective ? bestCandidate.objective.objectiveValue : null;
+      const decision = this.decisionEngine.createDecision(
+        DecisionType.MODEL_RETENTION,
+        `KEEP ${currentModel}`,
+        `run:${runtimeState.runId}`,
+        {
+          candidates: evaluation.candidates,
+          selectedCandidate: incumbentCand || { modelId: currentModel },
+          score: evaluation.currentScore,
+          factors: [
+            { key: 'score_challenger', label: `${bestCandidate.modelId} leads on score`, status: 'warn', detail: `${bestCandidate.score.toFixed(2)} vs ${Number(evaluation.currentScore).toFixed(2)}` },
+            { key: 'objective', label: 'Incumbent wins on expected total cost', status: 'pass', detail: `objective ${incObj === null ? 'unknown' : `$${incObj}`} vs challenger ${chalObj === null ? 'unknown' : `$${chalObj}`}` },
+            { key: 'switch_cost', label: 'Switching cost avoided', status: 'pass', detail: `$${toChallenger.total.toFixed(4)}` },
+            ...(incumbentCand && incumbentCand.objective ? objectiveFactors(incumbentCand) : []),
+          ],
+          reason: `Incumbent ${currentModel} has the lowest expected total task cost; score-leading challenger ${bestCandidate.modelId} is more expensive per expected success`,
+          expectedCost: incumbentCand && incumbentCand.objective && incumbentCand.objective.expectedTotalCostUsd !== null
+            ? incumbentCand.objective.expectedTotalCostUsd : this.realExpectedCostFor(incumbentDefSafe(), runtimeState, 0),
+          expectedLatency: runtimeState.model.modelLatency,
+          expectedQuality: evaluation.currentScore,
+          switchingCost: toChallenger.total,
+          confidence: 0.85,
+        }
+      );
+      decision.selectionReason = 'optimized';
+      decision.optimizationBypassed = false;
+      return this._finalizeRouting(task, runtimeState, evaluation, currentModel, decision);
+    }
+
+    // No incumbent, or incumbent already best: direct selection.
 
     // No incumbent, or incumbent already best: direct selection.
     if (!currentModel || bestCandidate.modelId === currentModel) {
+      const winnerCost = bestCandidate.objective && bestCandidate.objective.expectedTotalCostUsd !== null
+        ? bestCandidate.objective.expectedTotalCostUsd : bestCandidate.estimatedCost;
       const decision = this.decisionEngine.createDecision(
         DecisionType.MODEL_SELECTION,
         `SELECT ${bestCandidate.modelId}`,
@@ -184,46 +449,59 @@ class InMemoryModelRouter extends ModelRouter {
             { key: 'quality', label: 'Quality score', status: 'pass', detail: bestCandidate.score.toFixed(2) },
             { key: 'cost', label: 'Cost efficiency', status: 'pass', detail: `$${bestCandidate.estimatedCost?.toFixed(4) || 'N/A'}` },
             { key: 'latency', label: 'Latency', status: 'pass', detail: `${bestCandidate.avgLatencyMs}ms` },
-            ...(eliminated ? [{ key: 'context', label: `${eliminated} candidate(s) excluded: context window too small`, status: 'warn', detail: `need ~${needTokens} tokens` }] : []),
-            ...(excludedUnavailable ? [{ key: 'availability', label: `${excludedUnavailable} candidate(s) excluded: marked unavailable`, status: 'warn', detail: 'known-inaccessible models are never selected' }] : []),
-            ...(excludedPricing ? [{ key: 'pricing', label: `${excludedPricing} candidate(s) excluded: pricing incomplete`, status: 'warn', detail: 'unknown commercial pricing is not optimizer input' }] : []),
+            { key: 'objective', label: 'Why this candidate won', status: 'pass', detail: bestCandidate.objective ? `lowest objective (${bestCandidate.objective.objectiveValue === null ? 'unknown cost' : `$${bestCandidate.objective.objectiveValue}`})` : 'highest score' },
+            ...(preferredExcluded ? [{ key: 'pinned_ineligible', label: `Pinned model ${preferredId} ineligible`, status: 'fail', detail: preferredExcluded.reason || 'excluded' }] : []),
+            ...eligibilityFactors().slice(0, 4),
+            ...objectiveFactors(bestCandidate),
           ],
-          reason: 'Best overall score for task requirements',
-          expectedCost: bestCandidate.estimatedCost,
+          reason: bestCandidate.objective && bestCandidate.objective.objectiveValue !== null
+            ? `Lowest expected cost per success ($${bestCandidate.objective.objectiveValue} via ${bestCandidate.objective.successBasis})`
+            : 'Best overall score for task requirements',
+          expectedCost: winnerCost,
           expectedLatency: bestCandidate.avgLatencyMs,
           expectedQuality: bestCandidate.score,
           switchingCost: 0,
           confidence: 0.85
         }
       );
+      decision.selectionReason = 'optimized';
+      decision.optimizationBypassed = false;
       return this._finalizeRouting(task, runtimeState, evaluation, bestCandidate.modelId, decision);
     }
 
     // Incumbent exists and a challenger leads. A degraded/unavailable (or
     // unscored) incumbent is never sticky: switch without hysteresis.
-    const incumbentDef = availablePool.find((m) => m.id === currentModel) || null;
+    const incumbentDef = scoredPool.find((m) => m.id === currentModel)
+      || list.find((m) => m.id === currentModel) || null;
     const incumbentUnhealthy = !incumbentDef || (incumbentDef.status && incumbentDef.status !== 'healthy');
     // User pinned switching off: keep a healthy incumbent, always.
     if (runPolicy.allowSwitching === false && !incumbentUnhealthy) {
+      const incumbentCand = evaluation.candidates.find((c) => c.modelId === currentModel) || null;
+      const keepCost = incumbentCand && incumbentCand.objective && incumbentCand.objective.expectedTotalCostUsd !== null
+        ? incumbentCand.objective.expectedTotalCostUsd
+        : this.realExpectedCostFor(incumbentDef || { id: currentModel }, runtimeState, 0);
       const keep = this.decisionEngine.createDecision(
         DecisionType.MODEL_RETENTION,
         `KEEP ${currentModel}`,
         `run:${runtimeState.runId}`,
         {
           candidates: evaluation.candidates,
-          selectedCandidate: { modelId: currentModel },
+          selectedCandidate: incumbentCand || { modelId: currentModel },
           score: evaluation.currentScore,
           factors: [
             { key: 'user_preference', label: 'Model switching disabled for this run', status: 'pass', detail: 'user setting' },
+            { key: 'expected_cost', label: 'Real expected cost of retained model', status: keepCost === null ? 'warn' : 'pass', detail: keepCost === null ? 'pricing unknown' : `$${Number(keepCost).toFixed(6)}` },
           ],
           reason: 'Model switching disabled by user — incumbent retained',
-          expectedCost: 0,
+          expectedCost: keepCost,
           expectedLatency: runtimeState.model.modelLatency,
           expectedQuality: evaluation.currentScore,
           switchingCost: 0,
           confidence: 1,
         }
       );
+      keep.selectionReason = 'user_preference';
+      keep.optimizationBypassed = true;
       return this._finalizeRouting(task, runtimeState, evaluation, currentModel, keep);
     }
     const switchingCost = this.switchingCostCalculator.calculate(
@@ -265,27 +543,35 @@ class InMemoryModelRouter extends ModelRouter {
       allowed = switchEval.allowed;
       switchReason = switchEval.reason;
       if (!allowed) {
+        const incumbentCand = evaluation.candidates.find((c) => c.modelId === currentModel) || null;
+        const retainCost = incumbentCand && incumbentCand.objective && incumbentCand.objective.expectedTotalCostUsd !== null
+          ? incumbentCand.objective.expectedTotalCostUsd
+          : (incumbentDef ? this.realExpectedCostFor(incumbentDef, runtimeState, 0) : null);
         decision = this.decisionEngine.createDecision(
           DecisionType.MODEL_RETENTION,
           `KEEP ${currentModel}`,
           `run:${runtimeState.runId}`,
           {
             candidates: evaluation.candidates,
-            selectedCandidate: { modelId: currentModel },
+            selectedCandidate: incumbentCand || { modelId: currentModel },
             score: evaluation.currentScore,
             factors: [
               { key: 'stickiness', label: 'Model stickiness', status: 'pass', detail: switchEval.reason },
               { key: 'switch_cost', label: 'Switching cost too high', status: 'warn', detail: `$${switchingCost.total.toFixed(4)}` },
-              { key: 'net_benefit', label: 'Net benefit insufficient', status: 'fail', detail: `${netBenefit.toFixed(4)} < ${switchEval.requiredBenefit?.toFixed(4) || 'N/A'}` }
+              { key: 'net_benefit', label: 'Net benefit insufficient', status: 'fail', detail: `${netBenefit.toFixed(4)} < ${switchEval.requiredBenefit?.toFixed(4) || 'N/A'}` },
+              { key: 'expected_cost', label: 'Real expected cost of retained model', status: retainCost === null ? 'warn' : 'pass', detail: retainCost === null ? 'pricing unknown' : `$${Number(retainCost).toFixed(6)}` },
+              ...(bestCandidate.objective ? objectiveFactors(bestCandidate) : []),
             ],
             reason: switchEval.reason,
-            expectedCost: 0,
+            expectedCost: retainCost,
             expectedLatency: runtimeState.model.modelLatency,
             expectedQuality: evaluation.currentScore,
             switchingCost: switchingCost.total,
             confidence: 0.9
           }
         );
+        decision.selectionReason = 'stickiness';
+        decision.optimizationBypassed = false;
         selectedModel = currentModel;
         return this._finalizeRouting(task, runtimeState, evaluation, selectedModel, decision);
       }
@@ -305,15 +591,20 @@ class InMemoryModelRouter extends ModelRouter {
           ...(incumbentUnhealthy
             ? [{ key: 'incumbent', label: switchReason, status: 'fail', detail: currentModel }]
             : [{ key: 'net_benefit', label: 'Net benefit after switching cost', status: 'pass', detail: `${netBenefit.toFixed(4)}` }]),
+          { key: 'expected_cost', label: 'Expected total cost after switch', status: (bestCandidate.objective && bestCandidate.objective.expectedTotalCostUsd !== null) ? 'pass' : 'warn', detail: (bestCandidate.objective && bestCandidate.objective.expectedTotalCostUsd !== null) ? `$${bestCandidate.objective.expectedTotalCostUsd}` : 'pricing unknown' },
+          ...(bestCandidate.objective ? objectiveFactors(bestCandidate) : []),
         ],
         reason: incumbentUnhealthy ? switchReason : `Net benefit ${netBenefit.toFixed(4)} exceeds threshold`,
-        expectedCost: switchingCost.total,
+        expectedCost: (bestCandidate.objective && bestCandidate.objective.expectedTotalCostUsd !== null)
+          ? bestCandidate.objective.expectedTotalCostUsd : switchingCost.total,
         expectedLatency: bestCandidate.avgLatencyMs,
         expectedQuality: bestCandidate.score,
         switchingCost: switchingCost.total,
         confidence: 0.8
       }
     );
+    decision.selectionReason = decision.selectionReason || 'optimized';
+    decision.optimizationBypassed = false;
     selectedModel = bestCandidate.modelId;
     return this._finalizeRouting(task, runtimeState, evaluation, selectedModel, decision);
   }
@@ -337,6 +628,10 @@ class InMemoryModelRouter extends ModelRouter {
         taskProfile: evaluation.taskProfile || null,
         counterfactuals: cf,
         explanation: expl.summary,
+        objectiveFormula: (evaluation.objective && evaluation.objective.formula) || routingObjective.OBJECTIVE_FORMULA,
+        selectionReason: decision.selectionReason || null,
+        optimizationBypassed: decision.optimizationBypassed === true,
+        eligibility: (evaluation.eligibility || []).map((s) => ({ stage: s.stage, survivors: s.survivors, excluded: s.excluded })),
       };
       if (!Array.isArray(decision.factors)) decision.factors = [];
       for (const r of (selected.reasons || []).slice(0, 8)) {
