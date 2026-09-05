@@ -201,8 +201,8 @@ class AnthropicAdapter extends ProviderAdapter {
   async estimateCost(modelId, inputTokens, outputTokens, cachedTokens = 0) {
     const modelInfo = await this.getModelInfo(modelId);
     // Anthropic pricing
-    const inputPrice = modelInfo.pricing input_per_1k || 0.003; // placeholder
-    const outputPrice = modelInfo.pricing output_per_1k || 0.015; // placeholder
+    const inputPrice = (modelInfo.pricing && modelInfo.pricing.input_per_1k) || 0.003; // placeholder
+    const outputPrice = (modelInfo.pricing && modelInfo.pricing.output_per_1k) || 0.015; // placeholder
     // ... simplified
     return { inputCost: inputTokens * inputPrice / 1000, outputCost: outputTokens * outputPrice / 1000, cachedCost: 0, total: 0 };
   }

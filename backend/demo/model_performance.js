@@ -61,7 +61,7 @@ class ModelPerformanceTracker {
       metric: newMetric,
       sample_count: n,
       timestamp,
-      confidence: Math.min(1, (existing ? existing.confidence : 0) * 0.5 + confidence * 0.5)),
+      confidence: Math.min(1, (existing ? existing.confidence : 0) * 0.5 + confidence * 0.5),
     };
 
     this._updateAggregateQuality(modelId);
