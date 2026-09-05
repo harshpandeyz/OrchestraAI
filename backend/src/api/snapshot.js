@@ -292,6 +292,10 @@ function executionView(orchestrator, runId) {
       constraints: view.constraints,
       toolHealth: view.toolHealth,
       recovery: view.recovery,
+      artifacts: (view.artifacts || []).map((a) => ({
+        artifactId: a.artifactId || a.id, type: a.type, name: a.name,
+        size: a.size, mimeType: a.mimeType, hash: a.hash,
+      })),
       // Pending-approval headline for "Agent is waiting for approval".
       waitingForApproval: (view.pendingApprovals || []).length > 0,
     };

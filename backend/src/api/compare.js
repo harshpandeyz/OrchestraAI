@@ -5,15 +5,45 @@
 
 const { buildSnapshot, runSummary } = require('./snapshot');
 
+// Dual sync/async like the SSE service: sync stores (file adapter, test
+// fakes) return values directly; the durable RunStore returns Promises and
+// the comparison resolves asynchronously. `await` works with both.
 function summarizeRun(orchestrator, store, eventBus, id) {
   const live = (orchestrator.getRun && orchestrator.getRun(id))
     || (orchestrator.activeRuns && orchestrator.activeRuns.get(id))
     || null;
-  let snap = live ? buildSnapshot(orchestrator, id) : store.loadSnapshot(id);
-  let summary = live ? runSummary(orchestrator, id) : store.loadRunIndex().find((r) => r && r.id === id);
+  if (live) {
+    return finishSummarize(
+      buildSnapshot(orchestrator, id),
+      runSummary(orchestrator, id),
+      eventBus.eventLogs.get(id) || [],
+    );
+  }
+  const snapP = store.loadSnapshot(id);
+  const indexP = store.loadRunIndex();
+  if (isThenable(snapP) || isThenable(indexP)) {
+    return Promise.resolve().then(async () => {
+      const snap = await snapP;
+      const index = await indexP;
+      const summary = (Array.isArray(index) ? index : []).find((r) => r && r.id === id);
+      if (!snap && !summary) return null;
+      const events = (eventBus.eventLogs.get(id) || await store.loadEvents(id) || []);
+      return finishSummarize(snap, summary, events);
+    });
+  }
+  const snap = snapP;
+  const summary = (Array.isArray(indexP) ? indexP : []).find((r) => r && r.id === id);
   if (!snap && !summary) return null;
-
   const events = (eventBus.eventLogs.get(id) || store.loadEvents(id) || []);
+  if (isThenable(events)) {
+    return events.then((evts) => finishSummarize(snap, summary, evts || []));
+  }
+  return finishSummarize(snap, summary, events);
+
+  function finishSummarize(snapArg, summaryArg, eventsArg) {
+  const snap = snapArg;
+  const summary = summaryArg;
+  const events = Array.isArray(eventsArg) ? eventsArg : [];
   const tools = {};
   let switches = 0;
   const modelPath = [];
@@ -68,19 +98,35 @@ function summarizeRun(orchestrator, store, eventBus, id) {
     createdAt: created || null,
     updatedAt: updated || null,
   };
+  }
 }
 
 function compareRuns(orchestrator, store, eventBus, idA, idB) {
-  const a = summarizeRun(orchestrator, store, eventBus, idA);
-  const b = summarizeRun(orchestrator, store, eventBus, idB);
-  if (!a || !b) return null;
-  const delta = {
-    durationMs: a.durationMs !== null && b.durationMs !== null ? b.durationMs - a.durationMs : null,
-    costUsd: a.costUsd !== null && b.costUsd !== null ? Math.round((b.costUsd - a.costUsd) * 1e6) / 1e6 : null,
-    toolCalls: b.toolCalls - a.toolCalls,
-    switches: b.switches - a.switches,
-  };
-  return { a, b, delta };
+  const aP = summarizeRun(orchestrator, store, eventBus, idA);
+  const bP = summarizeRun(orchestrator, store, eventBus, idB);
+  if (isThenable(aP) || isThenable(bP)) {
+    return Promise.resolve().then(async () => {
+      const a = await aP;
+      const b = await bP;
+      return finishCompare(a, b);
+    });
+  }
+  return finishCompare(aP, bP);
+
+  function finishCompare(a, b) {
+    if (!a || !b) return null;
+    const delta = {
+      durationMs: a.durationMs !== null && b.durationMs !== null ? b.durationMs - a.durationMs : null,
+      costUsd: a.costUsd !== null && b.costUsd !== null ? Math.round((b.costUsd - a.costUsd) * 1e6) / 1e6 : null,
+      toolCalls: b.toolCalls - a.toolCalls,
+      switches: b.switches - a.switches,
+    };
+    return { a, b, delta };
+  }
+}
+
+function isThenable(v) {
+  return v && typeof v.then === 'function';
 }
 
 module.exports = { summarizeRun, compareRuns };
