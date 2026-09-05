@@ -15,14 +15,29 @@ function defaultSseLine(envelope) {
 // response was fully handled (replay and/or live stream), or
 // { served: false, code: 'not_found' } when the run has no events anywhere
 // (caller maps to 404). Never throws for expected states.
+//
+// Dual sync/async: with a synchronous store (file adapter, test fakes) it
+// returns the result directly; with an async store (durable RunStore over
+// Postgres) it returns a Promise for the same shape. Callers that await
+// work with both.
 function serveRunEvents({ eventBus, store, sseLine = defaultSseLine }, req, res, { runId, since = 0, live = false, corsHeaders = {}, securityHeaders = {} }) {
   const logs = eventBus.eventLogs;
   if (!logs.has(runId)) {
     // Persisted-only runs may not have reloaded logs in this process.
-    const onDisk = store.loadEvents(runId);
-    if (!onDisk.length) return { served: false, code: 'not_found' };
-    logs.set(runId, onDisk);
+    const loaded = store.loadEvents(runId);
+    if (loaded && typeof loaded.then === 'function') {
+      return loaded.then((onDisk) => {
+        if (!onDisk || !onDisk.length) return { served: false, code: 'not_found' };
+        logs.set(runId, onDisk);
+        return serveLive();
+      });
+    }
+    if (!loaded || !loaded.length) return { served: false, code: 'not_found' };
+    logs.set(runId, loaded);
   }
+  return serveLive();
+
+  function serveLive() {
   res.writeHead(200, {
     ...securityHeaders,
     'Content-Type': 'text/event-stream',
@@ -46,6 +61,7 @@ function serveRunEvents({ eventBus, store, sseLine = defaultSseLine }, req, res,
   if (live) eventBus.subscribe(runId, res);
   else res.end();
   return { served: true, replayed: list.length, gap: !!replay.gap };
+  }
 }
 
 module.exports = { serveRunEvents, defaultSseLine };
