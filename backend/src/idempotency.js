@@ -32,7 +32,17 @@ class IdempotencyStore {
     this.max = options.max || 1000;
     this.records = new Map(); // key -> { key, state, result?, error?, createdAt, updatedAt, runId?, op? }
     this.log = options.logger || null;
+    // Optional distributed backend (Postgres UNIQUE row or Redis NX key).
+    // When set, async beginAsync/completeAsync/failAsync consult the remote
+    // first so paid/durable side effects are safe across backend instances.
+    // The local Map remains only as a best-effort mirror/cache — never the
+    // authority in production. See backend/src/infrastructure/*.
+    this.remote = options.remote || options.distributedBackend || null;
     if (this.file) this._restore();
+  }
+
+  get distributed() {
+    return !!this.remote;
   }
 
   _warn(msg, extra) {
@@ -96,6 +106,8 @@ class IdempotencyStore {
   // Begin an operation. Returns { fresh: true } for the winner, or
   // { fresh: false, record } when the key already exists (caller must NOT
   // re-execute; return the stored result / observe the in-flight state).
+  // NOTE: process-local only. Paid/durable side effects in production MUST
+  // use beginAsync (distributed backend) instead — see below.
   begin(key, meta = {}) {
     if (!key || typeof key !== 'string') throw new Error('idempotency key required');
     const existing = this.records.get(key);
@@ -155,6 +167,52 @@ class IdempotencyStore {
     return { ...rec };
   }
 
+  // --- Distributed (multi-instance safe) path ---
+  // Uses the configured remote backend when present; otherwise falls back to
+  // the local implementation with degraded:true so callers can observe that
+  // the guarantee is single-process only. Production deployments handling
+  // paid/durable side effects must configure a remote (Postgres/Redis) and
+  // treat degraded reservations as NOT safe for irreversible work.
+  async beginAsync(key, meta = {}) {
+    if (!key || typeof key !== 'string') throw new Error('idempotency key required');
+    if (this.remote && typeof this.remote.begin === 'function') {
+      const out = await this.remote.begin(key, meta);
+      const record = out && out.record ? { ...out.record } : this.get(key);
+      if (out && out.fresh) {
+        this.records.set(key, { key, state: record.state || STATES.RUNNING, ...record, updatedAt: new Date().toISOString() });
+        this._evictIfNeeded();
+        this._persist();
+      }
+      return { fresh: !!(out && out.fresh), record, distributed: true, degraded: false };
+    }
+    const local = this.begin(key, meta);
+    return { ...local, distributed: false, degraded: true };
+  }
+
+  async completeAsync(key, result) {
+    if (this.remote && typeof this.remote.complete === 'function') {
+      await this.remote.complete(key, result);
+    }
+    return this.complete(key, result);
+  }
+
+  async failAsync(key, error) {
+    if (this.remote && typeof this.remote.fail === 'function') {
+      await this.remote.fail(key, error);
+    }
+    return this.fail(key, error);
+  }
+
+  async getAsync(key) {
+    if (this.remote && typeof this.remote.get === 'function') {
+      try {
+        const rec = await this.remote.get(key);
+        if (rec) return { ...rec };
+      } catch {}
+    }
+    return this.get(key);
+  }
+
   statusOf(key) {
     const rec = this.records.get(key);
     return rec ? rec.state : STATES.UNKNOWN;
@@ -170,4 +228,78 @@ class IdempotencyStore {
   }
 }
 
-module.exports = { IdempotencyStore, STATES };
+// Redis-backed distributed idempotency over a coordinator (SET NX).
+// Keys are namespaced and TTL-bounded; terminal states persist for ttlMs.
+class RedisIdempotencyBackend {
+  constructor(coordinator, { prefix = 'idem:', ttlMs = 7 * 24 * 60 * 60 * 1000 } = {}) {
+    this.coordinator = coordinator;
+    this.prefix = prefix;
+    this.ttlMs = ttlMs;
+  }
+
+  _k(key) { return `${this.prefix}${key}`; }
+
+  async begin(key, meta = {}) {
+    const now = new Date().toISOString();
+    const rec = {
+      key,
+      state: meta.state || STATES.RUNNING,
+      runId: meta.runId || null,
+      op: meta.op || null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const res = await this.coordinator.set(this._k(key), JSON.stringify(rec), { px: this.ttlMs, nx: true });
+    if (res === 'OK') return { fresh: true, record: { ...rec } };
+    return { fresh: false, record: await this.get(key) };
+  }
+
+  async complete(key, result) {
+    const existing = (await this.get(key)) || { key };
+    const rec = { ...existing, key, state: STATES.COMPLETED, result: result ?? null, error: null, updatedAt: new Date().toISOString() };
+    await this.coordinator.set(this._k(key), JSON.stringify(rec), { px: this.ttlMs });
+    return { ...rec };
+  }
+
+  async fail(key, error) {
+    const existing = (await this.get(key)) || { key };
+    const safe = String((error && error.message) || error || 'failed').slice(0, 500);
+    const rec = { ...existing, key, state: STATES.FAILED, error: safe, updatedAt: new Date().toISOString() };
+    await this.coordinator.set(this._k(key), JSON.stringify(rec), { px: this.ttlMs });
+    return { ...rec };
+  }
+
+  async get(key) {
+    const raw = await this.coordinator.get(this._k(key));
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }
+}
+
+// Postgres-backed distributed idempotency over PostgresDatastore
+// (UNIQUE key => cross-instance winner election in the database).
+class PostgresIdempotencyBackend {
+  constructor(pgStore) {
+    this.pg = pgStore;
+  }
+
+  async begin(key, meta = {}) {
+    const out = await this.pg.idempotencyBegin(key, meta);
+    return { fresh: !!out.fresh, record: out.record ? { ...out.record } : null };
+  }
+
+  async complete(key, result) {
+    await this.pg.idempotencyFinish(key, { state: STATES.COMPLETED, result });
+  }
+
+  async fail(key, error) {
+    const safe = String((error && error.message) || error || 'failed').slice(0, 500);
+    await this.pg.idempotencyFinish(key, { state: STATES.FAILED, error: safe });
+  }
+
+  async get(key) {
+    return this.pg.idempotencyGet(key);
+  }
+}
+
+module.exports = { IdempotencyStore, STATES, RedisIdempotencyBackend, PostgresIdempotencyBackend };
