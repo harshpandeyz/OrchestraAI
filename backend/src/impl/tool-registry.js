@@ -23,6 +23,12 @@ class InMemoryToolRegistry extends ToolRegistry {
   }
 
   async registerTool(tool) {
+    // Defense in depth: arbitrary shell execution is never exposed as a
+    // tool. Reject raw-shell registrations even if a caller requests them.
+    const bannedNames = new Set(['shell', 'exec', 'run_any_command', 'run_shell', 'bash', 'sh']);
+    if (tool && bannedNames.has(String(tool.name))) {
+      throw new Error(`tool name not allowed: ${tool.name} (raw shell execution is never exposed)`);
+    }
     const newTool = {
       id: tool.id || generateId('tool'),
       name: tool.name,
