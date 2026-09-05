@@ -86,6 +86,10 @@ function snapOf(id) {
 async function main() {
   await new Promise((resolve) => server.listen(0, resolve));
   BASE = `http://localhost:${server.address().port}`;
+  // Cold semantic index (durable via intelligence.json): fresh-execution
+  // assertions below must not reuse entries persisted by earlier suite runs.
+  // Fixture isolation only — cross-run reuse is covered by prompt-semantic.test.js.
+  orchestrator.cacheManager.semantic.clear();
 
   // ---------- A. create run ----------
   await test('A. create run returns frontend Run shape', async () => {
@@ -249,7 +253,7 @@ async function main() {
     });
     // Discovered-shape models so native IDs reach the adapter.
     await orchestrator.modelRegistry.registerModel({ id: 'x-down', name: 'X Down', provider: 'openrouter', status: 'healthy', contextWindow: 8000, quality: 0.8, avgLatencyMs: 500, reliability: 0.9, inputPer1k: 0.001, outputPer1k: 0.002, cachedPer1k: 0.001, capabilities: ['text'], source: 'discovered', nativeId: 'x-down' });
-    const id = await runToCompletion('int-M', 'Hello there', { timeoutMs: 90000 });
+    const id = await runToCompletion('int-M', 'Hello there', { timeoutMs: 90000, run: { mode: 'live' } });
     const s = snapOf(id);
     assert.strictEqual(s.status, 'failed', 'run failed instead of faking success');
     assert.ok(!s.messages.some((m) => m.role === 'assistant' && m.content), 'no invented assistant text');
@@ -275,7 +279,7 @@ async function main() {
     // Force the router to pick the failing model first: highest quality.
     await orchestrator.modelRegistry.registerModel({ id: 'y-down', name: 'Y Down', provider: 'openrouter', status: 'healthy', contextWindow: 8000, quality: 0.99, avgLatencyMs: 100, reliability: 0.99, inputPer1k: 0.001, outputPer1k: 0.002, cachedPer1k: 0.001, capabilities: ['text'], source: 'discovered', nativeId: 'y-down' });
     await orchestrator.modelRegistry.registerModel({ id: 'y-up', name: 'Y Up', provider: 'openrouter', status: 'healthy', contextWindow: 8000, quality: 0.5, avgLatencyMs: 100, reliability: 0.9, inputPer1k: 0.001, outputPer1k: 0.002, cachedPer1k: 0.001, capabilities: ['text'], source: 'discovered', nativeId: 'y-up' });
-    const id = await runToCompletion('int-N', 'Hello there', { timeoutMs: 90000 });
+    const id = await runToCompletion('int-N', 'Hello there', { timeoutMs: 90000, run: { mode: 'live' } });
     const s = snapOf(id);
     assert.strictEqual(s.status, 'completed');
     assert.strictEqual(s.activeModelId, 'y-up', 'failed over to healthy model');

@@ -32,13 +32,20 @@ const { SwitchingCostCalculator, ModelStickinessManager } = require('../decision
 const { PolicyEngine } = require('../policies/policy-engine');
 const { CostEstimator } = require('../cost/cost-estimator');
 const { CheckpointManager, RecoveryManager } = require('../checkpoint/checkpoint-manager');
+const { RecoveryService, classifySideEffect } = require('./recovery-service');
 const { TelemetryCollector, TelemetryEvent } = require('../telemetry/telemetry-collector');
 const { StateMachine } = require('./state-machine');
 const { generateId, now } = require('../state/runtime-state');
 const { createLogger } = require('../logger');
 const { ProviderError } = require('../providers/provider-adapter');
+const { resolveRunConfig, attachRunConfig, runConfigFor, syncLegacyMaxSteps } = require('../run-config');
+const { createModelCallRecord } = require('../economics/canonical-record');
 
 const TERMINAL = new Set([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]);
+
+function contentRetentionAllowed(runtimeState) {
+  return !!runtimeState && runtimeState.privacyMode === 'standard';
+}
 
 function frontendStatus(internal) {
   switch (internal) {
@@ -111,6 +118,15 @@ class Orchestrator {
     }
     this.checkpointManager = new CheckpointManager();
     this.recoveryManager = new RecoveryManager(this.checkpointManager);
+    this.recoveryService = new RecoveryService({
+      checkpointManager: this.checkpointManager,
+      recoveryManager: this.recoveryManager,
+      logger: this.log,
+    });
+    // Optional durable hook invoked after every completed step checkpoint:
+    // (runId) => void. The server wires snapshot persistence here so a
+    // crash loses at most the in-flight step, not the whole run.
+    this.persistHook = dependencies.persistHook || null;
     this.telemetry = new TelemetryCollector();
     this.decisionEngine = new DecisionEngine();
     this.switchingCostCalculator = dependencies.switchingCostCalculator || new SwitchingCostCalculator();
@@ -118,10 +134,20 @@ class Orchestrator {
     // Optional sink for finished-run evaluations + persistence hooks.
     // { recordEvaluation(eval), onRunEnd(summary) }. Failures here never fail a run.
     this.runEndSink = dependencies.runEndSink || dependencies.evaluationRecorder || null;
+    // Optional Session 2 intelligence store (IntelligenceStore). Attached by
+    // server wiring; every use is guarded so runs never depend on it.
+    this.intelligence = dependencies.intelligence || null;
 
     this.activeRuns = new Map();
     // runId -> per-run control record (never shared between runs).
     this.runControl = new Map();
+    // Terminal history (bounded): runs retired from activeRuns after their
+    // final state/events/snapshot are persisted. History stays queryable for
+    // replay/compare/retry without leaking live memory forever.
+    // runId -> { runtimeState, control, endedAt, status }
+    this.terminalRuns = new Map();
+    this.terminalOrder = []; // FIFO for bounded eviction
+    this.maxTerminalRetained = dependencies.maxTerminalRetained || 200;
 
     this.log = dependencies.logger || createLogger({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -136,7 +162,29 @@ class Orchestrator {
   // ---------- run-scoped helpers ----------
 
   control(runId) {
-    return this.runControl.get(runId);
+    return this.runControl.get(runId) || (this.terminalRuns.get(runId) || {}).control || null;
+  }
+
+  // Live control only (for mutation paths that must reject terminal runs).
+  liveControl(runId) {
+    return this.runControl.get(runId) || null;
+  }
+
+  // Unified run lookup: live first, then retired history. Never throws.
+  getRun(runId) {
+    return this.activeRuns.get(runId) || (this.terminalRuns.get(runId) || {}).runtimeState || null;
+  }
+
+  isActiveRun(runId) {
+    return this.activeRuns.has(runId);
+  }
+
+  isTerminalRun(runId) {
+    return this.terminalRuns.has(runId);
+  }
+
+  runConfig(runId) {
+    return runConfigFor(this.control(runId), this.config);
   }
 
   policyFor(runId) {
@@ -148,6 +196,14 @@ class Orchestrator {
     const ctrl = this.control(runtimeState.runId);
     if (!ctrl) throw new Error(`No control record for run ${runtimeState.runId}`);
     if (ctrl.machine.getState() === to) return;
+    // Explicit rejection of invalid transitions (never silent mutation).
+    if (!ctrl.machine.canTransition(to)) {
+      const e = new Error(`Invalid state transition: ${ctrl.machine.getState()} -> ${to}`);
+      e.code = 'invalid_transition';
+      e.currentState = ctrl.machine.getState();
+      e.attemptedState = to;
+      throw e;
+    }
     ctrl.machine.transition(to);
     runtimeState.updateStatus(to);
   }
@@ -160,6 +216,48 @@ class Orchestrator {
       this.transition(runtimeState, TaskStatus.EXECUTING);
     }
     this.transition(runtimeState, TaskStatus.OBSERVING);
+  }
+
+  // Track the last tool side effect for recovery: mark in_flight BEFORE
+  // dispatch (a crash at any point after this is UNKNOWN until proven
+  // otherwise), then completed/failed with the outcome. Classification is
+  // cached per run so recovery never depends on registry availability.
+  async _markToolInFlight(runtimeState, toolName, idempotencyKey, stepNumber) {
+    const ctrl = this.control(runtimeState.runId);
+    if (!ctrl) return null;
+    let cls = ctrl.toolRiskCache.get(toolName);
+    if (!cls) {
+      let def = null;
+      try {
+        if (this.toolRegistry && typeof this.toolRegistry.getTool === 'function') {
+          def = await this.toolRegistry.getTool(toolName);
+        }
+      } catch { /* registry advisory; default classification is cautious */ }
+      cls = classifySideEffect(def || { name: toolName, risk: 'medium' });
+      if (ctrl.toolRiskCache.size > 100) ctrl.toolRiskCache.clear();
+      ctrl.toolRiskCache.set(toolName, cls);
+    }
+    ctrl.lastToolEffect = {
+      state: 'in_flight',
+      tool: toolName,
+      idempotencyKey: idempotencyKey || null,
+      step: stepNumber,
+      destructive: cls.destructive,
+      idempotent: cls.idempotent,
+      retryable: true,
+      startedAt: now(),
+    };
+    return ctrl.lastToolEffect;
+  }
+
+  _markToolSettled(runtimeState, ok, code = null) {
+    const ctrl = this.control(runtimeState.runId);
+    if (!ctrl || !ctrl.lastToolEffect) return;
+    const rec = ctrl.lastToolEffect;
+    rec.state = ok ? 'completed' : 'failed';
+    rec.retryable = ok || !['bad_params', 'denied', 'scope_violation', 'path_escape', 'not_found', 'patch_conflict'].includes(String(code || ''));
+    rec.settledAt = now();
+    if (code) rec.code = code;
   }
 
   _emit(runId, type, payload) {
@@ -179,7 +277,7 @@ class Orchestrator {
       case EventType.CONTEXT_BUILT: return `Context built (${((p.usedTokens || 0) / 1000).toFixed(1)}k tokens)`;
       case EventType.CONTEXT_COMPRESSED: return `Context compressed (-${((p.reclaimedTokens || 0) / 1000).toFixed(1)}k)`;
       case EventType.MODEL_SELECTED: return `Model selected: ${p.modelId}`;
-      case EventType.MODEL_SWITCHED: return `Model switched: ${p.fromModel || p.fromId} -> ${p.toModel || p.toId}`;
+      case EventType.MODEL_SWITCHED: return `Model switched: ${p.fromModel || p.fromId} -> ${p.toModel || p.toId}${p.reason ? ` — ${String(p.reason).slice(0, 120)}` : ''}`;
       case EventType.MODEL_RETAINED: return `Model retained: ${p.modelId} (${p.reason || ''})`;
       case EventType.ROUTING_EVALUATED: return p.note || 'Routing evaluated';
       case EventType.TOOL_SELECTED: return `Tool selected: ${p.tool}`;
@@ -199,6 +297,9 @@ class Orchestrator {
       case EventType.RUN_CANCELLED: return 'Run cancelled';
       case EventType.PRICE_UPDATED: return `Price updated: ${p.modelId}`;
       case EventType.EXECUTION_RETRY: return `Retrying (attempt ${p.attempt || ''})`;
+      case EventType.EXECUTION_RECOVERY_STARTED: return 'Evaluating recovery...';
+      case EventType.EXECUTION_RECOVERED: return `Recovered (${p.action || 'resume'} from step ${p.cursor ?? '?'})`;
+      case EventType.EXECUTION_RECOVERY_BLOCKED: return `Recovery blocked: ${String(p.reason || '').slice(0, 100)}`;
       default: return type;
     }
   }
@@ -255,9 +356,51 @@ class Orchestrator {
       if (this.runEndSink && typeof this.runEndSink.onRunEnd === 'function') {
         this.runEndSink.onRunEnd(this._summaryOf(runtimeState));
       }
+      // Session 2 learning loop (§8, §31): outcome -> empirical model/task
+      // performance. Guarded and evidence-based; failures never fail a run.
+      if (this.intelligence && typeof this.intelligence.ingestRunOutcome === 'function') {
+        try {
+          const ctrl = this.control(runtimeState.runId);
+          const calls = runtimeState.tools.recentToolCalls || [];
+          const failures = calls.filter((c) => c && c.success === false).length;
+          const hasAssistant = !!(ctrl && (ctrl.messages || []).some((m) => m.role === 'assistant' && String(m.content || '').trim()));
+          const failedTests = calls
+            .filter((c) => c && c.name === 'run_tests' && c.success === true && c.result && Number.isFinite(Number(c.result.failed)))
+            .reduce((a, c) => a + Number(c.result.failed), 0);
+          const passedTests = calls
+            .filter((c) => c && c.name === 'run_tests' && c.success === true && c.result && Number.isFinite(Number(c.result.passed)))
+            .reduce((a, c) => a + Number(c.result.passed), 0);
+          const hasTestCounts = calls.some((c) => c && c.name === 'run_tests' && c.success === true && c.result && (Number.isFinite(Number(c.result.passed)) || Number.isFinite(Number(c.result.failed))));
+          this.intelligence.ingestRunOutcome({
+            runId: runtimeState.runId,
+            modelId: runtimeState.model.currentModel,
+            taskText: runtimeState.task.objective,
+            taskCategory: runtimeState.task.taskType && runtimeState.task.taskType !== 'general'
+              ? runtimeState.task.taskType
+              : undefined,
+            completed: status === TaskStatus.COMPLETED,
+            hasAssistantMessage: hasAssistant,
+            toolFailures: failures,
+            toolObservations: calls.slice(-20).map((c) => ({ toolName: c.name, success: c.success !== false })),
+            testSummary: hasTestCounts ? { passed: passedTests, failed: failedTests } : null,
+            userFeedback: (this.intelligence.userFeedback && this.intelligence.userFeedback.get(runtimeState.runId)) || null,
+            withinBudget: !runtimeState.budget.isBudgetExceeded(),
+            cost: Math.round(runtimeState.budget.currentSpend * 1e6) / 1e6,
+            latencyMs: runtimeState.budget.elapsedLatency,
+            steps: runtimeState.execution.currentStep,
+            errorCode: status === TaskStatus.FAILED ? 'run_failed' : null,
+          });
+        } catch (e) {
+          this.log.warn('intelligence ingest failed', { error: String((e && e.message) || e).slice(0, 200) });
+        }
+      }
     } catch (e) {
       this.log.warn('run-end sink failed', { error: String((e && e.message) || e).slice(0, 200) });
     }
+  }
+
+  setRuntimeDefaults(defaults) {
+    this.runtimeDefaults = { ...(defaults || {}) };
   }
 
   _summaryOf(runtimeState) {
@@ -272,16 +415,45 @@ class Orchestrator {
       activeModelId: runtimeState.model.currentModel,
       budget: runtimeState.budget.maximumCost,
       spent: Math.round(runtimeState.budget.currentSpend * 1e6) / 1e6,
+      ownerId: runtimeState.ownerId || null,
+      orgId: runtimeState.orgId || null,
+      projectId: runtimeState.projectId || null,
+      referenceModelId: runtimeState.referenceModelId || null,
     };
   }
 
   // ---------- lifecycle ----------
 
   async createRun(taskObjective, config = {}) {
+    // Concurrency guard: bounded live runs (DoS protection).
+    const liveCount = this.activeRuns.size;
+    const maxConcurrent = (this.config.maxConcurrentRuns) || 20;
+    if (liveCount >= maxConcurrent) {
+      const e = new Error(`Too many concurrent runs (${liveCount}/${maxConcurrent})`);
+      e.code = 'busy';
+      throw e;
+    }
+    // Prototype-pollution guard: drop dangerous keys from policy/tools/memory.
+    if (config.policy && typeof config.policy === 'object') {
+      for (const k of ['__proto__', 'constructor', 'prototype']) delete config.policy[k];
+    }
     const runtimeState = new RuntimeState(taskObjective, config);
 
-    if (config.policy) {
-      runtimeState.policy = config.policy;
+    // Merge user policy into the PolicyState instance (never replace it:
+    // replacing would drop isModelAllowed/isToolAllowed methods). Extra
+    // runtime keys (routerWeights, preset, preferredModel, allowSwitching,
+    // allowCompaction) ride along as own props for router/orchestrator use.
+    if (config.policy && typeof config.policy === 'object') {
+      for (const [k, v] of Object.entries(config.policy)) {
+        if (k === 'routerWeights' || k === 'preset' || k === 'preferredModel' ||
+            k === 'allowSwitching' || k === 'allowCompaction' || k === 'minReliability' ||
+            k === 'qualityFloor' || k === 'latencyTargetMs' || k === 'hardBudget' ||
+            k === 'allowUnknownPricing') {
+          runtimeState.policy[k] = v;
+        } else if (k in runtimeState.policy) {
+          runtimeState.policy[k] = v;
+        }
+      }
     }
 
     // One authoritative ToolRegistry -> per-run tool state. A tool visible on
@@ -308,8 +480,48 @@ class Orchestrator {
       }
     }
 
+    // Tool policy shortcut: 'readonly' blocks mutating tools for this run.
+    if (config.toolPolicy === 'readonly') {
+      for (const t of ['apply_patch', 'deploy_preview']) {
+        if (!runtimeState.policy.blockedTools.includes(t)) runtimeState.policy.blockedTools.push(t);
+      }
+    }
+
+    // One authoritative resolved config per run (process -> runtime -> run).
+    const resolved = resolveRunConfig({
+      processDefaults: {
+        maxSteps: this.config.maxSteps,
+        defaultBudgetUsd: this.config.defaultBudgetUsd ?? 0.5,
+        runTimeoutMs: this.config.runTimeoutMs,
+        maxToolCalls: this.config.maxToolCalls,
+        maxRetries: this.config.maxRetries,
+        defaultMaxContextTokens: this.config.defaultMaxContextTokens,
+        provider: this.config.provider,
+      },
+      runtimeDefaults: this.runtimeDefaults || {},
+      overrides: {
+        maxSteps: config.maxSteps,
+        budget: config.maxCost ?? config.budget,
+        runTimeoutMs: config.runTimeoutMs,
+        maxToolCalls: config.maxToolCalls,
+        maxRetries: config.maxRetries,
+        maxLatencyMs: config.maxLatencyMs,
+        maxContextTokens: config.maxContextTokens,
+        provider: config.provider,
+      },
+    });
+    // Resolved budget/timeout win over the raw constructor values.
+    runtimeState.budget.maximumCost = resolved.budgetUsd;
+    if (resolved.maxContextTokens) {
+      runtimeState.context.maximumTokens = resolved.maxContextTokens;
+      runtimeState.context.tokenBudget = resolved.maxContextTokens;
+    }
+
     this.activeRuns.set(runtimeState.runId, runtimeState);
-    this.runControl.set(runtimeState.runId, {
+    if (typeof eventBus.setPrivacyMode === 'function') {
+      eventBus.setPrivacyMode(runtimeState.runId, runtimeState.privacyMode);
+    }
+    const ctrlRecord = {
       policyEngine: new PolicyEngine(runtimeState.policy, this.config),
       machine: new StateMachine(TaskStatus.CREATED),
       abort: false,
@@ -317,8 +529,8 @@ class Orchestrator {
       running: false,
       startedAt: Date.now(),
       deadlineTimer: null,
-      mode: this.config.mode,
-      providerId: config.provider || this.config.provider,
+      mode: config.mode || this.config.mode,
+      providerId: resolved.provider,
       providerModel: null, // resolved registry model definition for the active model
       messages: [],
       history: [], // provider conversation turns [{role, content, name?}]
@@ -327,7 +539,7 @@ class Orchestrator {
       changes: [],
       latency: { currentStepMs: 0, avgStepMs: 0, modelMs: 0, toolMs: 0, totalMs: 0, samples: [], modelSamples: [], toolSamples: [] },
       series: [],
-      tokens: { input: 0, output: 0, cached: 0 },
+      tokens: { input: 0, output: 0, cached: 0, reasoning: 0 },
       routing: { candidates: [], decision: null },
       lastPromptTokens: 0,
       lastUserMessage: '',
@@ -336,14 +548,28 @@ class Orchestrator {
       retries: 0,
       triedModels: new Set(),
       completedCheckpoints: 0,
-    });
+      // Last known tool side-effect state for crash recovery. Updated around
+      // every tool dispatch: in_flight -> completed | failed. Consulted with
+      // idempotency records by RecoveryService before any retry resumes.
+      lastToolEffect: null,
+      toolRiskCache: new Map(),
+      // Synchronous re-entry guard: two concurrent retry/cancel paths must
+      // never resurrect or duplicate the same run.
+      recoveryInProgress: false,
+    };
+    this.runControl.set(runtimeState.runId, ctrlRecord);
+    attachRunConfig(ctrlRecord, resolved);
 
     // Snapshot current registry pricing into runtime knowledge.
     if (this.modelRegistry && typeof this.modelRegistry.getModels === 'function') {
       try {
         const models = await this.modelRegistry.getModels();
-        for (const m of models) {
+      for (const m of models) {
           runtimeState.model.setPricing(m.id, { inputPer1k: m.inputPer1k, outputPer1k: m.outputPer1k, cachedPer1k: m.cachedPer1k });
+        }
+        if (runtimeState.referenceModelId && typeof this.modelRegistry.getPricing === 'function') {
+          const referencePricing = this.modelRegistry.getPricing(runtimeState.referenceModelId);
+          if (referencePricing) runtimeState.referencePricingSnapshot = { ...referencePricing, capturedAt: now() };
         }
       } catch { /* registry unavailable -> routing will report honestly */ }
     }
@@ -365,10 +591,27 @@ class Orchestrator {
   }
 
   async startRun(runId, userMessage) {
+    // Terminal history is checked first so messages to finished runs get a
+    // 409 terminal error (not 404) with a clear retry hint.
+    if (this.terminalRuns.has(runId)) {
+      const term = this.terminalRuns.get(runId);
+      const st = term.runtimeState ? term.runtimeState.status : 'terminal';
+      const e = new Error(`Run is ${st}; use retry to resume a failed run`);
+      e.code = 'terminal';
+      throw e;
+    }
     const runtimeState = this.activeRuns.get(runId);
-    if (!runtimeState) throw new Error(`Run ${runId} not found`);
-    const ctrl = this.control(runId);
-    if (!ctrl) throw new Error(`Run ${runId} has no control record`);
+    if (!runtimeState) {
+      const e = new Error(`Run ${runId} not found`);
+      e.code = 'not_found';
+      throw e;
+    }
+    const ctrl = this.liveControl(runId);
+    if (!ctrl) {
+      const e = new Error(`Run ${runId} has no control record`);
+      e.code = 'not_found';
+      throw e;
+    }
     if (TERMINAL.has(runtimeState.status)) {
       const e = new Error(`Run is ${runtimeState.status}; use retry to resume a failed run`);
       e.code = 'terminal';
@@ -408,7 +651,10 @@ class Orchestrator {
 
   async waitForCompletion(runId, timeoutMs = 120000) {
     const ctrl = this.control(runId);
-    if (!ctrl || !ctrl.completion) return null;
+    if (!ctrl || !ctrl.completion) {
+      // Retired runs have no pending completion; return their terminal state.
+      return this.getRun(runId);
+    }
     let timer = null;
     try {
       await Promise.race([
@@ -418,13 +664,14 @@ class Orchestrator {
     } finally {
       if (timer) clearTimeout(timer);
     }
-    return this.activeRuns.get(runId) || null;
+    return this.getRun(runId);
   }
 
   _armDeadline(runtimeState) {
-    const ctrl = this.control(runtimeState.runId);
+    const ctrl = this.liveControl(runtimeState.runId) || this.control(runtimeState.runId);
     this._disarmDeadline(runtimeState.runId);
-    const ms = this.config.runTimeoutMs;
+    // Per-run timeout is authoritative (ResolvedRunConfig).
+    const ms = this.runConfig(runtimeState.runId).timeoutMs ?? this.config.runTimeoutMs;
     if (ms && ms > 0) {
       ctrl.deadlineTimer = setTimeout(() => {
         ctrl.abort = true;
@@ -450,6 +697,10 @@ class Orchestrator {
     const ctrl = this.control(runId);
     const t0 = Date.now();
     const resume = !!opts.resume && !!runtimeState.model.currentModel;
+    // Recovery cursor: first step to (re)execute. Fresh runs start at 0;
+    // resumed runs continue after the last COMPLETED checkpoint step so step
+    // numbers (and step-scoped idempotency keys) never reset.
+    const startStep = Number.isFinite(opts.startStep) && opts.startStep >= 0 ? Math.floor(opts.startStep) : 0;
 
     if (resume) {
       // Retry resume: valid state (context, model, history) is preserved, so
@@ -483,8 +734,15 @@ class Orchestrator {
       this.transition(runtimeState, TaskStatus.EXECUTING);
     }
 
-    let steps = 0;
-    while (steps < this.config.maxSteps) {
+    // Authoritative per-run step budget (ResolvedRunConfig). The global
+    // config is only the fallback for runs created before this module.
+    syncLegacyMaxSteps(ctrl);
+    const maxSteps = this.runConfig(runId).maxSteps;
+    let steps = startStep;
+    // totalSteps is monotonic across retries: a resumed run never forgets
+    // work already accounted for.
+    runtimeState.execution.totalSteps = Math.max(runtimeState.execution.totalSteps || 0, steps);
+    while (steps < maxSteps) {
       if (ctrl.abort) return this._cancelledRun(runtimeState, 'cancelled during execution');
       if (TERMINAL.has(runtimeState.status)) return runtimeState;
       if (runtimeState.budget.isBudgetExceeded() || runtimeState.budget.isLatencyExceeded()) {
@@ -494,7 +752,7 @@ class Orchestrator {
       }
 
       steps++;
-      runtimeState.execution.totalSteps = steps;
+      runtimeState.execution.totalSteps = Math.max(runtimeState.execution.totalSteps || 0, steps);
       const shouldContinue = await this._executeStep(runtimeState, userMessage, steps);
       await this._checkOptimizationTriggers(runtimeState);
       if (!shouldContinue) break;
@@ -503,11 +761,11 @@ class Orchestrator {
     }
 
     if (!TERMINAL.has(runtimeState.status) && !ctrl.abort) {
-      if (steps >= this.config.maxSteps) {
+      if (steps >= maxSteps) {
         // Step budget hit: complete only if work actually finished, else fail honestly.
         const lastAssistant = [...ctrl.messages].reverse().find((m) => m.role === 'assistant');
         if (lastAssistant) await this._completeRun(runtimeState, { summary: lastAssistant.content, note: 'step limit reached' });
-        else throw Object.assign(new Error(`Step limit (${this.config.maxSteps}) reached without a model response`), { code: 'step_limit' });
+        else throw Object.assign(new Error(`Step limit (${maxSteps}) reached without a model response`), { code: 'step_limit' });
       } else {
         await this._completeRun(runtimeState, {});
       }
@@ -529,7 +787,7 @@ class Orchestrator {
       relevance: 1.0, status: 'KEEP', metadata: { text: userMessage.slice(0, 2000) },
     }]);
 
-    if (this.memoryManager) {
+    if (contentRetentionAllowed(runtimeState) && this.memoryManager) {
       const mem = await this.memoryManager.searchMemory(runtimeState, userMessage, ['working', 'longterm'], 5);
       if (mem.length) {
         await this.contextManager.addContext(runtimeState, mem.slice(0, 3).map((m) => ({
@@ -555,11 +813,38 @@ class Orchestrator {
     const ctrl = this.control(runId);
     const policy = runtimeState.policy;
     const models = await this.modelRegistry.getModels();
-    const allowedModels = models.filter((m) => policy.isModelAllowed(m.id) && m.status !== 'unavailable');
+    // Live execution requires a provider-native mapping: a candidate without
+    // one can never be the model the provider actually runs, so it is
+    // excluded here (not silently substituted at request time). Demo mode has
+    // no provider-native namespace and is unaffected.
+    const liveMode = (ctrl.mode || this.config.mode) === 'live';
+    const allowedModels = models.filter((m) =>
+      policy.isModelAllowed(m.id) && m.status !== 'unavailable' && (!liveMode || m.nativeId)
+    );
 
     if (allowedModels.length === 0) {
-      throw Object.assign(new Error('No available models: registry is empty or all models are blocked/unavailable'), { code: 'no_models' });
+      const unmapped = liveMode ? models.filter((m) => policy.isModelAllowed(m.id) && m.status !== 'unavailable' && !m.nativeId).length : 0;
+      throw Object.assign(new Error(unmapped
+        ? `No available models: ${unmapped} candidate(s) lack a provider-native mapping for live execution`
+        : 'No available models: registry is empty or all models are blocked/unavailable'), { code: 'no_models' });
     }
+
+    // Router context-fit consumes the same canonical PromptPlan: compile it
+    // first so needTokens reflects the actual prompt definition (selected
+    // context + memory + tools), not a parallel size estimate.
+    try {
+      let selectionMemory = [];
+      try {
+        if (contentRetentionAllowed(runtimeState) && this.memoryManager) selectionMemory = await this.memoryManager.searchMemory(runtimeState, runtimeState.task.objective, ['working', 'longterm'], 4);
+      } catch { /* advisory */ }
+      const selectionTools = await this._providerTools(runtimeState);
+      const { plan: selectionPlan } = await this.contextManager.compilePrompt(runtimeState, {
+        userMessage: runtimeState.task.objective, stepNumber: 1,
+        memoryItems: selectionMemory, toolSpecs: selectionTools, history: [],
+      });
+      runtimeState.context.currentTokens = Math.max(runtimeState.context.currentTokens, selectionPlan.totalEstimatedTokens);
+      ctrl.lastPromptPlan = selectionPlan;
+    } catch { /* plan is advisory for selection; router still decides */ }
 
     const { selectedModel, decision, evaluation } = await this.modelRouter.route(
       runtimeState.task, runtimeState, allowedModels, policy
@@ -574,7 +859,17 @@ class Orchestrator {
       ctrl.providerModel = def; // resolved model definition drives execution (never a hard-coded string)
     }
 
-    ctrl.routing = { candidates: evaluation.candidates || [], decision };
+    ctrl.routing = {
+      candidates: evaluation.candidates || [],
+      decision,
+      // Session 2 routing intelligence (additive; consumed by snapshot + API).
+      counterfactuals: evaluation.counterfactuals || [],
+      explanation: evaluation.explanation || null,
+      tradeoff: evaluation.tradeoff || null,
+      taskProfile: evaluation.taskProfile || null,
+      inputsHash: evaluation.inputsHash || null,
+      policyVersion: evaluation.policyVersion || null,
+    };
     this._recordDecision(runId, decision);
     this.telemetry.recordMetric(runId, 'routing.candidates', (evaluation.candidates || []).length, { model: selectedModel });
 
@@ -620,19 +915,43 @@ class Orchestrator {
         }
         throw error;
       }
-      // Retryable provider errors: fail over to an untried healthy model
-      // first (each candidate tried once per run — no A->B->A loops), then
-      // bounded same-model retry with backoff, then honest failure.
-      if (error instanceof ProviderError && error.retryable) {
-        ctrl.triedModels.add(runtimeState.model.currentModel);
-        this._emit(runId, EventType.MODEL_UNAVAILABLE, { modelId: runtimeState.model.currentModel, code: error.code });
-        const fb = await this._failover(runtimeState, `${error.code} on ${runtimeState.model.currentModel}`, ctrl.triedModels);
+      // Provider errors with a viable alternative: fail over to an untried
+      // healthy model first (each candidate tried once per run — no A->B->A
+      // loops), then bounded same-model retry with backoff, then honest
+      // failure. Model-access failures (model_unavailable: the provider will
+      // not serve this model id/tier) ALWAYS fail over when policy allows and
+      // NEVER retry the same model — repeating the identical request cannot
+      // succeed. Only transient (retryable) errors use same-model backoff.
+      // model_resolution (no provider-native mapping) fails over the same
+      // way but never marks the registry: it is a configuration gap, not a
+      // provider availability fact.
+      const failoverEligible = error instanceof ProviderError && (error.retryable || error.code === 'model_unavailable' || error.code === 'model_resolution');
+      if (failoverEligible) {
+        const failedModel = runtimeState.model.currentModel;
+        ctrl.triedModels.add(failedModel);
+        this._emit(runId, EventType.MODEL_UNAVAILABLE, { modelId: failedModel, code: error.code });
+        if (error.code === 'model_unavailable') {
+          // Record request-time availability so routing excludes this model
+          // for the rest of the process (registry is per-process memory).
+          // This is a deliberate provider-authoritative state change, not the
+          // observation counter (which by contract never auto-marks
+          // unavailable for transient failures).
+          await this._markModelUnavailable(failedModel, error);
+        }
+        const fb = await this._failover(runtimeState, `${error.code} on ${failedModel}`, ctrl.triedModels);
         if (fb) {
           runtimeState.execution.recordRetry();
           this._emit(runId, EventType.EXECUTION_RETRY, { step: stepNumber, error: error.message, strategy: 'failover' });
           return true;
         }
-        if (ctrl.retries < this.config.maxRetries) {
+        if (error.code === 'model_unavailable') {
+          const provider = (ctrl.providerModel && ctrl.providerModel.provider) || ctrl.providerId || 'provider';
+          throw Object.assign(
+            new Error(`Model '${failedModel}' is not accessible via ${provider} (${String(error.message).slice(0, 200)}) and no viable alternative models remain`),
+            { code: 'model_unavailable' }
+          );
+        }
+        if (ctrl.retries < this.runConfig(runId).maxRetries) {
           ctrl.retries++;
           const backoff = Math.min(5000, 500 * 2 ** (ctrl.retries - 1));
           this._emit(runId, EventType.EXECUTION_RETRY, { step: stepNumber, error: error.message, attempt: ctrl.retries, backoffMs: backoff, strategy: 'backoff' });
@@ -645,22 +964,22 @@ class Orchestrator {
       throw error;
     }
 
-    // Stream the final text (chunked transport of already-complete content).
-    if (modelResult.text) {
-      for (const chunk of modelResult.text.match(/.{1,120}(\s|$)/g) || [modelResult.text]) {
-        this._emit(runId, EventType.RESPONSE_DELTA, { delta: chunk });
-      }
-    }
-
     // Tool-call loop (bounded): validate -> execute -> context -> continue.
     let guard = 0;
     while (modelResult.toolCalls && modelResult.toolCalls.length && guard < 4) {
       guard++;
       if (ctrl.abort) return false;
-      if (ctrl.toolCalls >= this.config.maxToolCalls) {
+      if (ctrl.toolCalls >= this.runConfig(runId).maxToolCalls) {
         throw Object.assign(new Error('Tool call budget exhausted'), { code: 'tool_budget' });
       }
       const calls = modelResult.toolCalls.slice(0, 3);
+      // Preserve the provider conversation contract: Anthropic requires the
+      // assistant tool_use turn immediately before user tool_result blocks;
+      // OpenAI-compatible providers also rely on this pairing on continuation.
+      ctrl.history.push({
+        role: 'assistant', content: modelResult.text || '',
+        tool_calls: calls.map((call) => ({ id: call.id, name: call.name, arguments: call.arguments || {} })),
+      });
       this.transition(runtimeState, TaskStatus.WAITING_FOR_TOOL);
       for (const call of calls) {
         this._emit(runId, EventType.TOOL_SELECTED, { tool: call.name, detail: `Model requested ${call.name}` });
@@ -668,21 +987,28 @@ class Orchestrator {
       const results = [];
       for (const call of calls) {
         ctrl.toolCalls++;
+        const toolKey = this.toolExecutor.idempotencyKeyFor
+          ? this.toolExecutor.idempotencyKeyFor(runId, call.name, call.arguments || {}, stepNumber)
+          : undefined;
+        await this._markToolInFlight(runtimeState, call.name, toolKey, stepNumber);
         const res = await this.toolExecutor.execute(call.name, call.arguments || {}, runtimeState, {
           signal: ctrl.abortController.signal,
-          idempotencyKey: this.toolExecutor.idempotencyKeyFor
-            ? this.toolExecutor.idempotencyKeyFor(runId, call.name, call.arguments || {}, stepNumber)
-            : undefined,
+          idempotencyKey: toolKey,
         });
+        this._markToolSettled(runtimeState, !!res.success, res.success ? null : (res.code || res.errorCode || null));
         results.push({ call, res });
-        ctrl.history.push({ role: 'tool', name: call.name, content: res.success ? JSON.stringify(res.result).slice(0, 2000) : `ERROR: ${res.error}` });
+        const evidence = res.success
+          ? summarizeToolResult(res.result).slice(0, 600)
+          : `ERROR: ${String(res.error || 'tool failed').slice(0, 400)}`;
+        ctrl.history.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: evidence });
         // Tool result -> context (real path) and -> working memory.
         await this.contextManager.addContext(runtimeState, [{
           kind: 'tool_result', title: `${call.name} result`, source: `tool:${call.name}`,
-          tokens: Math.ceil(JSON.stringify(res.result || res.error || '').length / 4) + 20,
+          tokens: Math.ceil(evidence.length / 4) + 20,
+          metadata: { text: evidence, sourceKind: 'compact_evidence' },
           relevance: 0.9, status: 'KEEP',
         }]);
-        if (this.memoryManager && res.success) {
+        if (contentRetentionAllowed(runtimeState) && this.memoryManager && res.success) {
           await this.memoryManager.writeWorkingMemory(runtimeState, {
             title: `${call.name} result (step ${stepNumber})`,
             snippet: summarizeToolResult(res.result).slice(0, 500),
@@ -697,11 +1023,6 @@ class Orchestrator {
       this.transition(runtimeState, TaskStatus.EXECUTING);
       // Continue the model with tool observations in context.
       modelResult = await this._callModel(runtimeState, userMessage, stepNumber, true);
-      if (modelResult.text) {
-        for (const chunk of modelResult.text.match(/.{1,120}(\s|$)/g) || [modelResult.text]) {
-          this._emit(runId, EventType.RESPONSE_DELTA, { delta: chunk });
-        }
-      }
     }
 
     // Heuristic single tool assist (only when the provider used no tools and the
@@ -718,23 +1039,26 @@ class Orchestrator {
         this.transition(runtimeState, TaskStatus.WAITING_FOR_TOOL);
         this._emit(runId, EventType.TOOL_SELECTED, { tool: assist.toolName, detail: 'Heuristic assist (provider returned no tool calls)' });
         ctrl.toolCalls++;
+        const heuristicCallId = `heuristic-${stepNumber}`;
+        ctrl.history.push({ role: 'assistant', content: modelResult.text || '', tool_calls: [{ id: heuristicCallId, name: assist.toolName, arguments: assist.params }] });
+        await this._markToolInFlight(runtimeState, assist.toolName, null, stepNumber);
         const res = await this.toolExecutor.execute(assist.toolName, assist.params, runtimeState, {
           signal: ctrl.abortController.signal,
         });
-        ctrl.history.push({ role: 'tool', name: assist.toolName, content: res.success ? JSON.stringify(res.result).slice(0, 2000) : `ERROR: ${res.error}` });
+        this._markToolSettled(runtimeState, !!res.success, res.success ? null : (res.code || res.errorCode || null));
+        const evidence = res.success
+          ? summarizeToolResult(res.result).slice(0, 600)
+          : `ERROR: ${String(res.error || 'tool failed').slice(0, 400)}`;
+        ctrl.history.push({ role: 'tool', tool_call_id: heuristicCallId, name: assist.toolName, content: evidence });
         await this.contextManager.addContext(runtimeState, [{
           kind: 'tool_result', title: `${assist.toolName} result`, source: `tool:${assist.toolName}`,
-          tokens: Math.ceil(JSON.stringify(res.result || res.error || '').length / 4) + 20,
+          tokens: Math.ceil(evidence.length / 4) + 20,
+          metadata: { text: evidence, sourceKind: 'compact_evidence' },
           relevance: 0.85, status: 'KEEP',
         }]);
         this.toObserving(runtimeState);
         this.transition(runtimeState, TaskStatus.EXECUTING);
         modelResult = await this._callModel(runtimeState, userMessage, stepNumber, true);
-        if (modelResult.text) {
-          for (const chunk of modelResult.text.match(/.{1,120}(\s|$)/g) || [modelResult.text]) {
-            this._emit(runId, EventType.RESPONSE_DELTA, { delta: chunk });
-          }
-        }
       }
     }
 
@@ -749,14 +1073,22 @@ class Orchestrator {
 
     // Completion contract: final text + no pending required actions.
     const completion = this._evaluateCompletion(runtimeState, modelResult);
-    const { checkpoint } = this.checkpointManager.createCheckpoint(runId, CheckpointType.STEP_COMPLETE, runtimeState.toSnapshot(), {
+    // Resume-grade checkpoint: runtime snapshot + control snapshot, marked
+    // completed, integrity-sealed. Recovery resumes from the newest one.
+    this.recoveryService.captureCheckpoint(runtimeState, ctrl, CheckpointType.STEP_COMPLETE, {
       stepNumber,
+      result: { step: stepNumber },
     });
-    if (checkpoint && typeof checkpoint.markCompleted === 'function') checkpoint.markCompleted({ step: stepNumber });
-    ctrl.completedCheckpoints++;
+    // Best-effort durable snapshot so a process crash loses at most the
+    // in-flight step. Failures here never fail the run (advisory).
+    if (typeof this.persistHook === 'function') {
+      try { await this.persistHook(runtimeState.runId); } catch (e) {
+        this.log.warn('post-checkpoint persist failed', { runId, error: String((e && e.message) || e).slice(0, 160) });
+      }
+    }
 
     // Durable memory: explicit durable facts -> long-term, else working summary.
-    if (this.memoryManager && modelResult.text) {
+    if (contentRetentionAllowed(runtimeState) && this.memoryManager && modelResult.text) {
       if (/(remember|preference|always|never|convention)\s*:/i.test(modelResult.text)) {
         await this.memoryManager.writeLongTermMemory(runtimeState, {
           title: `Durable fact (step ${stepNumber})`, snippet: modelResult.text.slice(0, 500),
@@ -809,6 +1141,24 @@ class Orchestrator {
 
   // The model request receives the ContextManager's output — never a prompt
   // invented inside the execution engine.
+  async _callProvider(adapter, request, ctrl, runId) {
+    // Live adapters expose native SSE. DEMO and injected test adapters use the
+    // normalized complete() contract; their response is emitted as one
+    // honest event rather than pretending a completed response was streamed.
+    if (ctrl.mode === 'live' && typeof adapter.stream === 'function') {
+      let final = null;
+      for await (const part of adapter.stream(request)) {
+        if (part && part.delta) this._emit(runId, EventType.RESPONSE_DELTA, { delta: part.delta, provider: adapter.providerId, nativeStream: true });
+        if (part && part.done) final = part;
+      }
+      if (final) return final;
+      return { text: '', toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, latencyMs: 0 };
+    }
+    const response = await adapter.complete(request);
+    if (response && response.text) this._emit(runId, EventType.RESPONSE_DELTA, { delta: response.text, provider: adapter.providerId, nativeStream: false });
+    return response;
+  }
+
   async _callModel(runtimeState, userMessage, stepNumber, continuation = false) {
     const runId = runtimeState.runId;
     const ctrl = this.control(runId);
@@ -818,9 +1168,25 @@ class Orchestrator {
     let def = ctrl.providerModel || await this.modelRegistry.getModel(modelId0);
     let modelId = modelId0;
     if (!def) throw Object.assign(new Error(`Model ${modelId} not found in registry`), { code: 'no_models' });
+    // No native provider model ID -> never silently substitute another model
+    // (e.g. the provider default) while reporting the selected id. Live-only
+    // guard: demo mode has no provider-native namespace.
+    if (!def.nativeId && ctrl.mode === 'live') {
+      throw Object.assign(
+        new Error(`Model '${modelId}' has no provider-native mapping for live execution; refusing to substitute another model`),
+        { code: 'model_resolution' }
+      );
+    }
 
-    let messages = await this._buildPromptMessages(runtimeState, userMessage, stepNumber);
-    let promptTokens = messages.reduce((n, m) => n + Math.ceil(String(m.content || '').length / 4), 0);
+    // Single canonical source: PromptPlan. promptTokens, the cache key and
+    // the fingerprint all derive from the plan — never from a parallel
+    // message-size summation. Counts are ESTIMATES (length/4); observed
+    // provider usage below stays authoritative for cost.
+    let built = await this._buildPrompt(runtimeState, userMessage, stepNumber);
+    let messages = built.messages;
+    let plan = built.plan;
+    let promptTokens = plan.totalEstimatedTokens;
+    ctrl.lastPromptPlan = plan;
 
     // Context-limit guard BEFORE any provider call: never send a request the
     // model cannot hold. Try one compression pass, then fail honestly so the
@@ -833,8 +1199,11 @@ class Orchestrator {
         const c = await this.contextManager.compressContext(runtimeState, Math.floor(window * 0.5), runtimeState.policy);
         reclaimed = (c && c.reclaimed) || 0;
       } catch {}
-      messages = await this._buildPromptMessages(runtimeState, userMessage, stepNumber);
-      promptTokens = messages.reduce((n, m) => n + Math.ceil(String(m.content || '').length / 4), 0);
+      built = await this._buildPrompt(runtimeState, userMessage, stepNumber);
+      messages = built.messages;
+      plan = built.plan;
+      promptTokens = plan.totalEstimatedTokens;
+      ctrl.lastPromptPlan = plan;
       if (promptTokens > window) {
         throw Object.assign(
           new Error(`Prompt (${promptTokens} tokens) exceeds ${modelId} context window (${window})`),
@@ -873,22 +1242,29 @@ class Orchestrator {
     runtimeState.context.currentTokens = Math.max(runtimeState.context.currentTokens, promptTokens);
     runtimeState.context.setCacheablePrefix(promptTokens);
 
-    // Real response cache (run-namespaced). Hits are genuine replays.
-    const cacheKey = this.cacheManager.scopedKey(runId, `prompt:${require('crypto').createHash('sha256').update(JSON.stringify({ p: ctrl.providerId, m: modelId, messages })).digest('hex')}`);
-    const cached = await this.cacheManager.get(cacheKey, runId);
+    // Real response cache (run-namespaced). Hits are genuine replays. The key
+    // derives from the canonical plan (fingerprint + history + model +
+    // provider) — the same logical prompt always maps to the same key.
+    const historyHash = require('crypto').createHash('sha256')
+      .update(JSON.stringify((messages || []).filter((m) => m.role !== 'system').map((m) => `${m.role}:${m.content}`))).digest('hex').slice(0, 16);
+    const cacheKey = this.cacheManager.scopedKey(runId, `prompt:${require('crypto').createHash('sha256').update(JSON.stringify({ p: ctrl.providerId, m: modelId, fp: plan.fingerprint, h: historyHash })).digest('hex')}`);
+    const cached = contentRetentionAllowed(runtimeState) && this.cacheManager
+      ? await this.cacheManager.get(cacheKey, runId) : { hit: false, value: null };
     if (cached.hit && cached.value && cached.value.text) {
-      const pricing = this.modelRegistry.getPricing ? this.modelRegistry.getPricing(modelId) : null;
-      const per1k = (pricing && pricing.inputPer1k) || 0;
-      const cachedPer1k = (pricing && pricing.cachedPer1k) ?? per1k;
-      const saved = Math.max(0, ((per1k - cachedPer1k) * promptTokens) / 1000);
+      runtimeState.addModelCall(createModelCallRecord({
+        runId, step: stepNumber, provider: def.provider, model: modelId,
+        providerCall: false, cacheType: 'local_response', plan,
+        pricingSnapshot: this.modelRegistry.getPricing(modelId), latencyMs: 0,
+      }));
       this.telemetry.recordCacheEvent(runId, EventType.CACHE_HIT, true, promptTokens, { key: 'prompt-cache' });
-      this._emit(runId, EventType.CACHE_HIT, { detail: 'Repeated prompt served from response cache', savedUsd: Math.round(saved * 1e6) / 1e6 });
+      this._emit(runId, EventType.CACHE_HIT, { detail: 'Repeated prompt served from local response cache', providerCall: false, providerCostUsd: 0 });
       this._recordCacheRecent(runId, 'cache.hit', 'Repeated prompt served from response cache');
-      ctrl.tokens.cached += promptTokens;
-      const est = this.costEstimator.estimateModelCost(modelId, def.provider, promptTokens, 0, promptTokens);
-      runtimeState.budget.addCost(CostCategory.CACHED_INPUT_TOKENS, est[CostCategory.CACHED_INPUT_TOKENS] || 0, { cached: true });
+      // A local response-cache hit never reaches a provider. Keep the audit
+      // category visible with a zero amount for compatibility, but never add
+      // fictitious provider usage or cost to the run budget.
+      runtimeState.budget.addCost(CostCategory.CACHED_INPUT_TOKENS, 0, { cached: true, local: true, providerCall: false });
       this._emitCost(runtimeState);
-      this._pushSeries(runtimeState, { inputTokens: 0, outputTokens: 0, cachedTokens: promptTokens, cost: est.total, latencyMs: 0 });
+      this._pushSeries(runtimeState, { inputTokens: 0, outputTokens: 0, cachedTokens: 0, cost: 0, latencyMs: 0 });
       if (this.modelRegistry && typeof this.modelRegistry.recordObservation === 'function') {
         try { this.modelRegistry.recordObservation(modelId, { success: true, latencyMs: 0, cached: true }); } catch {}
       }
@@ -896,25 +1272,76 @@ class Orchestrator {
     }
 
     const adapter = this.providerRegistry
-      ? this.providerRegistry.resolveForRun(ctrl.mode, ctrl.providerId)
+      ? this.providerRegistry.resolveForRun(ctrl.mode, ctrl.providerId, runtimeState.orgId || runtimeState.ownerId || 'default')
       : null;
     if (!adapter) throw new Error('No provider registry configured');
 
     const tools = await this._providerTools(runtimeState);
+    const toolNamesForCache = tools.map((t) => (t.function && t.function.name) || t.name).filter(Boolean);
+
+    // L3 semantic reuse (existing SemanticCacheIndex via cacheManager):
+    //   TASK + CONTEXT FINGERPRINT -> validate -> reuse | miss -> execute.
+    // Gates enforced by the index (similarity, freshness, fingerprint, tool
+    // compatibility) plus caller-side gates (same model served it, not this
+    // run's own entry). Fresh steps only: in-step continuations after tool
+    // results always execute fresh. Similarity here is lexical, not
+    // embeddings — conservative thresholds keep it honest.
+    if (contentRetentionAllowed(runtimeState) && !continuation && this.cacheManager && typeof this.cacheManager.lookupSemantic === 'function') {
+      let sem = null;
+      try {
+        sem = await this.cacheManager.lookupSemantic({
+          taskText: runtimeState.task.objective,
+          fingerprint: plan.fingerprint,
+          tools: toolNamesForCache,
+          runId,
+          tenantId: runtimeState.orgId || runtimeState.ownerId || 'default',
+          projectId: runtimeState.projectId || null,
+        });
+      } catch { sem = null; /* semantic cache is advisory; miss on error */ }
+      if (sem && sem.hit && sem.result && (typeof sem.result.text === 'string' || (sem.result.toolCalls || []).length)) {
+        const modelMismatch = sem.modelUsed && sem.modelUsed !== modelId;
+        const ownEntry = sem.runId && sem.runId === runId;
+        if (!modelMismatch && !ownEntry) {
+          runtimeState.addModelCall(createModelCallRecord({
+            runId, step: stepNumber, provider: def.provider, model: modelId,
+            providerCall: false, cacheType: 'semantic', plan,
+            pricingSnapshot: this.modelRegistry.getPricing(modelId), latencyMs: 0,
+          }));
+          this.telemetry.recordCacheEvent(runId, EventType.CACHE_HIT, true, promptTokens, { key: 'semantic' });
+          this._emit(runId, EventType.CACHE_HIT, {
+            detail: `Semantic reuse of "${String(sem.sourceTask || '').slice(0, 80)}" (similarity ${sem.similarity}, freshness ${sem.freshness})`,
+            savedUsd: 0, semantic: true, similarity: sem.similarity, freshness: sem.freshness,
+          });
+          this._recordCacheRecent(runId, 'cache.hit', 'Semantic cache reuse — no provider call');
+          this._pushSeries(runtimeState, { inputTokens: 0, outputTokens: 0, cachedTokens: 0, cost: 0, latencyMs: 0 });
+          return {
+            text: sem.result.text || '',
+            toolCalls: sem.result.toolCalls || [],
+            usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+            latencyMs: 0,
+            complete: false,
+            fromSemanticCache: true,
+          };
+        }
+        this._emit(runId, EventType.CACHE_MISS, {
+          detail: `Semantic reuse rejected (${modelMismatch ? 'different model served the cached answer' : 'same-run entry'})`,
+        });
+      }
+    }
     const started = Date.now();
     // providerModel = the registry's default for this provider when the routed
     // model ID is a local catalog alias; resolved native ID otherwise.
     const nativeModel = this._nativeModelId(def, adapter);
     let response;
     try {
-      response = await adapter.complete({
+      response = await this._callProvider(adapter, {
         model: nativeModel,
         messages,
         tools,
         maxTokens: 1024,
         timeoutMs: this.config.providerTimeoutMs || 60000,
         signal: ctrl.abortController.signal,
-      });
+      }, ctrl, runId);
     } catch (e) {
       // Observed-health hookup: provider outcomes feed the registry so future
       // routing uses real reliability/latency. Transient failures never mark a
@@ -926,20 +1353,73 @@ class Orchestrator {
     }
     const latencyMs = Date.now() - started;
 
-    const usage = response.usage || { inputTokens: promptTokens, outputTokens: 0, cachedTokens: 0 };
-    const inputTokens = usage.inputTokens ?? promptTokens;
-    const outputTokens = usage.outputTokens ?? 0;
-    const cachedTokens = usage.cachedTokens ?? 0;
+    // Provider usage is authoritative. A missing field stays unknown in the
+    // canonical economic record; prompt-plan values are forecasts for budget
+    // control only and must never become observed provider usage.
+    const usage = response.usage || {};
+    const observedInputTokens = Number.isFinite(Number(usage.inputTokens)) && Number(usage.inputTokens) >= 0 ? Number(usage.inputTokens) : null;
+    const observedOutputTokens = Number.isFinite(Number(usage.outputTokens)) && Number(usage.outputTokens) >= 0 ? Number(usage.outputTokens) : null;
+    const observedCachedTokens = Number.isFinite(Number(usage.cachedTokens)) && Number(usage.cachedTokens) >= 0 ? Number(usage.cachedTokens) : null;
+    const observedReasoningTokens = Number.isFinite(Number(usage.reasoningTokens)) && Number(usage.reasoningTokens) >= 0 ? Number(usage.reasoningTokens) : null;
+    const inputTokens = observedInputTokens ?? promptTokens;
+    const outputTokens = observedOutputTokens ?? 0;
+    const cachedTokens = observedCachedTokens ?? 0;
 
-    // ONE authoritative pricing path: registry -> estimator.
-    const est = this.costEstimator.estimateModelCost(modelId, def.provider, inputTokens, outputTokens, cachedTokens);
-    runtimeState.budget.addCost(CostCategory.INPUT_TOKENS, est[CostCategory.INPUT_TOKENS] || 0, { model: modelId });
-    runtimeState.budget.addCost(CostCategory.OUTPUT_TOKENS, est[CostCategory.OUTPUT_TOKENS] || 0, { model: modelId });
+    // ONE authoritative pricing path: registry -> estimator. Categories stay
+    // semantic: input / cached input / output / reasoning are distinct; the
+    // total is their sum and is NEVER recorded as OUTPUT_TOKENS.
+    const reasoningTokens = observedReasoningTokens ?? 0;
+    const est = this.costEstimator.estimateModelCost(modelId, def.provider, inputTokens, outputTokens, cachedTokens, { reasoningTokens });
+    const providerCostUsd = Number(usage.costUsd ?? response.costUsd);
+    const hasProviderCost = Number.isFinite(providerCostUsd) && providerCostUsd >= 0;
+    const hasObservedUsage = observedInputTokens !== null && observedOutputTokens !== null;
+    const estimateIsPriced = est && est.breakdown && est.breakdown.pricingSource !== 'default';
+    // An unpriced fallback estimate must never masquerade as a calculated
+    // cost: without observed usage AND registry pricing there is no honest
+    // calculated figure, so it stays null (canonical record => unknown).
+    const calculatedCostUsd = hasObservedUsage && estimateIsPriced ? est.total : null;
+    const usageSource = response.usageSource || (hasObservedUsage ? 'provider_reported' : 'unknown');
+    const modelCall = createModelCallRecord({
+      runId, step: stepNumber, provider: response.provider || def.provider,
+      model: response.model || modelId, requestId: response.requestId,
+      providerRequestId: response.requestId, providerMetadata: response.providerMetadata,
+      usage: { inputTokens: observedInputTokens, outputTokens: observedOutputTokens, cachedTokens: observedCachedTokens, reasoningTokens: observedReasoningTokens },
+      usageSource,
+      plan, pricingSnapshot: this.modelRegistry.getPricing(modelId),
+      providerCostUsd: hasProviderCost ? providerCostUsd : null,
+      calculatedCostUsd,
+      latencyMs,
+      costSource: hasProviderCost ? 'provider_reported' : !hasObservedUsage || !estimateIsPriced ? 'unknown_estimate' : 'pricing_snapshot',
+    });
+    runtimeState.addModelCall(modelCall);
+    // Honest pricing provenance: token counts are OBSERVED (provider usage),
+    // but rates may be registry-unknown fallbacks. Never present a
+    // fallback-priced total as precisely metered.
+    if (est && est.breakdown && est.breakdown.pricingSource === 'default') ctrl.pricingUnknown = true;
+    runtimeState.budget.addCost(CostCategory.INPUT_TOKENS, est[CostCategory.INPUT_TOKENS] || 0, { model: modelId, callId: modelCall.callId });
+    runtimeState.budget.addCost(CostCategory.OUTPUT_TOKENS, est[CostCategory.OUTPUT_TOKENS] || 0, { model: modelId, callId: modelCall.callId });
     if (est[CostCategory.CACHED_INPUT_TOKENS]) {
-      runtimeState.budget.addCost(CostCategory.CACHED_INPUT_TOKENS, est[CostCategory.CACHED_INPUT_TOKENS], { model: modelId });
+      runtimeState.budget.addCost(CostCategory.CACHED_INPUT_TOKENS, est[CostCategory.CACHED_INPUT_TOKENS], { model: modelId, callId: modelCall.callId });
+    }
+    if (est.reasoning_tokens) {
+      runtimeState.budget.addCost('reasoning_tokens', est.reasoning_tokens, { model: modelId, callId: modelCall.callId });
+    }
+    // Keep the live budget aligned with the provider's authoritative charge
+    // without destroying the token-composition estimate used for explanation.
+    // The adjustment is explicit and can be positive or negative.
+    if (hasProviderCost) {
+      const reconciliation = modelCall.canonicalCostUsd - (modelCall.calculatedCostUsd || 0);
+      if (Math.abs(reconciliation) > 0.0000005) {
+        runtimeState.budget.addCost('provider_reconciliation', reconciliation, { model: modelId, providerReported: true, callId: modelCall.callId });
+      }
     }
     runtimeState.budget.addLatency(latencyMs);
-    this.costEstimator.recordActualCost(runId, CostCategory.OUTPUT_TOKENS, est.total, est.total, { model: modelId });
+    // Per-category actuals (not total-as-output): keeps cost accuracy honest.
+    this.costEstimator.recordActualCost(runId, CostCategory.INPUT_TOKENS, est[CostCategory.INPUT_TOKENS] || 0, est[CostCategory.INPUT_TOKENS] || 0, { model: modelId });
+    this.costEstimator.recordActualCost(runId, CostCategory.OUTPUT_TOKENS, est[CostCategory.OUTPUT_TOKENS] || 0, est[CostCategory.OUTPUT_TOKENS] || 0, { model: modelId });
+    if (est[CostCategory.CACHED_INPUT_TOKENS]) {
+      this.costEstimator.recordActualCost(runId, CostCategory.CACHED_INPUT_TOKENS, est[CostCategory.CACHED_INPUT_TOKENS], est[CostCategory.CACHED_INPUT_TOKENS], { model: modelId });
+    }
 
     ctrl.tokens.input += inputTokens;
     ctrl.tokens.output += outputTokens;
@@ -953,11 +1433,20 @@ class Orchestrator {
     ctrl.latency.avgStepMs = ctrl.latency.samples.reduce((a, b) => a + b, 0) / ctrl.latency.samples.length;
 
     this.telemetry.recordModelEvent(runId, EventType.RESPONSE_DONE, modelId, def.provider,
-      { input: inputTokens, output: outputTokens, cached: cachedTokens }, latencyMs, est.total,
-      { step: stepNumber, continuation });
+      { input: inputTokens, output: outputTokens, cached: cachedTokens }, latencyMs, modelCall.canonicalCostUsd,
+      { step: stepNumber, continuation, modelCall });
     this.telemetry.recordMetric(runId, 'model.latency', latencyMs, { model: modelId });
-    this.telemetry.recordMetric(runId, 'model.cost', est.total, { model: modelId });
-    this._pushSeries(runtimeState, { inputTokens, outputTokens, cachedTokens, cost: est.total, latencyMs });
+    this.telemetry.recordMetric(runId, 'model.cost', modelCall.canonicalCostUsd, { model: modelId, costSource: modelCall.costSource });
+    this._pushSeries(runtimeState, { inputTokens, outputTokens, cachedTokens, cost: modelCall.canonicalCostUsd, estimatedCost: est.total, providerCostUsd: hasProviderCost ? providerCostUsd : null, latencyMs });
+
+    this._emit(runId, EventType.MODEL_CALL_COMPLETED, {
+      step: stepNumber, model: modelId, provider: def.provider,
+      inputTokens, outputTokens, cachedTokens, reasoningTokens,
+      cost: modelCall.canonicalCostUsd, ...(hasProviderCost ? { providerCostUsd } : {}),
+      modelCall,
+      pricingSource: est.breakdown && est.breakdown.pricingSource,
+      latencyMs, continuation,
+    });
 
     this._emit(runId, cachedTokens > 0 ? EventType.CACHE_HIT : EventType.CACHE_MISS, {
       detail: cachedTokens > 0 ? `${cachedTokens} cached tokens reported by provider` : 'Provider call (no prompt caching on this route)',
@@ -968,11 +1457,31 @@ class Orchestrator {
 
     this._emitCost(runtimeState);
 
-    await this.cacheManager.set(cacheKey, {
-      text: response.text, toolCalls: response.toolCalls,
-      usage: { inputTokens, outputTokens: 0, cachedTokens: 0 },
-      model: modelId,
-    }, undefined, runId);
+    if (contentRetentionAllowed(runtimeState) && this.cacheManager) {
+      await this.cacheManager.set(cacheKey, {
+        text: response.text, toolCalls: response.toolCalls,
+        usage: { inputTokens, outputTokens: 0, cachedTokens: 0 },
+        model: modelId,
+      }, undefined, runId);
+    }
+
+    // L3 semantic store: pure answers only (no pending tool calls), so
+    // intermediate tool-loop turns are never reused as final answers.
+    // A run never serves its own entry (runId gate on lookup).
+    if (contentRetentionAllowed(runtimeState) && !continuation && this.cacheManager && typeof this.cacheManager.storeSemantic === 'function'
+        && response.text && !(response.toolCalls && response.toolCalls.length)) {
+      try {
+        await this.cacheManager.storeSemantic(runtimeState.task.objective, {
+          text: response.text, toolCalls: [],
+          usage: { inputTokens, outputTokens, cachedTokens },
+        }, {
+          fingerprint: plan.fingerprint, modelId,
+          tools: toolNamesForCache, runId,
+          tenantId: runtimeState.orgId || runtimeState.ownerId || 'default',
+          projectId: runtimeState.projectId || null,
+        });
+      } catch { /* semantic store is advisory */ }
+    }
 
     runtimeState.model.updateLatency(latencyMs);
     if (this.modelRegistry && typeof this.modelRegistry.recordObservation === 'function') {
@@ -989,9 +1498,9 @@ class Orchestrator {
 
   _nativeModelId(def, adapter) {
     // Registry IDs are catalog aliases. A model reaches the provider API only
-    // via its native ID (discovered models). Anything without a native mapping
-    // resolves to the provider's configured default in LIVE mode — never send
-    // a local alias to a real provider API.
+    // via its native ID. Live execution of an unmapped model is rejected
+    // upstream (model_resolution) — this fallback never silently substitutes
+    // the provider default for a reported selection.
     if (def && def.nativeId) return def.nativeId;
     if (adapter && adapter.providerId !== 'demo' && adapter.defaultModel) {
       return adapter.defaultModel;
@@ -1012,30 +1521,26 @@ class Orchestrator {
     }));
   }
 
-  async _buildPromptMessages(runtimeState, userMessage, stepNumber) {
-    const ctx = runtimeState.context;
-    const lines = [];
-    for (const item of (ctx.contextItems || []).slice(-12)) {
-      const extra = item.metadata && item.metadata.text ? `: ${String(item.metadata.text).slice(0, 800)}` : '';
-      lines.push(`- [${item.kind}/${item.status}] ${item.title}${extra}`);
-    }
-    let memLines = [];
-    if (this.memoryManager) {
+  // Canonical prompt assembly lives in ContextManager.compilePrompt — this
+  // wrapper only gathers live inputs (memory, tools, history) the manager
+  // does not own. There is exactly one message-assembly implementation.
+  async _buildPrompt(runtimeState, userMessage, stepNumber) {
+    let memoryItems = [];
+    if (contentRetentionAllowed(runtimeState) && this.memoryManager) {
       try {
-        const mem = await this.memoryManager.searchMemory(runtimeState, userMessage, ['working', 'longterm'], 4);
-        memLines = mem.map((m) => `- (${m.scope}) ${m.title}: ${String(m.snippet || '').slice(0, 300)}`);
+        memoryItems = await this.memoryManager.searchMemory(runtimeState, userMessage, ['working', 'longterm'], 4);
       } catch { /* memory is advisory */ }
     }
-    const toolNames = Array.from(runtimeState.tools.availableTools.values())
-      .filter((t) => t.status === 'enabled').map((t) => t.name);
-    const system = [
-      `You are the execution model for an adaptive agent runtime (task: ${runtimeState.task.objective}).`,
-      `Step ${stepNumber}. Answer concisely. When finished with no further actions, say so explicitly.`,
-      toolNames.length ? `Available tools: ${toolNames.join(', ')}. Use them via tool calls when they would help; otherwise answer directly.` : 'No tools available; answer directly.',
-      lines.length ? `Context:\n${lines.join('\n')}` : '',
-      memLines.length ? `Memory:\n${memLines.join('\n')}` : '',
-    ].filter(Boolean).join('\n\n');
-    return [{ role: 'system', content: system }, ...this.control(runtimeState.runId).history.slice(-10)];
+    const toolSpecs = await this._providerTools(runtimeState);
+    const history = (this.control(runtimeState.runId) && this.control(runtimeState.runId).history.slice(-10)) || [];
+    return this.contextManager.compilePrompt(runtimeState, {
+      userMessage, stepNumber, memoryItems, toolSpecs, history,
+    });
+  }
+
+  async _buildPromptMessages(runtimeState, userMessage, stepNumber) {
+    const { messages } = await this._buildPrompt(runtimeState, userMessage, stepNumber);
+    return messages;
   }
 
   _emitCost(runtimeState, sample = null) {
@@ -1068,7 +1573,13 @@ class Orchestrator {
     ctrl.series.push({
       t: now(), step: runtimeState.execution.currentStep,
       inputTokens: sample.inputTokens, outputTokens: sample.outputTokens, cachedTokens: sample.cachedTokens,
-      cost: Math.round(runtimeState.budget.currentSpend * 1e6) / 1e6,
+      // `cost` remains the cumulative run series value for the console;
+      // `callCost` is the per-provider-call value used by accounting.
+      cost: Math.round((sample.cost ?? runtimeState.budget.currentSpend) * 1e6) / 1e6,
+      ...(sample.estimatedCost !== undefined ? { estimatedCost: Math.round(Number(sample.estimatedCost || 0) * 1e6) / 1e6 } : {}),
+      cumulativeCost: Math.round(runtimeState.budget.currentSpend * 1e6) / 1e6,
+      ...(sample.cost !== undefined ? { callCost: Math.round(Number(sample.cost || 0) * 1e6) / 1e6 } : {}),
+      ...(sample.providerCostUsd !== undefined ? { providerCostUsd: sample.providerCostUsd } : {}),
       latencyMs: sample.latencyMs, cacheHitRate: Math.round((stats.hitRate || 0) * 1000) / 1000,
       contextUtil: Math.round(runtimeState.context.getUtilization() * 1000) / 1000,
       model: runtimeState.model.currentModel,
@@ -1117,7 +1628,14 @@ class Orchestrator {
         currentTokens: contextEval.currentTokens,
         maxTokens: contextEval.maxTokens,
       });
-      await this.contextManager.compressContext(runtimeState, Math.floor(runtimeState.context.maximumTokens * 0.6), runtimeState.policy);
+      if (runtimeState.policy && runtimeState.policy.allowCompaction === false) {
+        this._emit(runId, EventType.OPTIMIZATION_TRIGGERED, {
+          trigger: { type: 'context_compaction_skipped', severity: 'info' },
+          reason: 'Context compaction disabled for this run — utilization will keep growing',
+        });
+      } else {
+        await this.contextManager.compressContext(runtimeState, Math.floor(runtimeState.context.maximumTokens * 0.6), runtimeState.policy);
+      }
     }
   }
 
@@ -1147,10 +1665,12 @@ class Orchestrator {
     const excluded = new Set(exclude || []);
     excluded.add(runtimeState.model.currentModel);
     const models = await this.modelRegistry.getModels();
+    const liveMode = ((this.control(runId) && this.control(runId).mode) || this.config.mode) === 'live';
     const healthyModels = models.filter((m) =>
       m.status === 'healthy' &&
       runtimeState.policy.isModelAllowed(m.id) &&
-      !excluded.has(m.id)
+      !excluded.has(m.id) &&
+      (!liveMode || m.nativeId)
     );
     if (healthyModels.length === 0) return false;
     const { selectedModel, decision } = await this.modelRouter.route(
@@ -1158,6 +1678,30 @@ class Orchestrator {
     );
     await this._applyModelSwitch(runtimeState, selectedModel, healthyModels, decision, `Failover: ${reason}`, { force: true });
     return true;
+  }
+
+  // Request-time availability: the provider authoritatively refused this
+  // model id (unknown, withdrawn, or not served for the current tier/key).
+  // Marks the registry so routing excludes it process-wide. Deliberate and
+  // explicit — recordObservation() by contract never does this for transient
+  // failures. Registry is per-process memory, so the mark resets on restart.
+  async _markModelUnavailable(modelId, error) {
+    try {
+      if (!modelId || !this.modelRegistry || typeof this.modelRegistry.getModel !== 'function') return false;
+      const m = await this.modelRegistry.getModel(modelId);
+      if (!m || m.status === 'unavailable') return false;
+      if (typeof this.modelRegistry.updateModel !== 'function') return false;
+      await this.modelRegistry.updateModel(modelId, {
+        status: 'unavailable',
+        unavailableReason: String((error && error.message) || error || 'model_unavailable').slice(0, 300),
+        unavailableAt: now(),
+        unavailableCode: (error && error.code) || 'model_unavailable',
+        degradedByObserver: false,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async _failoverLargerContext(runtimeState) {
@@ -1303,10 +1847,45 @@ class Orchestrator {
 
   // ---------- completion / failure / cancellation / retry ----------
 
+  // Lifecycle: CREATED -> RUNNING -> COMPLETED/FAILED/CANCELLED -> PERSISTED
+  // -> REMOVED FROM ACTIVE MEMORY. Retirement happens only AFTER the terminal
+  // event + snapshot + sink persistence, so replay/history survive.
+  _retireRun(runId) {
+    const runtimeState = this.activeRuns.get(runId);
+    const ctrl = this.runControl.get(runId);
+    if (!runtimeState || !ctrl) return;
+    // Disarm deadline before moving (no timer firing on retired runs).
+    try {
+      if (ctrl.deadlineTimer) { clearTimeout(ctrl.deadlineTimer); ctrl.deadlineTimer = null; }
+    } catch {}
+    ctrl.running = false;
+    this.activeRuns.delete(runId);
+    this.runControl.delete(runId);
+    this.terminalRuns.set(runId, { runtimeState, control: ctrl, endedAt: Date.now(), status: runtimeState.status });
+    this.terminalOrder.push(runId);
+    // Bounded terminal history (no unbounded memory growth).
+    while (this.terminalOrder.length > this.maxTerminalRetained) {
+      const oldest = this.terminalOrder.shift();
+      if (oldest && this.terminalRuns.has(oldest) && oldest !== runId) {
+        this.terminalRuns.delete(oldest);
+        // Final eviction clears per-run telemetry/cache/events/checkpoints.
+        // Persisted FileStore history remains the durable record.
+        try { this.telemetry.clearRun(oldest); } catch {}
+        try { if (this.cacheManager && typeof this.cacheManager.clearRun === 'function') this.cacheManager.clearRun(oldest); } catch {}
+        try { this.checkpointManager.clearRun(oldest); } catch {}
+        // Keep event logs for replay within retention; prune only on overflow.
+      }
+    }
+    // Completed runs must not hold live SSE sockets.
+    try { eventBus.closeSubscribers(runId); } catch {}
+  }
+
   async _completeRun(runtimeState, evidence = {}) {
     const runId = runtimeState.runId;
-    const ctrl = this.control(runId);
+    // Idempotent: multiple terminal transitions collapse to the first.
     if (TERMINAL.has(runtimeState.status)) return runtimeState;
+    if (!this.activeRuns.has(runId)) return runtimeState;
+    const ctrl = this.liveControl(runId) || this.control(runId);
     // A step may finish in OBSERVING/WAITING_FOR_TOOL; route back explicitly.
     if (runtimeState.status === TaskStatus.OBSERVING || runtimeState.status === TaskStatus.WAITING_FOR_TOOL) {
       this.transition(runtimeState, TaskStatus.EXECUTING);
@@ -1326,15 +1905,19 @@ class Orchestrator {
     this.telemetry.recordEvent(runId, new TelemetryEvent(
       runId, EventType.RUN_COMPLETED, { summary: 'Completed' }, { status: 'completed' }
     ));
+    // Terminal guarantees: final state -> terminal event -> persistence -> cleanup.
     this._recordRunEnd(runtimeState, TaskStatus.COMPLETED);
-    this.log.info('run completed', { runId, steps: runtimeState.execution.currentStep, spent: runtimeState.budget.currentSpend });
+    this.log.info('run completed', { runId, steps: runtimeState.execution.currentStep, spent: runtimeState.budget.currentSpend, model: runtimeState.model.currentModel });
+    this._retireRun(runId);
     return runtimeState;
   }
 
   async _failRun(runtimeState, error) {
-    const runId = runtimeState.runId;
+    const runId = runtimeState ? runtimeState.runId : null;
+    if (!runId) return runtimeState;
     if (TERMINAL.has(runtimeState.status)) return runtimeState;
-    const ctrl = this.control(runId);
+    if (!this.activeRuns.has(runId)) return runtimeState;
+    const ctrl = this.liveControl(runId) || this.control(runId);
     // Cancellation wins over failure: if an abort was requested, the run was
     // cancelled — never report it as failed.
     if (ctrl && ctrl.abort) {
@@ -1342,13 +1925,15 @@ class Orchestrator {
     }
     const code = (error && error.code) || 'unknown';
     try {
-      // Legal failure edge from any active state.
-      const from = this.control(runId)?.machine.getState();
-      const allowed = [TaskStatus.EXECUTING, TaskStatus.OBSERVING, TaskStatus.WAITING_FOR_TOOL, TaskStatus.REOPTIMIZING, TaskStatus.PLANNING, TaskStatus.CONTEXT_BUILD, TaskStatus.MODEL_SELECT, TaskStatus.RETRYING, TaskStatus.PAUSED, TaskStatus.CREATED];
-      if (allowed.includes(from)) this.transition(runtimeState, TaskStatus.FAILED);
-      else runtimeState.updateStatus(TaskStatus.FAILED);
-    } catch {
+      this.transition(runtimeState, TaskStatus.FAILED);
+    } catch (e) {
+      // transition() already rejects invalid edges; FAILED is reachable from
+      // every active state via the StateMachine, so a throw here means a
+      // programming error — record it and force the terminal state explicitly
+      // only as a last resort (never silently).
+      this.log.warn('failure transition rejected', { runId, from: ctrl?.machine?.getState(), error: String((e && e.message) || e).slice(0, 200) });
       runtimeState.updateStatus(TaskStatus.FAILED);
+      try { if (ctrl) ctrl.machine.currentState = TaskStatus.FAILED; } catch {}
     }
 
     const safe = error instanceof ProviderError ? error.message : String((error && error.message) || error).slice(0, 500);
@@ -1363,23 +1948,32 @@ class Orchestrator {
     ));
     this._recordRunEnd(runtimeState, TaskStatus.FAILED);
     this.log.warn('run failed', { runId, code, error: safe });
+    this._retireRun(runId);
     return runtimeState;
   }
 
   async _cancelledRun(runtimeState, reason) {
     const runId = runtimeState.runId;
     if (TERMINAL.has(runtimeState.status)) return runtimeState;
+    if (!this.activeRuns.has(runId)) return runtimeState;
     try { this.transition(runtimeState, TaskStatus.CANCELLED); }
-    catch { runtimeState.updateStatus(TaskStatus.CANCELLED); }
+    catch (e) {
+      this.log.warn('cancel transition rejected', { runId, error: String((e && e.message) || e).slice(0, 200) });
+      runtimeState.updateStatus(TaskStatus.CANCELLED);
+      try { const c = this.control(runId); if (c) c.machine.currentState = TaskStatus.CANCELLED; } catch {}
+    }
     this._emit(runId, EventType.RUN_CANCELLED, { reason });
     this._recordRunEnd(runtimeState, TaskStatus.CANCELLED);
+    this.log.info('run cancelled', { runId, reason });
+    this._retireRun(runId);
     return runtimeState;
   }
 
   async cancelRun(runId, reason = 'User cancelled') {
+    if (this.terminalRuns.has(runId)) return false;
     const runtimeState = this.activeRuns.get(runId);
     if (!runtimeState) return false;
-    const ctrl = this.control(runId);
+    const ctrl = this.liveControl(runId);
     if (!ctrl || TERMINAL.has(runtimeState.status)) return false;
 
     // Real cancellation: flag the loop, abort in-flight provider/tool calls,
@@ -1398,24 +1992,98 @@ class Orchestrator {
     return true;
   }
 
-  async retryRun(runId) {
+  // Last recovery plan per run (diagnostics for API/UI; never throws).
+  lastRecoveryPlan(runId) {
+    const ctrl = this.control(runId);
+    return (ctrl && ctrl.lastRecoveryPlan) || null;
+  }
+
+  async retryRun(runId, options = {}) {
+    // Synchronous re-entry guard: two concurrent retries of the same run
+    // must not resurrect/duplicate it. The flag is set before any await.
+    const existingCtrl = this.runControl.get(runId) || (this.terminalRuns.get(runId) || {}).control || null;
+    if (existingCtrl && existingCtrl.recoveryInProgress) return false;
+    if (existingCtrl) existingCtrl.recoveryInProgress = true;
+    try {
+      return await this._retryRunInner(runId, options);
+    } finally {
+      try {
+        const c = this.control(runId);
+        if (c) c.recoveryInProgress = false;
+      } catch {}
+    }
+  }
+
+  async _retryRunInner(runId, options = {}) {
+    // Failed runs retire to history but stay retryable: resurrect to active.
+    if (this.terminalRuns.has(runId)) {
+      const term = this.terminalRuns.get(runId);
+      if (!term || term.status !== TaskStatus.FAILED) return false;
+      if (term.runtimeState.budget.isBudgetExceeded()) {
+        return false;
+      }
+      // Resurrect: move back to active with preserved state.
+      this.terminalRuns.delete(runId);
+      this.terminalOrder = this.terminalOrder.filter((id) => id !== runId);
+      this.activeRuns.set(runId, term.runtimeState);
+      this.runControl.set(runId, term.control);
+    }
     const runtimeState = this.activeRuns.get(runId);
     if (!runtimeState) return false;
-    const ctrl = this.control(runId);
+    const ctrl = this.liveControl(runId);
     if (!ctrl || runtimeState.status !== TaskStatus.FAILED) return false;
+    if (ctrl.running) return false;
     if (runtimeState.budget.isBudgetExceeded()) {
       this._emit(runId, EventType.RUN_FAILED, { error: 'Cannot retry: budget exhausted', code: 'budget_exceeded' });
       return false;
     }
 
-    // Controlled retry: preserve valid state, resume after the last completed
-    // checkpoint. Idempotency keys are step-derived, so re-executed tool calls
-    // return stored results instead of duplicating irreversible operations.
-    const lastCheckpoint = this.checkpointManager.getLastCheckpoint(runId);
-    let fromStep = runtimeState.execution.currentStep;
-    if (lastCheckpoint && typeof lastCheckpoint.stepNumber === 'number') {
-      fromStep = lastCheckpoint.stepNumber;
+    // ---- Real recovery: validate checkpoint, inspect last side effect,
+    // consult idempotency, decide, restore cursor/state. ----
+    this._emit(runId, EventType.EXECUTION_RECOVERY_STARTED, { note: 'Evaluating recovery...' });
+    const idempotencyStore = (this.toolExecutor && this.toolExecutor.idempotencyStore) || null;
+    let recovery;
+    try {
+      recovery = await this.recoveryService.recover({
+        runId,
+        runtimeState,
+        ctrl,
+        idempotencyStore,
+        toolRecord: options.toolRecord || null,
+        checkpointId: options.checkpointId || null,
+      });
+    } catch (e) {
+      this._emit(runId, EventType.EXECUTION_RECOVERY_BLOCKED, {
+        reason: `recovery evaluation failed: ${String((e && e.message) || e).slice(0, 200)}`,
+      });
+      return false;
     }
+    ctrl.lastRecoveryPlan = {
+      action: recovery.plan.action,
+      reason: recovery.plan.reason,
+      cursor: recovery.plan.cursor,
+      checkpointId: recovery.checkpoint ? recovery.checkpoint.checkpointId : null,
+      at: now(),
+    };
+
+    if (recovery.plan.action === 'ask_user' || recovery.plan.action === 'mark_unknown' || recovery.plan.action === 'unrecoverable') {
+      // Do NOT re-run blindly. The run stays FAILED (auditable) with a
+      // recovery_blocked event explaining exactly what is needed. An
+      // operator can resolve the underlying state and retry again.
+      this._emit(runId, EventType.EXECUTION_RECOVERY_BLOCKED, {
+        action: recovery.plan.action,
+        reason: recovery.plan.reason,
+        checkpointId: ctrl.lastRecoveryPlan.checkpointId,
+      });
+      return false;
+    }
+
+    const rawCursor = Number.isFinite(recovery.cursor) ? recovery.cursor
+      : (Number.isFinite(recovery.plan.cursor) ? recovery.plan.cursor : null);
+    // Cursor null (no checkpoint) keeps the preserved live cursor so step
+    // numbers and step-scoped idempotency keys stay stable.
+    const cursor = rawCursor !== null ? rawCursor : (runtimeState.execution.currentStep || 0);
+    const hasModel = !!runtimeState.model.currentModel;
     try {
       this.transition(runtimeState, TaskStatus.RETRYING);
     } catch {
@@ -1424,18 +2092,35 @@ class Orchestrator {
     ctrl.abort = false;
     ctrl.abortController = new AbortController();
     ctrl.retries = 0;
-    this._emit(runId, EventType.EXECUTION_RETRY, {
-      step: fromStep,
-      fromCheckpoint: lastCheckpoint ? lastCheckpoint.checkpointId : null,
-      preservedMessages: ctrl.messages.length,
-      strategy: runtimeState.model.currentModel ? 'resume' : 'restart',
+    ctrl.recoveryAttempts = (ctrl.recoveryAttempts || 0) + 1;
+    // Clear a stale in-flight marker from the crashed attempt: the plan has
+    // already accounted for it (skip => proven completed; retry_step =>
+    // safe). Keeping it would mislabel the resumed execution.
+    if (ctrl.lastToolEffect && ctrl.lastToolEffect.state === 'in_flight') {
+      ctrl.lastToolEffect = { ...ctrl.lastToolEffect, state: 'unknown', note: 'superseded by recovery plan' };
+    }
+    this._emit(runId, EventType.EXECUTION_RECOVERED, {
+      action: recovery.plan.action,
+      reason: recovery.plan.reason,
+      cursor,
+      checkpointId: ctrl.lastRecoveryPlan.checkpointId,
+      preservedSpend: runtimeState.budget.currentSpend,
     });
-    // Entry states are handled by _executeRun: resume (model exists) re-enters
-    // EXECUTING; restart (nothing preserved) replays setup via RETRYING→PLANNING.
+    this._emit(runId, EventType.EXECUTION_RETRY, {
+      step: cursor,
+      fromCheckpoint: ctrl.lastRecoveryPlan.checkpointId,
+      preservedMessages: ctrl.messages.length,
+      strategy: hasModel ? 'resume' : 'restart',
+      recoveryAction: recovery.plan.action,
+    });
+    // Entry states are handled by _executeRun: resume (model exists)
+    // re-enters at EXECUTING from the cursor; restart (nothing preserved,
+    // e.g. failure before model selection) replays setup via
+    // RETRYING→PLANNING. Accounting (spend, tokens, event seq) is preserved.
     ctrl.running = true;
     this._armDeadline(runtimeState);
     const msg = ctrl.lastUserMessage || runtimeState.task.objective;
-    ctrl.completion = this._executeRun(runtimeState, msg, { resume: true })
+    ctrl.completion = this._executeRun(runtimeState, msg, { resume: hasModel, startStep: hasModel ? cursor : 0 })
       .catch((error) => this._failRun(runtimeState, error))
       .finally(() => { ctrl.running = false; this._disarmDeadline(runId); });
     return true;
@@ -1444,7 +2129,7 @@ class Orchestrator {
   // ---------- readers ----------
 
   getRunState(runId) {
-    const runtimeState = this.activeRuns.get(runId);
+    const runtimeState = this.getRun(runId);
     if (!runtimeState) return null;
     return runtimeState.toSnapshot();
   }
@@ -1469,6 +2154,19 @@ class Orchestrator {
       activeModelId: r.model.currentModel,
       budget: r.budget.maximumCost,
       spent: Math.round(r.budget.currentSpend * 1e6) / 1e6,
+      ownerId: r.ownerId || null,
+      orgId: r.orgId || null,
+      projectId: r.projectId || null,
+      privacyMode: r.privacyMode || 'standard',
+    }));
+  }
+
+  getTerminalRuns() {
+    return Array.from(this.terminalRuns.entries()).map(([id, t]) => ({
+      id,
+      status: frontendStatus(t.status),
+      internalStatus: t.status,
+      endedAt: new Date(t.endedAt).toISOString(),
     }));
   }
 
@@ -1476,6 +2174,8 @@ class Orchestrator {
     this._disarmDeadline(runId);
     this.activeRuns.delete(runId);
     this.runControl.delete(runId);
+    this.terminalRuns.delete(runId);
+    this.terminalOrder = this.terminalOrder.filter((id) => id !== runId);
     this.checkpointManager.clearRun(runId);
     this.telemetry.clearRun(runId);
     if (this.cacheManager && typeof this.cacheManager.clearRun === 'function') {

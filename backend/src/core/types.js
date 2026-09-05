@@ -13,6 +13,8 @@ const TaskStatus = Object.freeze({
   FAILED: 'failed',
   CANCELLED: 'cancelled',
   PAUSED: 'paused',
+  PAUSING: 'pausing',
+  RESUMING: 'resuming',
   RETRYING: 'retrying'
 });
 
@@ -72,7 +74,30 @@ const EventType = Object.freeze({
   PRICE_UPDATED: 'price.updated',
   CHANGE_RECORDED: 'change.recorded',
   RESPONSE_DELTA: 'response.delta',
-  RESPONSE_DONE: 'response.done'
+  RESPONSE_DONE: 'response.done',
+  MODEL_CALL_COMPLETED: 'model.call_completed',
+  // Session 3 — agent execution, approvals, changesets, verification,
+  // episodes, plans, recovery (extends the canonical vocabulary).
+  PLAN_CREATED: 'plan.created',
+  PLAN_UPDATED: 'plan.updated',
+  TOOL_APPROVAL_REQUIRED: 'tool.approval_required',
+  TOOL_APPROVED: 'tool.approved',
+  TOOL_DENIED: 'tool.denied',
+  TOOL_TIMED_OUT: 'tool.timed_out',
+  CHANGESET_CREATED: 'changeset.created',
+  CHANGESET_APPROVAL_REQUIRED: 'changeset.approval_required',
+  CHANGESET_APPLIED: 'changeset.applied',
+  CHANGESET_ROLLED_BACK: 'changeset.rolled_back',
+  VERIFICATION_STARTED: 'verification.started',
+  VERIFICATION_PASSED: 'verification.passed',
+  VERIFICATION_FAILED: 'verification.failed',
+  EXECUTION_RECOVERY_STARTED: 'execution.recovery_started',
+  EXECUTION_RECOVERED: 'execution.recovered',
+  EXECUTION_RECOVERY_BLOCKED: 'execution.recovery_blocked',
+  EPISODE_STARTED: 'episode.started',
+  EPISODE_COMPLETED: 'episode.completed',
+  APPROVAL_REQUESTED: 'approval.requested',
+  APPROVAL_DECIDED: 'approval.decided'
 });
 
 const DecisionType = Object.freeze({

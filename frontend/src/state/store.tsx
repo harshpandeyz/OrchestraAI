@@ -1,15 +1,27 @@
 import React, { createContext, useContext, useMemo, useReducer } from 'react';
-import type { ChatMessage, ConnStatus, MemoryItem, ModelInfo, Run, RuntimeSnapshot, StreamEnvelope } from '../types';
+import type { ChatMessage, ConnStatus, EvaluationRecord, MemoryItem, ModelInfo, Run, RuntimeSnapshot, StreamEnvelope } from '../types';
 
 // ---------- Pure event application (tested) ----------
 let localSeq = 100000;
 const stamp = () => new Date().toISOString();
 
 export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope): RuntimeSnapshot {
+  const t = env.type, p = env.payload || {};
+  // Text deltas are the highest-frequency event. Apply them with structural
+  // sharing so the large snapshot, routing tables, and telemetry arrays are
+  // not deep-cloned for every provider chunk. The stream hook also coalesces
+  // adjacent chunks to keep React work bounded.
+  if (t === 'response.delta') {
+    return {
+      ...snap,
+      lastSeq: Math.max(snap.lastSeq, env.seq),
+      updatedAt: env.ts,
+      messages: appendDelta(snap.messages, String(p.delta || '')),
+    };
+  }
   const next: RuntimeSnapshot = JSON.parse(JSON.stringify(snap));
   next.lastSeq = Math.max(next.lastSeq, env.seq);
   next.updatedAt = env.ts;
-  const t = env.type, p = env.payload || {};
   const pushTrace = (label: string, status = 'done', extra: any = {}) => {
     next.trace = [...next.trace.slice(-200), { seq: env.seq, ts: env.ts, type: t, label, status, ...extra }];
   };
@@ -34,7 +46,7 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
     case 'execution.resumed': pushTrace('Execution resumed', 'running'); break;
     case 'context.added': if (p.tokens) next.context.usedTokens += p.tokens; pushTrace(`Context added: ${p.title || p.itemId || ''}`); break;
     case 'context.removed': if (p.tokens) next.context.usedTokens = Math.max(0, next.context.usedTokens - p.tokens); pushTrace(`Context removed: ${p.title || ''}`); break;
-    case 'context.limit_warning': pushTrace(`Context near limit (${((p.utilization || 0) * 100).toFixed(0)}%)`, 'error'); pushChange('updated', '↻ Context near limit'); break;
+    case 'context.limit_warning': pushTrace(`Context near limit (${((p.utilization || 0) * 100).toFixed(0)}%)`, 'error'); pushChange('updated', 'Context near limit'); break;
     case 'context.compressed':
       if (p.reclaimedTokens) next.context.usedTokens = Math.max(0, next.context.usedTokens - p.reclaimedTokens);
       pushTrace(p.detail || 'Context compressed', 'done'); pushChange('updated', `↻ Context compressed −${((p.reclaimedTokens || 0) / 1000).toFixed(1)}k tokens`); break;
@@ -78,9 +90,15 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
     case 'routing.evaluated':
       if (Array.isArray(p.candidates) && p.candidates.length && typeof p.candidates[0] === 'object') {
         next.routing.candidates = p.candidates.map((c: any) => ({
-          modelId: c.modelId || c.id, score: c.score || 0, costUsd: c.estimatedCost || c.costUsd || 0,
-          latencyMs: c.avgLatencyMs || c.latencyMs || 0,
+          modelId: c.modelId || c.id, score: c.score || 0, costUsd: c.estimatedCost ?? c.costUsd ?? null,
+          latencyMs: c.avgLatencyMs ?? c.latencyMs ?? null,
           factors: { quality: c.quality || 0, cost: c.cost || 0, latency: c.latency || 0, reliability: c.reliability || 0, contextFit: c.contextFit || 0, switchCost: c.switchCost || 0 },
+          predictedSuccess: c.predictedSuccess ?? null, taskFitScore: c.taskFitScore ?? null,
+          toolCapabilityScore: c.toolCapabilityScore ?? null, expectedCostUsd: c.expectedCostUsd ?? null,
+          expectedLatencyMs: c.expectedLatencyMs ?? null, taskCategory: c.taskCategory ?? null,
+          predictionConfidence: c.predictionConfidence || 'none', predictionSamples: c.predictionSamples || 0,
+          reasons: Array.isArray(c.reasons) ? c.reasons : [],
+          ...(c.excluded ? { excluded: c.excluded, exclusionReason: c.exclusionReason || null } : {}),
         }));
       }
       pushTrace(p.note || 'Routing re-evaluated', 'running'); break;
@@ -95,32 +113,37 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
     case 'tool.completed':
     case 'tool.finished': {
       const tn = p.tool || p.toolName;
-      const ok = (p.status || 'success') !== 'failed';
-      next.tools = next.tools.map(x => x.name === tn ? { ...x, lastStatus: ok ? 'success' : 'failed', calls: p.deduped ? x.calls : x.calls + 1 } : x);
+      const rawStatus = p.status || 'success';
+      const ok = rawStatus === 'success';
+      // Preserve canonical outcome (timed_out/cancelled/…) — never collapse
+      // a timeout into generic failure.
+      const lastStatus = rawStatus === 'success' ? 'success' : rawStatus === 'failed' ? 'failed' : rawStatus;
+      next.tools = next.tools.map(x => x.name === tn ? { ...x, lastStatus, calls: p.deduped ? x.calls : x.calls + 1 } : x);
       if (p.durationMs) {
         next.latency.toolMs = p.durationMs;
         next.latency.samples = [...next.latency.samples.slice(-40), p.durationMs];
       }
       pushTrace(`${tn}: ${String(p.status || 'success').toUpperCase()} (${((p.durationMs || 0) / 1000).toFixed(1)}s)${p.deduped ? ' [idempotent replay]' : ''}`, ok ? 'done' : 'error');
       next.messages = [...next.messages.slice(-200), { id: `sys-${env.seq}`, role: 'tool', content: `${tn}: ${String(p.status || 'success').toUpperCase()} (${((p.durationMs || 0) / 1000).toFixed(1)}s)`, ts: env.ts }];
-      if (!ok) pushChange('updated', '↻ Tool failed — observed, continuing');
+      if (!ok) pushChange('updated', 'Tool failed — observed, continuing');
       break;
     }
     case 'tool.failed': {
       const tn = p.tool || p.toolName;
-      next.tools = next.tools.map(x => x.name === tn ? { ...x, lastStatus: 'failed' } : x);
+      const lastStatus = p.status && p.status !== 'failed' ? p.status : 'failed';
+      next.tools = next.tools.map(x => x.name === tn ? { ...x, lastStatus } : x);
       if (p.durationMs) {
         next.latency.toolMs = p.durationMs;
         next.latency.samples = [...next.latency.samples.slice(-40), p.durationMs];
       }
       pushTrace(`${tn}: FAILED — ${p.error || p.code || ''}`, 'error');
       next.messages = [...next.messages.slice(-200), { id: `sys-${env.seq}`, role: 'tool', content: `${tn}: FAILED — ${p.error || p.code || ''}`, ts: env.ts }];
-      pushChange('updated', '↻ Tool failed — observed, continuing');
+      pushChange('updated', 'Tool failed — observed, continuing');
       break;
     }
-    case 'response.delta':
-      next.messages = appendDelta(next.messages, String(p.delta || ''));
-      break;
+    // NOTE: 'response.delta' is handled by the structural-sharing fast path
+    // at the top of this function, not here — keep it that way so the hot
+    // path never pays for a deep clone.
     case 'response.done': {
       next.messages = finalizeStream(next.messages, String(p.full || ''));
       if (p.tokens && typeof p.tokens === 'object') {
@@ -141,13 +164,13 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
       // The live event is recorded in `recent` and real savedUsd is accumulated.
       next.cache.recent = [{ type: 'cache.hit', ts: env.ts, detail: p.detail || 'Cache hit' }, ...next.cache.recent].slice(0, 20);
       if (typeof p.savedUsd === 'number') next.cache.savedUsd += p.savedUsd;
-      pushChange('updated', '↻ Cache hit'); break;
+      pushChange('updated', 'Cache hit'); break;
     case 'cache.miss':
       next.cache.recent = [{ type: 'cache.miss', ts: env.ts, detail: p.detail || 'Cache miss' }, ...next.cache.recent].slice(0, 20); break;
     case 'cache.invalidated':
       next.cache.state = 'COOLING';
       next.cache.recent = [{ type: 'cache.invalidated', ts: env.ts, detail: p.detail || 'Cache invalidated' }, ...next.cache.recent].slice(0, 20);
-      pushChange('updated', '↻ Cache invalidated'); break;
+      pushChange('updated', 'Cache invalidated'); break;
     case 'cost.updated':
       if (p.spentUsd !== undefined) next.cost.spentUsd = p.spentUsd;
       if (p.projectedUsd !== undefined) next.cost.projectedUsd = p.projectedUsd;
@@ -155,10 +178,10 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
       pushTrace(`Cost updated: $${(p.spentUsd || 0).toFixed(3)}`); break;
     case 'budget.warning':
       pushTrace(`Budget warning: $${(p.spent || 0).toFixed(3)} / $${(p.budget || 0).toFixed(3)}`, 'error');
-      pushChange('updated', '↻ Budget warning'); break;
+      pushChange('updated', 'Budget warning'); break;
     case 'budget.exceeded':
       pushTrace(`Budget exceeded: $${(p.spent || 0).toFixed(3)} / $${(p.budget || 0).toFixed(3)}`, 'error');
-      pushChange('updated', '↻ Budget exceeded'); break;
+      pushChange('updated', 'Budget exceeded'); break;
     case 'price.updated':
       pushTrace(`Price updated: ${p.modelId || ''}`, 'done'); pushChange('updated', `↻ Price updated: ${p.modelId || ''}`); break;
     case 'model.price_changed':
@@ -175,9 +198,32 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
     case 'execution.step_completed': pushTrace(`Step ${p.step || ''} completed`); break;
     case 'execution.retry': pushTrace(`Retrying (attempt ${p.attempt || ''})`, 'running'); break;
     case 'execution.failed': pushTrace(`Step failed: ${p.error || ''}`, 'error'); break;
+    // Session 3 execution events: trace + headline. The authoritative
+    // plan/approval/changeset/episode state arrives via snapshot.execution;
+    // events never reconstruct it locally (no duplicated source of truth).
+    case 'plan.created': pushTrace(`Plan created (${p.steps || ''} steps)`); pushChange('added', `+ Plan created`); break;
+    case 'plan.updated': pushTrace(`Plan updated (v${p.version || ''})`); pushChange('updated', '↻ Plan updated'); break;
+    case 'tool.approval_required': pushTrace(`Approval required: ${p.tool || ''} (${p.risk || ''})`, 'running'); pushChange('added', `+ Approval required: ${p.tool || ''}`); break;
+    case 'tool.approved': pushTrace(`Approved: ${p.actionType || p.tool || ''}`); break;
+    case 'tool.denied': pushTrace(`Denied: ${p.actionType || p.tool || ''}`, 'error'); break;
+    case 'tool.timed_out': pushTrace(`Timed out: ${p.tool || ''}`, 'error'); pushChange('updated', 'Tool timed out — recorded, not retried blindly'); break;
+    case 'approval.requested': pushTrace(`Approval requested: ${p.actionType || ''}`, 'running'); pushChange('added', `+ Approval requested`); break;
+    case 'approval.decided': pushTrace(`Approval ${p.decision || ''}: ${p.actionType || ''}`); break;
+    case 'changeset.created': pushTrace(`Changes proposed (${(p.files || []).length || ''} files)`); pushChange('added', '+ Changes proposed'); break;
+    case 'changeset.approval_required': pushTrace('Changeset waiting for approval', 'running'); break;
+    case 'changeset.applied': pushTrace(`Changes applied (${p.additions || 0}+/${p.deletions || 0}-)`); pushChange('updated', `↻ Changes applied`); break;
+    case 'changeset.rolled_back': pushTrace('Changes rolled back'); pushChange('updated', '↻ Changes rolled back'); break;
+    case 'verification.started': pushTrace(`Verification started (${p.origin || ''})`, 'running'); break;
+    case 'verification.passed': pushTrace(`Verified: ${p.summary || ''}`); pushChange('retained', `→ Verified: ${String(p.summary || '').slice(0, 80)}`); break;
+    case 'verification.failed': pushTrace(`Verification failed: ${p.summary || ''}`, 'error'); pushChange('updated', 'Verification failed — see evidence'); break;
+    case 'episode.started': pushTrace(p.parentEpisodeId ? 'Continuation started (new episode, same run)' : 'Episode started'); break;
+    case 'episode.completed': pushTrace('Episode completed'); break;
+    case 'execution.recovery_started': pushTrace('Recovery started', 'running'); break;
+    case 'execution.recovered': pushTrace('Recovered'); break;
+    case 'execution.recovery_blocked': pushTrace('Recovery needs your decision (unknown side effects)', 'error'); pushChange('updated', 'Recovery blocked — review required'); break;
     case 'optimization.triggered': pushTrace('Optimization triggered', 'running'); break;
     case 'optimization.completed': pushTrace('Optimization completed'); break;
-    case 'run.completed': next.status = 'completed'; pushTrace(p.summary ? String(p.summary).slice(0, 120) : 'Task completed'); pushChange('retained', '→ Run completed'); break;
+    case 'run.completed': next.status = 'completed'; pushTrace(p.summary ? String(p.summary).slice(0, 120) : 'Task completed'); pushChange('retained', 'Run completed'); break;
     case 'run.failed': next.status = 'failed'; pushTrace(p.error || p.reason || 'Run failed', 'error'); break;
     case 'run.cancelled': next.status = 'cancelled'; pushTrace('Run cancelled', 'error'); break;
     case 'change.recorded': pushChange(p.kind || 'updated', p.label || 'Changed'); break;
@@ -189,34 +235,62 @@ export function applyEventToSnapshot(snap: RuntimeSnapshot, env: StreamEnvelope)
 const MAX_MESSAGES = 300;
 function appendDelta(msgs: ChatMessage[], delta: string): ChatMessage[] {
   const last = msgs[msgs.length - 1];
-  if (last && last.role === 'assistant' && (last.meta as any)?.streaming) {
+  if (last && last.role === 'assistant' && last.meta?.streaming) {
     return [...msgs.slice(-MAX_MESSAGES, -1), { ...last, content: last.content + delta }];
   }
   return [...msgs.slice(-MAX_MESSAGES + 1), { id: `stream-${localSeq++}`, role: 'assistant', content: delta, ts: stamp(), meta: { streaming: true } }];
 }
 function finalizeStream(msgs: ChatMessage[], full: string): ChatMessage[] {
   const last = msgs[msgs.length - 1];
-  if (last && (last.meta as any)?.streaming) return [...msgs.slice(-MAX_MESSAGES, -1), { ...last, content: full, meta: {} }];
+  if (last && last.meta?.streaming) return [...msgs.slice(-MAX_MESSAGES, -1), { ...last, content: full, meta: {} }];
   return [...msgs.slice(-MAX_MESSAGES + 1), { id: `a-${localSeq++}`, role: 'assistant', content: full, ts: stamp() }];
 }
 
 // ---------- Store ----------
-export type View = 'run' | 'models' | 'memory' | 'tools' | 'evals' | 'settings';
+export type View = 'overview' | 'savings' | 'run' | 'sessions' | 'models' | 'prompts' | 'memory' | 'tools' | 'evals' | 'cache' | 'alerts' | 'projects' | 'billing' | 'settings';
 export interface Toast { id: number; kind: 'ok' | 'warn' | 'err' | 'info'; title: string; body?: string }
-interface ServerState { runs: Run[]; activeRunId: string | null; snapshot: RuntimeSnapshot | null; models: ModelInfo[]; tools: RuntimeSnapshot['tools']; memItems: MemoryItem[]; evals: any[]; evalNote: string; conn: { status: ConnStatus; lastSeq: number; lastUpdate: string | null }; sending: boolean; }
-interface UIState { view: View; settingsAnchor: string | null; leftOpen: boolean; rightOpen: boolean; expanded: Record<string, boolean>; selectedTrace: number | null; paletteOpen: boolean; taskMode: string; memQuery: string; modelQuery: string; toolQuery: string; runQuery: string; theme: 'dark' | 'light'; toasts: Toast[]; }
+interface ServerState { runs: Run[]; activeRunId: string | null; snapshot: RuntimeSnapshot | null; models: ModelInfo[]; tools: RuntimeSnapshot['tools']; memItems: MemoryItem[]; evals: EvaluationRecord[]; evalNote: string; conn: { status: ConnStatus; lastSeq: number; lastUpdate: string | null }; sending: boolean; }
+interface UIState { view: View; settingsAnchor: string | null; leftOpen: boolean; rightOpen: boolean; leftWidth: number; rightWidth: number; expanded: Record<string, boolean>; selectedTrace: number | null; paletteOpen: boolean; newRunOpen: boolean; taskMode: string; memQuery: string; modelQuery: string; toolQuery: string; runQuery: string; runStatusFilter: string; theme: 'dark' | 'light'; toasts: Toast[]; }
 interface State { server: ServerState; ui: UIState }
 type Action =
   | { type: 'runs/set'; runs: Run[] } | { type: 'runs/active'; id: string | null }
   | { type: 'snap/set'; snap: RuntimeSnapshot } | { type: 'event/apply'; env: StreamEnvelope }
   | { type: 'conn/set'; conn: Partial<ServerState['conn']> }
   | { type: 'models/set'; models: ModelInfo[] } | { type: 'tools/set'; tools: RuntimeSnapshot['tools'] }
-  | { type: 'mem/set'; items: MemoryItem[] } | { type: 'evals/set'; evals: any[]; note: string }
+  | { type: 'mem/set'; items: MemoryItem[] } | { type: 'evals/set'; evals: EvaluationRecord[]; note: string }
   | { type: 'send/set'; sending: boolean } | { type: 'msg/add'; msg: ChatMessage }
   | { type: 'ui/set'; patch: Partial<UIState> } | { type: 'ui/toggle'; key: string }
   | { type: 'toast/push'; toast: Omit<Toast, 'id'> } | { type: 'toast/dismiss'; id: number };
 
 let toastSeq = 1;
+const PANEL_KEY = 'orchestra-panels-v1';
+function initialPanels(): { leftOpen: boolean; rightOpen: boolean; leftWidth: number; rightWidth: number } {
+  const fallback = { leftOpen: true, rightOpen: true, leftWidth: 264, rightWidth: 380 };
+  try {
+    if (typeof localStorage === 'undefined') return fallback;
+    const raw = localStorage.getItem(PANEL_KEY);
+    if (!raw) return fallback;
+    const p = JSON.parse(raw);
+    return {
+      leftOpen: typeof p.leftOpen === 'boolean' ? p.leftOpen : fallback.leftOpen,
+      rightOpen: typeof p.rightOpen === 'boolean' ? p.rightOpen : fallback.rightOpen,
+      leftWidth: clampWidth(typeof p.leftWidth === 'number' ? p.leftWidth : fallback.leftWidth, 180, 380),
+      rightWidth: clampWidth(typeof p.rightWidth === 'number' ? p.rightWidth : fallback.rightWidth, 300, 520),
+    };
+  } catch { return fallback; }
+}
+export function clampWidth(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+export function persistPanels(ui: Pick<UIState, 'leftOpen' | 'rightOpen' | 'leftWidth' | 'rightWidth'>) {
+  try {
+    localStorage.setItem(PANEL_KEY, JSON.stringify({
+      leftOpen: ui.leftOpen, rightOpen: ui.rightOpen,
+      leftWidth: ui.leftWidth, rightWidth: ui.rightWidth,
+    }));
+  } catch { /* private mode — session-only */ }
+}
 function initialTheme(): 'dark' | 'light' {
   try {
     const saved = (typeof localStorage !== 'undefined' && (localStorage.getItem('orchestra-theme') || localStorage.getItem('aar-theme'))) as string | null;
@@ -225,9 +299,13 @@ function initialTheme(): 'dark' | 'light' {
   // Friendly light-first product; dark remains one toggle away.
   return 'light';
 }
+const panels = initialPanels();
 const initial: State = {
   server: { runs: [], activeRunId: null, snapshot: null, models: [], tools: [], memItems: [], evals: [], evalNote: '', conn: { status: 'idle', lastSeq: 0, lastUpdate: null }, sending: false },
-  ui: { view: 'run', settingsAnchor: null, leftOpen: true, rightOpen: true, expanded: { model: true, why: true, switch: true, context: true, cache: true, memory: false, tools: true, cost: true, latency: true, history: false, routing: false, trace: true, changes: false, decisions: false }, selectedTrace: null, paletteOpen: false, taskMode: 'debug', memQuery: '', modelQuery: '', toolQuery: '', runQuery: '', theme: initialTheme(), toasts: [] },
+  // Progressive disclosure: the runtime story (health/model/why/context/cost) is
+  // open; historical + low-frequency detail (switches/cache/memory/latency/
+  // routing/history/trace/decisions/changes) starts collapsed.
+  ui: { view: 'overview', settingsAnchor: null, leftOpen: panels.leftOpen, rightOpen: panels.rightOpen, leftWidth: panels.leftWidth, rightWidth: panels.rightWidth, expanded: { health: true, model: true, why: true, switch: false, context: true, cache: false, memory: false, tools: true, cost: true, latency: false, history: false, routing: false, trace: false, changes: false, decisions: false, outcome: true, replay: false, compare: false, focus: true }, selectedTrace: null, paletteOpen: false, newRunOpen: false, taskMode: 'auto', memQuery: '', modelQuery: '', toolQuery: '', runQuery: '', runStatusFilter: 'all', theme: initialTheme(), toasts: [] },
 };
 
 function reducer(s: State, a: Action): State {

@@ -30,6 +30,22 @@ const { DiscoveryService } = require('./providers/model-discovery');
 const { buildSnapshot, runSummary } = require('./api/snapshot');
 const { FileStore } = require('./persistence');
 const { EvaluationStore, buildEvaluation, scoreEvidence } = require('./evals');
+// Session 3 — agent execution capabilities.
+const { ExecutionController, attachExecution } = require('./execution/controller');
+const ToolSystem = require('./execution/tool-system');
+const ExecutionPolicy = require('./execution/execution-policy');
+const Approvals = require('./execution/approvals');
+const Changesets = require('./execution/changesets');
+const Environment = require('./execution/environment');
+const PlansEpisodes = require('./execution/plans-episodes');
+const Recovery = require('./execution/recovery');
+const { resolveRunConfig, attachRunConfig, runConfigFor } = require('./run-config');
+const { IdempotencyStore, STATES: IdempotencyStates } = require('./idempotency');
+const { loadAuthConfig, authenticate, requireRole, canAccessRun } = require('./auth');
+const { resolveProviderRuntime } = require('./provider-runtime');
+const { loadLimits } = require('./limits');
+const { appVersion } = require('./version');
+const { normalizeModelCost } = require('./cost/breakdown');
 
 module.exports = {
   // Types
@@ -132,4 +148,28 @@ module.exports = {
   EvaluationStore,
   buildEvaluation,
   scoreEvidence,
+  // Session 3 — agent execution engine
+  ExecutionController,
+  attachExecution,
+  ToolSystem,
+  ExecutionPolicy,
+  Approvals,
+  Changesets,
+  Environment,
+  PlansEpisodes,
+  Recovery,
+  // Session 1 foundation
+  resolveRunConfig,
+  attachRunConfig,
+  runConfigFor,
+  IdempotencyStore,
+  IdempotencyStates,
+  loadAuthConfig,
+  authenticate,
+  requireRole,
+  canAccessRun,
+  resolveProviderRuntime,
+  loadLimits,
+  appVersion,
+  normalizeModelCost,
 };

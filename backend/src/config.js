@@ -69,11 +69,17 @@ function loadConfig(env = process.env) {
     maxToolCalls: num(env, 'RUN_MAX_TOOL_CALLS', 20),
     maxRetries: num(env, 'RUN_MAX_RETRIES', 2),
     defaultBudgetUsd: num(env, 'DEFAULT_BUDGET_USD', 0.5),
+    // Business hypothesis, deliberately centralized and surfaced in every
+    // economics response. This is a platform fee on eligible positive savings
+    // only; it is not provider spend and is never mixed into model pricing.
+    platformFeePct: Math.max(0, Math.min(1, num(env, 'PLATFORM_FEE_PCT', 0.25))),
+    stripeWebhookSecret: str(env, 'STRIPE_WEBHOOK_SECRET', ''),
     defaultMaxContextTokens: num(env, 'DEFAULT_MAX_CONTEXT_TOKENS', 64000),
     discoveryEnabled: bool(env, 'DISCOVERY_ENABLED', true),
     discoveryIntervalMs: num(env, 'DISCOVERY_INTERVAL_MS', 300000),
     workspaceRoot: str(env, 'WORKSPACE_ROOT', ''),
     dataDir: str(env, 'RUNTIME_DATA_DIR', 'backend/.runtime-data'),
+    dataEncryptionKey: str(env, 'DATA_ENCRYPTION_KEY', ''),
     logLevel: str(env, 'LOG_LEVEL', 'info'),
   };
 }
@@ -85,11 +91,63 @@ function redact(value) {
   if (typeof value === 'string') {
     let out = value;
     for (const k of SECRET_KEYS) {
+      if (k === 'bearer') continue;
       out = out.replace(new RegExp(`(${k}[\"'\\s:=]+)([^\"'\\s,}]+)`, 'gi'), '$1[REDACTED]');
     }
-    return out.replace(/(Bearer\s+)[^\s"']+/gi, '$1[REDACTED]');
+    // Providers sometimes echo a masked or prefixed form of a rejected key
+    // in their error body (for example, "API key provided: LLM_…"). Treat
+    // those fragments as secrets too, even when the full key is not present.
+    out = out.replace(/((?:api[\s_-]*key|access[\s_-]*token|secret|password)[^:=]{0,32}[:=]\s*)([^\s,}]+)/gi, '$1[REDACTED]');
+    out = out.replace(/\b(?:sk-(?:ant|or-v1|proj)-|sk-|LLM_|key[_-])[A-Za-z0-9*._~+\/=~-]{8,}/gi, '[REDACTED]');
+    return out.replace(/(Bearer\s+)(?!token\b)[^\s"']+/gi, '$1[REDACTED]');
   }
   return value;
 }
 
-module.exports = { loadConfig, redact, SECRET_KEYS };
+// Fail-fast configuration validation. Production refuses to start with
+// dangerous or incoherent settings instead of running half-secured.
+// Returns { warnings } in non-production; throws in production for
+// release-blocking misconfiguration. Never throws for missing optional keys.
+function validateConfig(config, env = process.env) {
+  const warnings = [];
+  const isProd = String(env.NODE_ENV || '').toLowerCase() === 'production';
+  const problems = [];
+
+  if (!Number.isFinite(config.port) || config.port < 1 || config.port > 65535) {
+    problems.push(`PORT out of range: ${config.port}`);
+  }
+  const explicitMode = String(env.RUNTIME_MODE || '').toLowerCase();
+  if (explicitMode && !['demo', 'live', 'auto'].includes(explicitMode)) {
+    problems.push(`RUNTIME_MODE must be demo|live|auto (got ${JSON.stringify(explicitMode)})`);
+  }
+  if (!(config.defaultBudgetUsd >= 0)) problems.push('DEFAULT_BUDGET_USD must be >= 0');
+  if (!(config.runTimeoutMs >= 1000)) problems.push('RUN_TIMEOUT_MS must be >= 1000');
+  if (!(config.providerTimeoutMs >= 1000)) problems.push('PROVIDER_TIMEOUT_MS must be >= 1000');
+  if (!(config.maxSteps >= 1 && config.maxSteps <= 50)) problems.push('RUN_MAX_STEPS must be 1..50');
+  if (!(config.maxToolCalls >= 1 && config.maxToolCalls <= 100)) problems.push('RUN_MAX_TOOL_CALLS must be 1..100');
+  if (!config.dataDir || typeof config.dataDir !== 'string') problems.push('RUNTIME_DATA_DIR is required');
+
+  if (isProd) {
+    // Secrets must never have accidental hardcoded production values, and
+    // the encryption key must be present before any credential is stored.
+    if (!config.dataEncryptionKey) {
+      problems.push('DATA_ENCRYPTION_KEY is required in production (32 random bytes as 64 hex chars or base64)');
+    }
+    if (config.frontendOrigin === 'http://localhost:5173' && !env.FRONTEND_ORIGIN) {
+      warnings.push('FRONTEND_ORIGIN is unset: production CORS falls back to localhost; set it to the real console origin');
+    }
+    if (String(env.AUTH_ENABLED || '').toLowerCase() === 'false' && !env.API_TOKEN && !env.OPERATOR_TOKEN && !env.AUTH_TOKENS) {
+      warnings.push('AUTH_ENABLED=false in production with no API tokens: bearer auth is open; prefer session auth + tokens');
+    }
+  }
+
+  if (problems.length) {
+    const err = new Error(`invalid configuration: ${problems.join('; ')}`);
+    err.code = 'config';
+    err.problems = problems;
+    throw err;
+  }
+  return { warnings };
+}
+
+module.exports = { loadConfig, validateConfig, redact, SECRET_KEYS };

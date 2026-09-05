@@ -14,17 +14,25 @@ const STATE_TRANSITIONS = {
     TaskStatus.COMPLETED, 
     TaskStatus.FAILED, 
     TaskStatus.CANCELLED,
-    TaskStatus.PAUSED
+    TaskStatus.PAUSED,
+    TaskStatus.PAUSING
   ],
-  [TaskStatus.WAITING_FOR_TOOL]: [TaskStatus.EXECUTING, TaskStatus.RETRYING, TaskStatus.FAILED, TaskStatus.CANCELLED],
-  [TaskStatus.OBSERVING]: [TaskStatus.EXECUTING, TaskStatus.REOPTIMIZING, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED],
+  [TaskStatus.WAITING_FOR_TOOL]: [TaskStatus.EXECUTING, TaskStatus.RETRYING, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSING],
+  [TaskStatus.OBSERVING]: [TaskStatus.EXECUTING, TaskStatus.REOPTIMIZING, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.PAUSING],
   [TaskStatus.REOPTIMIZING]: [TaskStatus.EXECUTING, TaskStatus.MODEL_SELECT, TaskStatus.CONTEXT_BUILD, TaskStatus.FAILED, TaskStatus.CANCELLED],
   // Session 5: RETRYING may resume mid-run (→ EXECUTING, state preserved) or
   // restart setup from scratch (→ PLANNING, e.g. failure happened before any
   // model was selected and there is nothing to preserve).
   [TaskStatus.RETRYING]: [TaskStatus.EXECUTING, TaskStatus.PLANNING, TaskStatus.FAILED, TaskStatus.CANCELLED],
-  [TaskStatus.PAUSED]: [TaskStatus.EXECUTING, TaskStatus.CANCELLED],
-  [TaskStatus.COMPLETED]: [],
+  [TaskStatus.PAUSED]: [TaskStatus.EXECUTING, TaskStatus.RESUMING, TaskStatus.CANCELLED],
+  // Session 3 cooperative pause: EXECUTING -> PAUSING -> PAUSED ->
+  // RESUMING -> EXECUTING. Direct PAUSED -> EXECUTING kept for compat.
+  [TaskStatus.PAUSING]: [TaskStatus.PAUSED, TaskStatus.CANCELLED],
+  [TaskStatus.RESUMING]: [TaskStatus.EXECUTING, TaskStatus.CANCELLED],
+  [TaskStatus.COMPLETED]: [TaskStatus.RETRYING],
+  // Session 3: same-run continuation reopens a COMPLETED run as a new
+  // execution episode (COMPLETED -> RETRYING is the only legal re-entry;
+  // COMPLETED -> anything else stays rejected).
   [TaskStatus.FAILED]: [TaskStatus.RETRYING, TaskStatus.CANCELLED],
   [TaskStatus.CANCELLED]: []
 };

@@ -1,20 +1,22 @@
 'use strict';
 
 // File persistence: run summaries, per-run event logs, latest snapshot,
-// evaluation records.
+// evaluation records, idempotency records.
 //
 // Durable across restarts: COMPLETED / FAILED / CANCELLED summaries, event
-// logs, snapshots, evaluations. NOT durable: in-flight execution — a restart
-// marks previously-active runs interrupted (server.js), because resuming
-// mid-step is an explicit non-goal.
+// logs, snapshots, evaluations, idempotency. NOT durable: in-flight execution
+// — a restart marks previously-active runs interrupted (server.js), because
+// resuming mid-step is an explicit non-goal.
 //
 // Reliability properties:
-//   - writes are atomic where practical (tmp file + rename)
+//   - writes are atomic (tmp file + fsync + rename); NEVER truncate JSON at an
+//     arbitrary byte boundary. Oversized payloads are pruned structurally
+//     (drop oldest entries) or rejected safely — always valid JSON or no write.
 //   - the data directory is (re)created on every write, not just construction
 //   - corrupted files are quarantined to *.corrupt-<ts> and reported, never
 //     crash the process and never silently poison reads
 //   - event retention is bounded (500/run); run index bounded (200 entries)
-//   - every write returns { ok, error? } so callers can log instead of
+//   - every write returns { ok, error?, pruned? } so callers can log instead of
 //     silently swallowing failures
 //
 // Layout under RUNTIME_DATA_DIR:
@@ -22,19 +24,90 @@
 //   <runId>.events.json   — event envelopes (bounded)
 //   <runId>.snapshot.json — last snapshot
 //   evals.json            — [Evaluation...] (bounded)
+//   idempotency.json      — [IdempotencyRecord...] (bounded, Session 3 primitive)
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const MAX_EVENTS_PER_RUN = 500;
 const MAX_RUN_INDEX = 200;
 const MAX_EVALS = 200;
+const MAX_IDEMPOTENCY = 1000;
 const MAX_BYTES = 5_000_000;
+
+// Retention defaults: per-run files invisible to both live state and the
+// persisted index (i.e. no longer retryable/inspectable via the API) become
+// eligible for garbage collection after a grace period. Active runs and
+// indexed runs are NEVER touched.
+const RETENTION_GRACE_MS = 24 * 60 * 60 * 1000;
+const TMP_MAX_AGE_MS = 60 * 60 * 1000;
+const MAX_CORRUPT_KEPT = 20;
+
+// Per-collection caps for intelligence.json compaction. Unknown arrays fall
+// back to GENERIC_ARRAY_CAP. Caps apply to the persisted document only;
+// live stores keep their own (usually tighter) bounds.
+const INTELLIGENCE_CAPS = {
+  outcomeEvals: 200,
+  routingHistory: 300,
+  history: 300,
+  benchmarks: 500,
+  entries: 500,
+  observations: 500,
+  evaluations: 200,
+  cache: 500,
+  versions: 100,
+};
+const GENERIC_ARRAY_CAP = 500;
+
+// Count entries above caps (0 = already compact). Used to decide whether a
+// prune pass made progress, so the bounded-serialize loop terminates.
+function intelligenceOverflow(doc, caps = INTELLIGENCE_CAPS) {
+  if (!doc || typeof doc !== 'object') return 0;
+  const capFor = (key) => (Number.isFinite(caps[key]) ? caps[key] : GENERIC_ARRAY_CAP);
+  let excess = 0;
+  const walkKeyed = (node) => {
+    if (!node || typeof node !== 'object') return;
+    for (const [k, v] of Object.entries(node)) {
+      if (Array.isArray(v)) {
+        excess += Math.max(0, v.length - capFor(k));
+        for (const item of v) walkKeyed(item);
+      } else if (v && typeof v === 'object') walkKeyed(v);
+    }
+  };
+  walkKeyed(doc);
+  return excess;
+}
+
+// Structurally compact an intelligence document so it cannot grow into a
+// monolithic file that threatens startup or write reliability. Keeps newest
+// entries (history is append-ordered), never slices JSON strings.
+function pruneIntelligenceDoc(doc, caps = INTELLIGENCE_CAPS) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return doc;
+  const out = Array.isArray(doc) ? [...doc] : { ...doc };
+  const capFor = (key) => (Number.isFinite(caps[key]) ? caps[key] : GENERIC_ARRAY_CAP);
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    for (const [k, v] of Object.entries(node)) {
+      if (Array.isArray(v)) {
+        const cap = capFor(k);
+        if (v.length > cap) node[k] = v.slice(-cap);
+        // Recurse into kept entries (bounded count now).
+        for (const item of node[k]) walk(item);
+      } else if (v && typeof v === 'object') {
+        walk(v);
+      }
+    }
+  };
+  walk(out);
+  return out;
+}
 
 class FileStore {
   constructor(dir, options = {}) {
     this.dir = dir;
     this.log = options.logger || null;
+    this.maxBytes = options.maxBytes || MAX_BYTES;
     this.ensureDir();
   }
 
@@ -69,6 +142,7 @@ class FileStore {
       if (e && e.code !== 'ENOENT') this._logWarn(`read failed: ${name}`, e);
       return { value: fallback, ok: e && e.code === 'ENOENT' ? true : false, error: e && e.code === 'ENOENT' ? null : String((e && e.message) || e) };
     }
+    if (!raw.trim()) return { value: fallback, ok: false, error: `empty: ${name}` };
     try {
       return { value: JSON.parse(raw), ok: true };
     } catch (e) {
@@ -81,22 +155,54 @@ class FileStore {
     }
   }
 
-  _writeJson(name, value) {
+  // Serialize structurally: if the payload exceeds maxBytes, prune by dropping
+  // oldest array entries (never slice the JSON string). Returns
+  // { text, pruned } or { error } when it cannot fit even minimally.
+  _serializePrunable(name, value, prune) {
+    let current = value;
+    let pruned = 0;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let text;
+      try {
+        text = JSON.stringify(current);
+      } catch (e) {
+        this._logWarn(`serialize failed: ${name}`, e);
+        return { error: 'unserializable value' };
+      }
+      if (text.length <= this.maxBytes) return { text, pruned };
+      // Too large: ask the pruner for a smaller value.
+      if (typeof prune !== 'function') break;
+      const next = prune(current, attempt);
+      if (!next || next === current) break;
+      pruned++;
+      current = next;
+    }
+    // Final attempt: report safely without writing malformed JSON.
+    try {
+      const text = JSON.stringify(current);
+      if (text.length <= this.maxBytes) return { text, pruned };
+    } catch {}
+    return { error: `too_large: ${name} exceeds ${this.maxBytes} bytes even after pruning` };
+  }
+
+  _writeJson(name, value, prune) {
     const dirStatus = this.ensureDir();
     if (!dirStatus.ok) return dirStatus;
-    let text;
-    try {
-      text = JSON.stringify(value);
-    } catch (e) {
-      this._logWarn(`serialize failed: ${name}`, e);
-      return { ok: false, error: 'unserializable value' };
+    const ser = this._serializePrunable(name, value, prune);
+    if (ser.error) {
+      this._logWarn(`write rejected (not truncated): ${name}`, new Error(ser.error));
+      return { ok: false, error: ser.error };
     }
-    if (text.length > MAX_BYTES) text = text.slice(0, MAX_BYTES);
-    const tmp = this._p(`${name}.tmp-${process.pid}`);
+    const tmp = this._p(`${name}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`);
     try {
-      fs.writeFileSync(tmp, text, 'utf8');
+      fs.writeFileSync(tmp, ser.text, 'utf8');
+      // Flush file content before atomic rename where the platform allows it.
+      try {
+        const fd = fs.openSync(tmp, 'r');
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      } catch {}
       fs.renameSync(tmp, this._p(name));
-      return { ok: true };
+      return { ok: true, ...(ser.pruned ? { pruned: ser.pruned } : {}) };
     } catch (e) {
       try { fs.unlinkSync(tmp); } catch {}
       this._logWarn(`write failed: ${name}`, e);
@@ -106,7 +212,10 @@ class FileStore {
 
   saveRunIndex(runs) {
     const list = Array.isArray(runs) ? runs.slice(-MAX_RUN_INDEX) : [];
-    return this._writeJson('runs.json', list);
+    return this._writeJson('runs.json', list, (cur, attempt) => {
+      if (!Array.isArray(cur) || cur.length <= 10) return null;
+      return cur.slice(-Math.max(10, Math.floor(cur.length / 2)));
+    });
   }
 
   loadRunIndex() {
@@ -125,7 +234,10 @@ class FileStore {
 
   saveEvents(runId, events) {
     const list = Array.isArray(events) ? events.slice(-MAX_EVENTS_PER_RUN) : [];
-    return this._writeJson(`${runId}.events.json`, list);
+    return this._writeJson(`${runId}.events.json`, list, (cur) => {
+      if (!Array.isArray(cur) || cur.length <= 10) return null;
+      return cur.slice(-Math.max(10, Math.floor(cur.length / 2)));
+    });
   }
 
   loadEvents(runId) {
@@ -135,7 +247,23 @@ class FileStore {
 
   saveSnapshot(runId, snapshot) {
     if (!snapshot) return { ok: false, error: 'no snapshot' };
-    return this._writeJson(`${runId}.snapshot.json`, snapshot);
+    // Snapshots prune oldest trace/series/messages structurally when huge.
+    return this._writeJson(`${runId}.snapshot.json`, snapshot, (cur) => {
+      if (!cur || typeof cur !== 'object') return null;
+      const next = { ...cur };
+      let shrunk = false;
+      for (const k of ['trace', 'series', 'messages', 'decisions', 'changes']) {
+        if (Array.isArray(next[k]) && next[k].length > 20) {
+          next[k] = next[k].slice(-Math.floor(next[k].length / 2));
+          shrunk = true;
+        }
+      }
+      if (next.context && Array.isArray(next.context.items) && next.context.items.length > 50) {
+        next.context = { ...next.context, items: next.context.items.slice(-50) };
+        shrunk = true;
+      }
+      return shrunk ? next : null;
+    });
   }
 
   loadSnapshot(runId) {
@@ -145,13 +273,140 @@ class FileStore {
 
   saveEvals(evals) {
     const list = Array.isArray(evals) ? evals.slice(-MAX_EVALS) : [];
-    return this._writeJson('evals.json', list);
+    return this._writeJson('evals.json', list, (cur) => {
+      if (!Array.isArray(cur) || cur.length <= 10) return null;
+      return cur.slice(-Math.max(10, Math.floor(cur.length / 2)));
+    });
   }
 
   loadEvals() {
     const { value } = this._readJson('evals.json', []);
     return Array.isArray(value) ? value : [];
   }
+
+  saveIdempotency(records) {
+    const list = Array.isArray(records) ? records.slice(-MAX_IDEMPOTENCY) : [];
+    return this._writeJson('idempotency.json', list, (cur) => {
+      if (!Array.isArray(cur) || cur.length <= 10) return null;
+      return cur.slice(-Math.max(10, Math.floor(cur.length / 2)));
+    });
+  }
+
+  loadIdempotency() {
+    const { value } = this._readJson('idempotency.json', []);
+    return Array.isArray(value) ? value : [];
+  }
+
+  // Session 2 intelligence persistence (additive): the IntelligenceStore dump
+  // (model/task performance, routing history, benchmarks, semantic cache,
+  // outcome evaluations, feedback). Same atomic-write + quarantine semantics.
+  // The document is compacted structurally (newest entries kept) so the file
+  // cannot grow without bound across restarts.
+  saveIntelligence(doc) {
+    if (!doc || typeof doc !== 'object') return { ok: false, error: 'no intelligence doc' };
+    const halved = Object.fromEntries(
+      Object.entries(INTELLIGENCE_CAPS).map(([k, v]) => [k, Math.max(10, Math.floor(v / 2))]),
+    );
+    return this._writeJson('intelligence.json', pruneIntelligenceDoc(doc), (cur) => {
+      if (!cur || typeof cur !== 'object') return null;
+      if (intelligenceOverflow(cur, halved) <= 0) return null;
+      return pruneIntelligenceDoc(cur, halved);
+    });
+  }
+
+  loadIntelligence() {
+    const { value } = this._readJson('intelligence.json', null);
+    return value && typeof value === 'object' ? value : null;
+  }
+
+  saveBilling(runId, line) {
+    if (!runId || !line || typeof line !== 'object') return { ok: false, error: 'billing line requires runId and object' };
+    return this._writeJson(`${runId}.billing.json`, line);
+  }
+
+  loadBilling(runId) {
+    const { value } = this._readJson(`${runId}.billing.json`, null);
+    return value && typeof value === 'object' ? value : null;
+  }
+
+  // Retention garbage collection for per-run physical files.
+  //
+  // The logical index (runs.json) is bounded, but per-run files
+  // (<id>.events.json / .snapshot.json / .billing.json) otherwise grow
+  // forever. A file is eligible ONLY when its run is neither active nor
+  // present in the retained index (i.e. no longer retryable/inspectable via
+  // the API) AND older than graceMs. Stale tmp files and surplus quarantined
+  // corrupt files are also collected. Never throws; returns an observable
+  // report { deleted, keptActive, keptIndexed, keptFresh, freedBytes, errors }.
+  sweepRetention({ activeIds = [], indexIds = null, graceMs = RETENTION_GRACE_MS, dryRun = false } = {}) {
+    const report = { deleted: [], keptActive: 0, keptIndexed: 0, keptFresh: 0, freedBytes: 0, errors: [] };
+    let names;
+    try {
+      names = fs.readdirSync(this.dir);
+    } catch (e) {
+      report.errors.push(`list failed: ${String((e && e.message) || e).slice(0, 120)}`);
+      return report;
+    }
+    const active = new Set(activeIds);
+    let indexed = null;
+    if (Array.isArray(indexIds)) {
+      indexed = new Set(indexIds);
+    } else {
+      try {
+        indexed = new Set(this.loadRunIndex().map((r) => r && r.id).filter(Boolean));
+      } catch { indexed = new Set(); }
+    }
+    const nowMs = Date.now();
+    const statAge = (full) => {
+      try { return nowMs - fs.statSync(full).mtimeMs; } catch { return 0; }
+    };
+    const remove = (full, name) => {
+      let size = 0;
+      try { size = fs.statSync(full).size; } catch {}
+      if (dryRun) { report.deleted.push(name); report.freedBytes += size; return; }
+      try {
+        fs.unlinkSync(full);
+        report.deleted.push(name);
+        report.freedBytes += size;
+      } catch (e) {
+        report.errors.push(`${name}: ${String((e && e.message) || e).slice(0, 120)}`);
+      }
+    };
+
+    const perRunRe = /^(.+)\.(events|snapshot|billing)\.json$/;
+    for (const name of names) {
+      const full = this._p(name);
+      // Stale temp files from interrupted atomic writes.
+      if (name.includes('.tmp-')) {
+        if (statAge(full) > TMP_MAX_AGE_MS) remove(full, name);
+        continue;
+      }
+      const m = perRunRe.exec(name);
+      if (!m) continue;
+      const id = m[1];
+      if (active.has(id)) { report.keptActive++; continue; }
+      if (indexed.has(id)) { report.keptIndexed++; continue; }
+      if (statAge(full) < graceMs) { report.keptFresh++; continue; }
+      remove(full, name);
+    }
+    // Cap quarantined corrupt files (keep newest, delete oldest surplus).
+    try {
+      const corrupt = names
+        .filter((n) => n.includes('.corrupt-'))
+        .map((n) => ({ n, full: this._p(n), age: statAge(this._p(n)) }))
+        .sort((a, b) => b.age - a.age);
+      for (const c of corrupt.slice(MAX_CORRUPT_KEPT)) remove(c.full, c.n);
+    } catch (e) {
+      report.errors.push(`corrupt cap failed: ${String((e && e.message) || e).slice(0, 120)}`);
+    }
+    return report;
+  }
 }
 
-module.exports = { FileStore, MAX_EVENTS_PER_RUN, MAX_RUN_INDEX, MAX_EVALS };
+module.exports = {
+  FileStore,
+  MAX_EVENTS_PER_RUN, MAX_RUN_INDEX, MAX_EVALS, MAX_IDEMPOTENCY, MAX_BYTES,
+  RETENTION_GRACE_MS, TMP_MAX_AGE_MS, MAX_CORRUPT_KEPT,
+  INTELLIGENCE_CAPS, GENERIC_ARRAY_CAP,
+  pruneIntelligenceDoc, intelligenceOverflow,
+};

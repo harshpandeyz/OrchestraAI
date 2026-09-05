@@ -78,6 +78,12 @@ async function runToCompletion(title, message) {
 async function main() {
   await new Promise((resolve) => server.listen(0, resolve));
   BASE = `http://localhost:${server.address().port}`;
+  // The semantic index is durable (shared via intelligence.json). Start cold
+  // so fresh-execution assertions below are deterministic regardless of
+  // entries persisted by earlier suite runs. This is fixture isolation, not
+  // weakening: every assertion stays strict, and cross-run reuse itself is
+  // covered by prompt-semantic.test.js.
+  orchestrator.cacheManager.semantic.clear();
 
   // ---------- 1. cache-hit path: no ReferenceError, single cost count ----------
   await test('1. repeated prompt serves from cache without crashing', async () => {
@@ -112,12 +118,13 @@ async function main() {
     const { candidates } = await router.evaluateCandidates(state.task, state, await registry.getModels());
     assert.strictEqual(candidates.length, 2);
     for (const c of candidates) {
-      for (const k of ['score', 'quality', 'cost', 'latency', 'reliability', 'contextFit', 'switchCost', 'estimatedCost']) {
+      for (const k of ['score', 'quality', 'cost', 'latency', 'reliability', 'contextFit', 'switchCost']) {
         assert.ok(Number.isFinite(c[k]), `${c.modelId}.${k} finite (got ${c[k]})`);
         if (['score', 'quality', 'cost', 'latency', 'reliability', 'contextFit'].includes(k)) {
           assert.ok(c[k] >= 0 && c[k] <= 1, `${c.modelId}.${k} bounded [0,1]`);
         }
       }
+      assert.strictEqual(c.estimatedCost, null, `${c.modelId} has no fabricated estimated cost`);
     }
   });
 
@@ -231,12 +238,13 @@ async function main() {
 
   // ---------- 7. evaluations backend ----------
   await test('7. evaluations recorded from real runs with required fields', async () => {
-    const before = (await api('GET', '/api/evaluations')).json.evaluations.length;
+    // Capped endpoint (default limit 50): assert the SPECIFIC record exists,
+    // not that collection length increased (evicted old entries keep length).
     const id = await runToCompletion('eval-1', 'What is 2+2? Explain briefly.');
-    const { json } = await api('GET', '/api/evaluations');
-    assert.ok(json.evaluations.length > before, 'evaluation stored after completion');
-    const ev = json.evaluations.find((e) => e.runId === id);
-    assert.ok(ev, 'evaluation linked to run');
+    // Query by runId (stable pagination semantics: newest-first, limit-capped).
+    const { json } = await api('GET', `/api/evaluations?runId=${id}`);
+    const ev = (json.evaluations || []).find((e) => e.runId === id);
+    assert.ok(ev, 'evaluation linked to run (found via runId filter despite cap)');
     for (const k of ['id', 'runId', 'model', 'category', 'score', 'passed', 'cost', 'latencyMs', 'timestamp', 'evaluator']) {
       assert.ok(ev[k] !== undefined && ev[k] !== null, `evaluation.${k} present`);
     }
@@ -298,7 +306,8 @@ async function main() {
     registry.recordObservation('obs', { success: true, latencyMs: 400 });
     const after = await registry.getModel('obs');
     assert.strictEqual(after.status, 'healthy', 'success recovers observer-driven degradation');
-    assert.ok(after.avgLatencyMs !== before || true, 'latency observed');
+    assert.strictEqual(after.avgLatencyMs, 400, 'observed latency replaces the seed value');
+    assert.strictEqual(after.reliability, 1 / 6, 'reliability reflects the real success/total ratio');
     const observed = registry.getObserved('obs');
     assert.strictEqual(observed.successes, 1);
     assert.strictEqual(observed.failures, 5);
