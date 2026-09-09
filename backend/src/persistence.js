@@ -15,7 +15,9 @@
 //   - the data directory is (re)created on every write, not just construction
 //   - corrupted files are quarantined to *.corrupt-<ts> and reported, never
 //     crash the process and never silently poison reads
-//   - event retention is bounded (500/run); run index bounded (200 entries)
+//   - event retention is bounded (500/run); run index bounded per tenant
+//     (newest 1000 per owning org — never a global cap that evicts another
+//     tenant's history)
 //   - every write returns { ok, error?, pruned? } so callers can log instead of
 //     silently swallowing failures
 //
@@ -35,6 +37,35 @@ const MAX_RUN_INDEX = 200;
 const MAX_EVALS = 200;
 const MAX_IDEMPOTENCY = 1000;
 const MAX_BYTES = 5_000_000;
+
+// Retention is scoped to the ownership boundary, never a global cap. The run
+// index keeps the newest `MAX_RUN_INDEX_PER_TENANT` summaries PER tenant, so
+// one tenant's activity can never evict another tenant's history (a global
+// "keep newest 200" cap used to do exactly that). The legacy MAX_RUN_INDEX
+// export is retained for backwards compatibility only.
+const MAX_RUN_INDEX_PER_TENANT = 1000;
+
+function runTenantKey(run) {
+  const orgId = (run && (run.orgId || (run.ownership && run.ownership.orgId))) || '';
+  return String(orgId).slice(0, 128);
+}
+
+// Keep the newest `cap` entries of each tenant, preserving the original global
+// ordering of the survivors. Unscoped/legacy records share one '' bucket.
+function retainPerTenant(runs, cap) {
+  const buckets = new Map();
+  for (const r of runs) {
+    const k = runTenantKey(r);
+    const arr = buckets.get(k);
+    if (arr) arr.push(r);
+    else buckets.set(k, [r]);
+  }
+  const keep = new Set();
+  for (const entries of buckets.values()) {
+    for (const r of entries.slice(Math.max(0, entries.length - cap))) keep.add(r);
+  }
+  return runs.filter((r) => keep.has(r));
+}
 
 // Retention defaults: per-run files invisible to both live state and the
 // persisted index (i.e. no longer retryable/inspectable via the API) become
@@ -211,8 +242,9 @@ class FileStore {
   }
 
   saveRunIndex(runs) {
-    const list = Array.isArray(runs) ? runs.slice(-MAX_RUN_INDEX) : [];
-    return this._writeJson('runs.json', list, (cur, attempt) => {
+    const list = Array.isArray(runs) ? runs : [];
+    const retained = retainPerTenant(list, MAX_RUN_INDEX_PER_TENANT);
+    return this._writeJson('runs.json', retained, (cur, attempt) => {
       if (!Array.isArray(cur) || cur.length <= 10) return null;
       return cur.slice(-Math.max(10, Math.floor(cur.length / 2)));
     });
@@ -229,7 +261,7 @@ class FileStore {
     if (!summary || !summary.id) return { ok: false, error: 'summary requires id' };
     const index = this.loadRunIndex().filter((r) => r && r.id !== summary.id);
     index.push(summary);
-    return this.saveRunIndex(index.slice(-MAX_RUN_INDEX));
+    return this.saveRunIndex(index);
   }
 
   saveEvents(runId, events) {
@@ -420,6 +452,7 @@ class FileStore {
 module.exports = {
   FileStore,
   MAX_EVENTS_PER_RUN, MAX_RUN_INDEX, MAX_EVALS, MAX_IDEMPOTENCY, MAX_BYTES,
+  MAX_RUN_INDEX_PER_TENANT, retainPerTenant,
   RETENTION_GRACE_MS, TMP_MAX_AGE_MS, MAX_CORRUPT_KEPT,
   INTELLIGENCE_CAPS, GENERIC_ARRAY_CAP,
   pruneIntelligenceDoc, intelligenceOverflow,

@@ -9,6 +9,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+const { readSessionCookie, SESSION_TTL_MS } = require('./auth');
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function hash(value) {
@@ -156,7 +158,7 @@ class TenantStore {
     const candidate = crypto.scryptSync(password, user.passwordSalt, 64).toString('hex');
     if (!safeEqual(candidate, user.passwordHash)) throw Object.assign(new Error('invalid email or password'), { code: 'unauthenticated' });
     const raw = crypto.randomBytes(32).toString('base64url');
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30);
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
     if (this.remote) {
       return this.remote.createSession({ hash: hash(raw), userId: user.id, expiresAt })
         .then(() => this.remote.pruneExpiredSessions().catch(() => {}))
@@ -267,9 +269,8 @@ class TenantStore {
 }
 
 function sessionCookie(req) {
-  const raw = String(req?.headers?.cookie || '');
-  const part = raw.split(';').map((v) => v.trim()).find((v) => v.startsWith('oa_session='));
-  return part ? decodeURIComponent(part.slice('oa_session='.length)) : '';
+  // Single source of truth for reading the session cookie (auth.js).
+  return readSessionCookie(req?.headers);
 }
 
 // Datastore-boundary ownership enforcement. Global (env-token) admins may
