@@ -18,12 +18,9 @@ function queryOf(f: IntelligenceFilters): string {
 }
 
 async function fetchJson<T>(path: string): Promise<T> {
-  let token: string | null = null;
-  try { token = localStorage.getItem('orchestra-api-token'); } catch { token = null; }
-  const res = await fetch(path, {
-    credentials: 'include',
-    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-  });
+  // Same auth model as the shared API client: HttpOnly session cookie via
+  // credentialed fetch. No bearer token is ever read from localStorage.
+  const res = await fetch(path, { credentials: 'include' });
   if (!res.ok) {
     let detail = '';
     try {

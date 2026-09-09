@@ -131,11 +131,58 @@ export function IntelligencePage() {
 }
 
 // ---------- Overview: differentiator hero + headline cards ----------
+function Recommendations({ data }: { data: NonNullable<ReturnType<typeof useIntelligence>['data']> }) {
+  const rows = (data.leaderboard.rows || []).filter((r) => r.runs > 0);
+  const recs: { delta: string; title: string; body: string }[] = [];
+  const withCost = rows.filter((r) => r.costPerTask !== null && r.quality !== null) as (LeaderboardRow & { costPerTask: number; quality: number })[];
+  if (withCost.length >= 2) {
+    const sorted = [...withCost].sort((a, b) => a.costPerTask - b.costPerTask);
+    const cheap = sorted[0]; const pricey = sorted[sorted.length - 1];
+    if (pricey.costPerTask > cheap.costPerTask * 1.1 && cheap.quality >= 0.6) {
+      const pct = Math.round((1 - cheap.costPerTask / pricey.costPerTask) * 100);
+      recs.push({ delta: `↓ ${pct}% cost`, title: `Move simple tasks to ${shortModel(cheap.model)}`, body: `$${cheap.costPerTask.toFixed(4)}/task at quality ${cheap.quality.toFixed(2)} vs $${pricey.costPerTask.toFixed(4)} for ${shortModel(pricey.model)}. Measured in this slice — verify on your workload.` });
+    }
+  }
+  const withRel = rows.filter((r) => r.reliability !== null) as (LeaderboardRow & { reliability: number })[];
+  if (withRel.length >= 2) {
+    const sorted = [...withRel].sort((a, b) => b.reliability - a.reliability);
+    const best = sorted[0]; const worst = sorted[sorted.length - 1];
+    if (best.reliability - worst.reliability >= 0.03) {
+      recs.push({ delta: `↑ ${((best.reliability - worst.reliability) * 100).toFixed(1)}pts reliability`, title: `Prefer ${shortModel(best.model)} over ${shortModel(worst.model)} for critical tasks`, body: `${(best.reliability * 100).toFixed(0)}% vs ${(worst.reliability * 100).toFixed(0)}% observed reliability in this slice.` });
+    }
+  }
+  const withLat = rows.filter((r) => r.avgLatencyMs !== null) as (LeaderboardRow & { avgLatencyMs: number })[];
+  if (withLat.length >= 2) {
+    const sorted = [...withLat].sort((a, b) => a.avgLatencyMs - b.avgLatencyMs);
+    const fast = sorted[0]; const slow = sorted[sorted.length - 1];
+    if (slow.avgLatencyMs > fast.avgLatencyMs * 1.25) {
+      recs.push({ delta: `↓ ${((slow.avgLatencyMs - fast.avgLatencyMs) / 1000).toFixed(1)}s latency`, title: `Reuse context with ${shortModel(fast.model)} for latency-sensitive tasks`, body: `${(fast.avgLatencyMs / 1000).toFixed(1)}s vs ${(slow.avgLatencyMs / 1000).toFixed(1)}s average in this slice.` });
+    }
+  }
+  if (!recs.length) {
+    return (
+      <ChartCard title="What needs attention?" subtitle="Recommendations appear once runs with measured cost, reliability, and latency accumulate." provenance={data.leaderboard.provenance}>
+        <ChartEmpty title="No recommendations yet" hint="Complete runs with known pricing to unlock optimization opportunities. Nothing is guessed." />
+      </ChartCard>
+    );
+  }
+  return (
+    <ChartCard title={`${recs.length} optimization opportunit${recs.length === 1 ? 'y' : 'ies'}`} subtitle="What's wrong, what's changing, and what to do — computed from this slice only." provenance={data.leaderboard.provenance}>
+      <ol style={{ margin: 0, paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {recs.slice(0, 3).map((r, i) => (
+          <li key={i}><b>{r.delta}</b> — {r.title}<br /><span className="oi-muted">{r.body}</span></li>
+        ))}
+      </ol>
+    </ChartCard>
+  );
+}
+
 function OverviewSection({ data, go }: { data: NonNullable<ReturnType<typeof useIntelligence>['data']>; go: (s: NavId) => void }) {
   const lb = data.leaderboard.rows.slice(0, 5);
   const flow = data.executionFlow;
   return (
     <div className="oi-stack">
+      <Recommendations data={data} />
       <ChartCard title="Orchestra optimizes execution — not a model catalog"
         subtitle="Incoming task → verified savings. Every stage shows measured values from this slice."
         provenance={flow.provenance}
