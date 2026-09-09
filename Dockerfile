@@ -11,14 +11,14 @@
 # FRONTEND_ORIGIN is required in production: the API reflects only configured
 # origins (no wildcard CORS). DATA_ENCRYPTION_KEY must be injected at runtime.
 
-FROM node:20-alpine AS frontend-build
+FROM node:22-alpine AS frontend-build
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM node:20-alpine AS runtime
+FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 ENV RUNTIME_DATA_DIR=/var/lib/orchestraai
 WORKDIR /app
