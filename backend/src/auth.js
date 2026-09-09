@@ -22,6 +22,42 @@ const crypto = require('crypto');
 const ROLES = ['viewer', 'operator', 'admin'];
 const ROLE_RANK = { viewer: 1, operator: 2, admin: 3 };
 
+// The browser session credential is an HttpOnly cookie. This name and the
+// Set-Cookie builders below are the single authority for session transport:
+// caller-set cookies (server.js) and reader (authenticate) share them so the
+// attribute posture (HttpOnly/SameSite/Secure) can never drift between routes.
+const SESSION_COOKIE_NAME = 'oa_session';
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days (matches TenantStore)
+
+// Read the opaque session token from a request's Cookie header. Returns '' when
+// absent. Never throws: a malformed cookie simply auths as unauthenticated.
+function readSessionCookie(headers = {}) {
+  const raw = String(headers.cookie || headers.Cookie || '');
+  const part = raw.split(';').map((v) => v.trim()).find((v) => v.startsWith(`${SESSION_COOKIE_NAME}=`));
+  if (!part) return '';
+  try {
+    return decodeURIComponent(part.slice(SESSION_COOKIE_NAME.length + 1));
+  } catch {
+    return '';
+  }
+}
+
+// Build the Set-Cookie value for a freshly issued session token.
+// `secure` enables the Secure attribute (production/live); dev keeps it off so
+// plain-HTTP localhost login keeps working. HttpOnly + SameSite=Lax + Path=/
+// are always set — JavaScript can never read the credential, and cross-site
+// requests never carry it (Lax), which is the CSRF posture the server pairs
+// with the Origin check on state-changing requests.
+function buildSessionCookie(token, { secure = false } = {}) {
+  const attr = `HttpOnly; SameSite=Lax; Path=/${secure ? '; Secure' : ''}`;
+  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(String(token))}; ${attr}`;
+}
+
+// Expire a session cookie (logout invalidation).
+function clearSessionCookie() {
+  return `${SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
 function roleRank(role) {
   return ROLE_RANK[String(role || '').toLowerCase()] || 0;
 }
@@ -103,16 +139,13 @@ function authenticate(req, authConfig, tenantStore = null) {
   const configuredPrincipal = principalForToken(cfg, token);
   if (configuredPrincipal) return configuredPrincipal;
   if (tenantStore && typeof tenantStore.userForSession === 'function') {
-    const rawCookie = String(req.headers?.cookie || '').split(';').map((v) => v.trim()).find((v) => v.startsWith('oa_session='));
-    if (rawCookie) {
-      try {
-        const session = decodeURIComponent(rawCookie.slice('oa_session='.length));
-        const found = tenantStore.userForSession(session);
-        if (found && typeof found.then === 'function') {
-          return found.then((user) => (user ? { id: user.id, role: user.role, orgId: user.orgId, source: 'session' } : null));
-        }
-        if (found) return { id: found.id, role: found.role, orgId: found.orgId, source: 'session' };
-      } catch { /* malformed cookie stays unauthenticated */ }
+    const session = readSessionCookie(req.headers);
+    if (session) {
+      const found = tenantStore.userForSession(session);
+      if (found && typeof found.then === 'function') {
+        return found.then((user) => (user ? { id: user.id, role: user.role, orgId: user.orgId, source: 'session' } : null));
+      }
+      if (found) return { id: found.id, role: found.role, orgId: found.orgId, source: 'session' };
     }
   }
   return null;
@@ -162,4 +195,9 @@ module.exports = {
   isGlobalAdmin,
   canAccessRun,
   authModeSummary,
+  SESSION_COOKIE_NAME,
+  SESSION_TTL_MS,
+  readSessionCookie,
+  buildSessionCookie,
+  clearSessionCookie,
 };
