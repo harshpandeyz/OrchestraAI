@@ -94,11 +94,19 @@ if (datastoreKind() === 'postgres') {
   boot();
 }
 
-// 3. Exec the server.
+// 3. Start the server as the container's foreground process. Signals are
+//    forwarded to the child so SIGTERM/SIGINT reach server.js's graceful
+//    shutdown (drain in-flight runs, flush durable state, close SSE/Redis/Postgres).
 function boot() {
   const child = spawn(process.execPath, [path.join(APP_ROOT, 'backend', 'server.js')], { stdio: 'inherit' });
+  // Forward termination signals to the server process. Without this the
+  // entrypoint (PID 1) absorbs SIGTERM and the server never drains, so Docker
+  // would SIGKILL the container after the stop grace period.
+  const forward = (sig) => () => { try { child.kill(sig); } catch {} };
+  process.on('SIGTERM', forward('SIGTERM'));
+  process.on('SIGINT', forward('SIGINT'));
   child.on('exit', (code, signal) => {
-    if (signal) process.kill(process.pid, signal);
-    else process.exit(code === null ? 1 : code);
+    if (signal) process.exit(128 + (signal === 'SIGTERM' ? 15 : signal === 'SIGINT' ? 2 : 1));
+    process.exit(code === null ? 1 : code);
   });
 }

@@ -18,7 +18,6 @@
    - Contains users, sessions, organizations, projects, run index, run
      events, snapshots, idempotency, evaluations, intelligence docs,
      billing records, and the audit log
-   - See postgres-backup.md for pg_dump procedures
 
 3. **Object storage** (not deployed by default)
    - The default compose deployment keeps run artifacts in Postgres
@@ -120,24 +119,34 @@ docker compose -f deploy/docker-compose.yml start api
 
 ### 2. Restore PostgreSQL
 
+The backup above is a plain-SQL `pg_dump`, so restore it with `psql` (not
+`pg_restore`, which expects a `-Fc` custom-format archive):
+
 ```bash
-docker compose -f deploy/docker-compose.yml exec postgres \
-  psql -U orchestraai -c "DROP DATABASE orchestraai;"
+# Restore into an empty database (schema_migrations is recreated by the SQL).
+docker compose -f deploy/docker-compose.yml exec -T postgres \
+  psql -U orchestraai -d orchestraai < postgres-backup-YYYYMMDD-HHMMSS.sql
 
+# Verify: migrations + row counts.
 docker compose -f deploy/docker-compose.yml exec postgres \
-  psql -U orchestraai -c "CREATE DATABASE orchestraai;"
-
+  psql -U orchestraai -c "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
 docker compose -f deploy/docker-compose.yml exec postgres \
-  pg_dump -U orchestraai -Fc postgres-backup-20240101-000000.sql | \
-  pg_restore -U orchestraai -d orchestraai
+  psql -U orchestraai -c "SELECT count(*) FROM run_index; SELECT count(*) FROM users;"
 ```
 
-### 3. Restore MinIO
+**RPO / RTO**: with daily `pg_dump` the recovery point is the last successful
+dump (≤24h for default guidance). Restore of a plain-SQL dump into an empty
+image database completes in seconds-to-minutes depending on data size. Test
+the restore to a staging database at least quarterly.
+
+### 3. Restore object storage (only if you provisioned one)
+
+The default deployment provisions **no object store**, so there is nothing to
+restore here. If you added S3-compatible storage, restore a private bucket
+snapshot (never public), then verify tenant-scoped keys:
 
 ```bash
-docker cp minio-data-backup-20240101-000000.tar $(docker compose -f deploy/docker-compose.yml ps -q minio):/tmp/restore.tar
-docker exec $(docker compose -f deploy/docker-compose.yml ps -q minio) \
-  tar xzf /tmp/restore.tar -C /data/
+aws s3 sync s3://orchestraai-artifacts-backup-YYYYMMDD s3://orchestraai-artifacts --only-show-errors
 ```
 
 ### 4. Restore DATA_ENCRYPTION_KEY
@@ -151,15 +160,14 @@ If no key backup exists, stored credentials must be reconfigured from scratch.
 | Medium         | Keep          | Rotation  |
 |----------------|---------------|-----------|
 | Runtime data   | 14 daily, 8 weekly, 4 monthly | Weekly full, daily incremental |
-| PostgreSQL     | 7 daily, 4 weekly, 1 monthly   | Daily incremental, weekly full   |
-| MinIO          | 14 daily, 8 weekly, 4 monthly  | Weekly full, daily incremental   |
+| PostgreSQL     | 7 daily, 4 weekly, 1 monthly   | Daily full (`pg_dump`)   |
+| Object storage | (none by default) | n/a (not provisioned) |
 | Encryption key | Permanent, off-site, immutable   | Rotate annually, keep all versions |
 
 ## Disaster Recovery Checklist
 
 - [ ] Runtime data volume backed up within last 24 hours
 - [ ] PostgreSQL backup verified (restore to staging, check data integrity)
-- [ ] MinIO backup verified (at least one valid snapshot)
 - [ ] DATA_ENCRYPTION_KEY stored in separate location, tested accessible
 - [ ] Docker Compose file matches current production topology
 - [ ] Test restore performed in staging environment within last 90 days

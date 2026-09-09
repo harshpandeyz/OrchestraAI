@@ -25,7 +25,7 @@ for deployment/bootstrap preconfiguration (see `.env.example`).
 ## Production deployment
 
 ```bash
-POSTGRES_PASSWORD=... SANDBOX_WORKER_TOKEN=... ISOLATED_EXECUTOR_TOKEN=... \
+POSTGRES_PASSWORD=... SANDBOX_WORKER_TOKEN=... \
 DATA_ENCRYPTION_KEY=... FRONTEND_ORIGIN=https://console.example \
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
@@ -36,12 +36,21 @@ evaluations, intelligence, billing, audit — migrations in
 `backend/migrations/`, applied by the entrypoint, fatal on failure) +
 **Redis** (locks, rate limits, durable `run.execute` queue) + **isolated
 sandbox worker** (customer code runs there via bounded workspace snapshots,
-never in the API process). Missing secrets fail compose interpolation;
-unreachable Postgres/Redis fail `/api/ready`, never silent fallbacks.
-No object store is provisioned (no app path needs one); no default
-passwords or public artifact policies anywhere. See `ARCHITECTURE.md`
-(operational assumptions) and `deploy/backup-procedures.md`.
-Production: `cd frontend && npm run build` → `frontend/dist`, which the runtime serves itself on :8787 (one port: console + API). Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon).
+never in the API process).
+
+`DATABASE_URL` and `REDIS_URL` are **derived automatically** from the
+compose `postgres`/`redis` services (`postgres://orchestraai:<password>@postgres:5432/orchestraai`
+and `redis://redis:6379`) — you normally do not set them. Set them only to
+point at an external datastore. `ISOLATED_EXECUTOR_TOKEN` (the API's client
+token for the sandbox worker) is likewise derived from `SANDBOX_WORKER_TOKEN`
+unless explicitly overridden. Required input secrets are `POSTGRES_PASSWORD`
+(URL-safe), `SANDBOX_WORKER_TOKEN`, `DATA_ENCRYPTION_KEY` (32 random bytes as
+64 hex or 44 base64 chars), and `FRONTEND_ORIGIN`. Missing secrets fail
+compose interpolation; unreachable Postgres/Redis fail `/api/ready`, never
+silent fallback. No object store is provisioned (no app path needs one); no
+default passwords or public artifact policies anywhere. See
+`ARCHITECTURE.md` (operational assumptions) and `deploy/backup-procedures.md`.
+Production: `cd frontend && npm run build` → `frontend/dist`, which the runtime serves itself on :8787 (one port: console + API). Docker: `docker build -t orchestraai .` (Dockerfile provided; requires a running Docker daemon). Run the full topology smoke test with `bash deploy/scripts/smoke-topology.sh`.
 
 ## Test it
 ```bash

@@ -1,14 +1,31 @@
 name: CI
 
+# Security model:
+#   push         -> build + test + (on main/release) publish immutable image
+#   pull_request -> build + test ONLY (never publishes, never mutates `latest`)
+#
+# Publishing is gated on `github.event_name == 'push'`: a pull_request run can
+# never reach the release-image or release-latest jobs. `latest` is only advanced
+# on main/release AFTER every test/build/smoke job that it depends on has
+# succeeded. Images are tagged by immutable git SHA; `latest` is a moving alias
+# applied only after release validation.
+
 on:
   push:
     branches: [main, release]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 defaults:
   run:
-    workdir: .
+    working-directory: .
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   install:
@@ -18,8 +35,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache root dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-root-${{ hashFiles('package-lock.json') }}
+
       - name: Install root dependencies
         run: npm ci
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-npm-fe-${{ hashFiles('frontend/package-lock.json') }}
 
       - name: Install frontend dependencies
         run: npm ci --prefix frontend
@@ -35,29 +64,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run backend runtime tests
-        run: node backend/test/runtime.test.js
-
-      - name: Run backend provider config tests
-        run: node backend/test/provider-config.test.js
-
-      - name: Run backend boundaries tests
-        run: node backend/test/production-boundaries.test.js
-
-      - name: Run backend auth integration tests
-        run: node backend/test/auth-integration.test.js
-
-      - name: Run backend SSRF tests
-        run: node backend/test/ssrf.test.js
-
-      - name: Run backend event contract tests
-        run: node backend/test/event-contract.test.js
-
-      - name: Run backend savings tests
-        run: node backend/test/savings/savings-engine.test.js
-
-      - name: Run backend analytics tests
-        run: node backend/test/analytics.test.js
+      - name: Run backend test suite
+        run: npm run test:all
 
   frontend-tests:
     name: Frontend Tests
@@ -74,8 +82,8 @@ jobs:
         run: npm --prefix frontend run test -- --run
 
   frontend-build:
-    name: Frontend Build
-    needs: frontend-tests
+    name: Frontend Build (typecheck + bundle)
+    needs: install
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -87,79 +95,132 @@ jobs:
       - name: Build frontend
         run: npm --prefix frontend run build
 
+  e2e:
+    name: Browser E2E (Playwright)
+    needs: [install, frontend-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Install Playwright Chromium (with OS deps)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser E2E suite
+        run: npm run test:e2e
+
+      - name: Upload E2E report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/.artifacts
+          retention-days: 7
+
+  release-gate:
+    name: Assert Release Conditions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Static-regression release gate
+        run: node qa/ci-release-gate.test.js
+
+      - name: Clean-source hygiene
+        run: node qa/clean-install-check.js
+
+      - name: Secret scan
+        run: node qa/secret-scan.js
+
   docker-build:
-    name: Docker Build
-    needs: frontend-build
+    name: Docker Build (no publish)
+    needs: [frontend-build, release-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t orchestraai .
+        run: docker build -t orchestraai:ci .
 
       - name: Verify Docker image exists
-        run: docker images orchestraai
+        run: docker images orchestraai:ci
 
-  deployment-smoke:
-    name: Deployment Smoke Validation
+  container-smoke:
+    name: Single-Container Smoke (demo topology)
     needs: docker-build
     runs-on: ubuntu-latest
-    environment: production
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub (if needed)
+      - name: Run demo-mode container smoke test
+        run: bash deploy/scripts/smoke-container.sh
+
+  compose-smoke:
+    name: Full Topology Smoke (Postgres + Redis + sandbox)
+    if: github.event_name == 'push'
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run production-topology smoke test
+        run: bash deploy/scripts/smoke-topology.sh
+
+  release-image:
+    name: Publish Immutable Image (:sha)
+    if: github.event_name == 'push'
+    needs: [backend-tests, frontend-tests, frontend-build, e2e, docker-build, compose-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub (push-only, never on PRs)
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push immutable image
         run: |
-          docker build -t orchestraai:$(git rev-parse --short HEAD) .
-          docker tag orchestraai:$(git rev-parse --short HEAD) orchestraai:latest
-          docker push orchestraai:latest
+          docker build -t "${IMAGE_REPO:-orchestraai}:${GITHUB_SHA}" .
+          docker push "${IMAGE_REPO:-orchestraai}:${GITHUB_SHA}"
+        env:
+          IMAGE_REPO: ${{ vars.IMAGE_REPO || 'orchestraai' }}
 
-      - name: Run deployment smoke test
+  release-latest:
+    name: Advance `latest` (release branch only)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release')
+    needs: release-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Tag and push `latest`
         run: |
-          # Run the container with required env vars set to safe defaults
-          docker run -d --name orchestraai-test \
-            -p 8787:8787 \
-            -e NODE_ENV=production \
-            -e FRONTEND_ORIGIN=http://localhost:5173 \
-            -e DATA_ENCRYPTION_KEY=test-key-for-smoke-test-only \
-            -e RUNTIME_MODE=demo \
-            -e PROVIDER=openrouter \
-            orchestraai:latest
-
-          # Wait for server to start
-          echo "Waiting for server to be ready..."
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8787/api/health > /dev/null 2>&1; then
-              echo "Server is healthy"
-              break
-            fi
-            echo "Attempt $i/30 - server not up yet, waiting..."
-            sleep 2
-          done
-
-          # Validate health endpoint
-          echo "Validating /api/health..."
-          HEALTH=$(curl -sf http://localhost:8787/api/health || echo '{}')
-          echo "Health: $HEALTH"
-
-          # Validate readiness endpoint
-          echo "Validating /api/ready..."
-          READY=$(curl -sf http://localhost:8787/api/ready || echo '{}')
-          echo "Ready: $READY"
-
-          # Validate console is served
-          echo "Validating frontend console..."
-          CONSOLE=$(curl -sf http://localhost:8787/ || echo '{}')
-          echo "Console loaded: ${CONSOLE:0:100}"
-
-          # Stop and remove test container
-          docker stop orchestraai-test > /dev/null 2>&1 || true
-          docker rm orchestraai-test > /dev/null 2>&1 || true
+          docker pull "${IMAGE_REPO:-orchestraai}:${GITHUB_SHA}"
+          docker tag "${IMAGE_REPO:-orchestraai}:${GITHUB_SHA}" "${IMAGE_REPO:-orchestraai}:latest"
+          docker push "${IMAGE_REPO:-orchestraai}:latest"
+        env:
+          IMAGE_REPO: ${{ vars.IMAGE_REPO || 'orchestraai' }}
