@@ -345,8 +345,8 @@ async function main() {
     assert.ok(learning, 'learning applied');
     const desc = intel.performance.describe('m', outcome.taskCategory);
     assert.ok(desc.attempts >= 1);
-    assert.ok(Object.keys(intel.performance.records.get('m::' + outcome.taskCategory).workloads || {}).length >= 1,
-      'workload slice recorded');
+    const w = intel.performance.predictedSuccess('m', outcome.taskCategory, { contextTokens: 500, toolProfile: ['run_tests'] });
+    assert.ok(w.workload && w.workload.attempts >= 1, 'workload slice recorded');
   });
 }
 

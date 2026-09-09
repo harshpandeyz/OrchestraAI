@@ -11,6 +11,14 @@ process.env.SANDBOX_ALLOW_ROOT = '1';
 // The worker sanitizes PATH for children; point it at this interpreter so
 // `node` resolves on any dev machine (the container image has node on PATH).
 process.env.SANDBOX_PATH = `${require('path').dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`;
+// Dedicated reusable workspace root for these tests. The root itself is
+// REUSED across executions and must PERSIST; only the ephemeral `run-*` dirs
+// materialized inside it must be destroyed after every execution.
+const fsMod = require('fs');
+const osMod = require('os');
+const pathMod = require('path');
+process.env.SANDBOX_WORKSPACE_ROOT = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'sandbox-worker-test-'));
+const WORKSPACE_ROOT = process.env.SANDBOX_WORKSPACE_ROOT;
 
 const assert = require('assert');
 const fs = require('fs');
@@ -34,6 +42,19 @@ async function test(name, fn) {
 
 function b64(s) {
   return Buffer.from(String(s), 'utf8').toString('base64');
+}
+
+// The reusable workspace root holds ephemeral `run-*` dirs during execution.
+// These helpers snapshot/compare the root so a leaked run workspace is caught
+// without ever requiring the shared root itself to disappear.
+function runWorkspaceEntries() {
+  try { return new Set(fs.readdirSync(WORKSPACE_ROOT).filter((n) => n.startsWith('run-'))); } catch { return new Set(); }
+}
+function runWorkspaceLeaked(before) {
+  const after = runWorkspaceEntries();
+  const leaked = [];
+  for (const n of after) if (!before.has(n) && n.startsWith('run-')) leaked.push(n);
+  return leaked;
 }
 
 // The worker throws plain { status, code, message } objects (not Errors).
@@ -96,7 +117,7 @@ async function main() {
   });
 
   await test('execute materializes the snapshot, runs, collects, manifests, destroys', async () => {
-    const before = new Set(fs.readdirSync(os.tmpdir()));
+    const before = runWorkspaceEntries();
     const validated = worker.validateRequest({
       runId: 'run-ws-1', command: 'node', args: ['app.js'],
       workspace: {
@@ -115,13 +136,45 @@ async function main() {
     assert.strictEqual(Buffer.from(r.artifacts[0].contentBase64, 'base64').toString('utf8'), 'hello-artifact');
     const names = r.workspaceManifest.map((m) => m.path);
     assert.ok(names.includes('app.js') && names.includes('out.log'), `manifest lists workspace files: ${names.join(',')}`);
-    // Ephemeral cleanup: no new entries left in the OS tmpdir.
-    const after = new Set(fs.readdirSync(os.tmpdir()));
-    for (const name of after) {
-      if (!before.has(name) && name.startsWith('sandbox-worker-ws')) {
-        throw new Error(`ephemeral workspace leaked: ${name}`);
-      }
-    }
+    // Ephemeral cleanup: no NEW run-* workspace remains under the reusable root,
+    // and the reusable root itself persists (it is shared, not per-request).
+    const leaked = runWorkspaceLeaked(before);
+    assert.strictEqual(leaked.length, 0, `ephemeral run workspace leaked: ${leaked.join(', ')}`);
+    assert.ok(fs.existsSync(WORKSPACE_ROOT), 'reusable workspace root must persist');
+  });
+
+  await test('concurrent executions are isolated (no cross-run workspace visibility)', async () => {
+    const before = runWorkspaceEntries();
+    const mk = (marker, runId) => worker.validateRequest({
+      runId, command: 'node', args: ['w.js'],
+      workspace: {
+        files: [{
+          path: 'w.js',
+          contentBase64: b64(`const fs=require("fs");fs.writeFileSync("marker.txt","${marker}");console.log("${marker}");`),
+        }],
+      },
+      collect: ['marker.txt'],
+      timeoutMs: 20000, maxOutputBytes: 8000,
+    });
+    const [a, b] = await Promise.all([
+      worker.executeInEphemeralWorkspace(mk('alpha', 'run-conc-a')),
+      worker.executeInEphemeralWorkspace(mk('beta', 'run-conc-b')),
+    ]);
+    // Each run produced only its own artifact — no bleed of the other's files.
+    const aText = Buffer.from(a.artifacts[0].contentBase64, 'base64').toString('utf8');
+    const bText = Buffer.from(b.artifacts[0].contentBase64, 'base64').toString('utf8');
+    assert.strictEqual(aText, 'alpha', 'run A artifact isolated');
+    assert.strictEqual(bText, 'beta', 'run B artifact isolated');
+    assert.strictEqual(a.stdout.trim(), 'alpha');
+    assert.strictEqual(b.stdout.trim(), 'beta');
+    const aManifest = a.workspaceManifest.map((m) => m.path);
+    const bManifest = b.workspaceManifest.map((m) => m.path);
+    assert.ok(aManifest.includes('marker.txt') && !aManifest.includes('unrelated'), `run A manifest: ${aManifest.join(', ')}`);
+    assert.ok(bManifest.includes('marker.txt'), `run B manifest: ${bManifest.join(', ')}`);
+    // Both ephemeral run workspaces are destroyed; the shared root persists.
+    const leaked = runWorkspaceLeaked(before);
+    assert.strictEqual(leaked.length, 0, `concurrent run workspace leaked: ${leaked.join(', ')}`);
+    assert.ok(fs.existsSync(WORKSPACE_ROOT), 'reusable workspace root must persist');
   });
 
   await test('execute refuses a snapshot that escapes the ephemeral dir', async () => {
@@ -148,6 +201,7 @@ async function main() {
   });
 
   console.log(`\n--- Sandbox-worker results: ${passed} passed, ${failed} failed ---`);
+  try { fs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true }); } catch { /* best-effort */ }
   process.exit(failed ? 1 : 0);
 }
 
