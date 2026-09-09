@@ -8,12 +8,15 @@ import { ConsoleSidebar } from './console/ConsoleSidebar';
 import { ConsoleTopBar } from './console/ConsoleTopBar';
 import { LiveIntelligence } from './console/LiveIntelligence';
 import { Composer, MessageList, RunHeader } from './components/Center';
+import { RunStudio } from './components/run/RunStudio';
 import { CommandPalette } from './components/CommandPalette';
 import { NewRunDialog } from './components/NewRunDialog';
 import { Onboarding } from './components/Onboarding';
 import { Skeleton } from './components/ui';
 import { IconChevronLeft, IconChevronRight, IconX } from './components/icons';
 import { EvalsPage, MemoryPage, ModelsPage, SettingsPage, ToolsPage } from './pages/pages';
+import { AgentsPage, ApprovalsPage, DeploymentsPage, IncidentsPage, SkillsPage, WorkflowsPage, WorkspacesPage } from './pages/ops';
+import { parseRoute, buildRoute } from './lib/routes';
 import { OverviewPage, SavingsPage } from './pages/command-center';
 import { BillingPage, OperationsPage, ProjectsPage } from './pages/account';
 import { AuthPage, LandingPage } from './pages/public';
@@ -44,50 +47,20 @@ function Toasts() {
 }
 
 function Breadcrumbs({ view }: { view: View }) {
-  const parts: { label: string; href?: string }[] = [];
-  if (view === 'run') {
-    parts.push({ label: 'Run' });
-  } else if (view === 'overview') {
-    parts.push({ label: 'Overview' });
-  } else if (view === 'savings') {
-    parts.push({ label: 'Savings' });
-  } else if (view === 'models') {
-    parts.push({ label: 'Models' });
-  } else if (view === 'tools') {
-    parts.push({ label: 'Tools' });
-  } else if (view === 'memory') {
-    parts.push({ label: 'Memory' });
-  } else if (view === 'evals') {
-    parts.push({ label: 'Evaluations' });
-  } else if (view === 'cache') {
-    parts.push({ label: 'Cache' });
-  } else if (view === 'alerts') {
-    parts.push({ label: 'Alerts' });
-  } else if (view === 'projects') {
-    parts.push({ label: 'Projects' });
-  } else if (view === 'billing') {
-    parts.push({ label: 'Billing' });
-  } else if (view === 'settings') {
-    parts.push({ label: 'Settings' });
-  } else if (view === 'intelligence') {
-    parts.push({ label: 'Intelligence' });
-  } else if (view === 'conversations') {
-    parts.push({ label: 'Conversations' });
-  } else if (view === 'traces') {
-    parts.push({ label: 'Traces' });
-  } else if (view === 'api') {
-    parts.push({ label: 'API' });
-  } else if (view === 'prompts') {
-    parts.push({ label: 'Prompts' });
-  }
+  const labels: Record<string, string> = {
+    run: 'Run', overview: 'Overview', savings: 'Savings', models: 'Models', agents: 'Agents',
+    tools: 'Tools', skills: 'Skills', workflows: 'Workflows', workspaces: 'Workspaces',
+    memory: 'Memory', evals: 'Evaluations', cache: 'Cache', alerts: 'Alerts',
+    approvals: 'Approvals', deployments: 'Deployments', incidents: 'Incidents',
+    projects: 'Projects', billing: 'Billing', settings: 'Settings',
+    intelligence: 'Intelligence', conversations: 'Conversations', traces: 'Traces', api: 'API',
+  };
+  const label = labels[view] || 'Overview';
   return (
     <nav className="o2-breadcrumbs" aria-label="Page breadcrumbs">
-      {parts.map((p, i) => (
-        <span key={i} style={{ marginRight: 8 }}>
-          {i > 0 ? ' / ' : ''}
-          <a href={p.href || '#'} style={{ color: 'var(--primary)', textDecoration: 'none' }}>{p.label}</a>
-        </span>
-      ))}
+      <span style={{ marginRight: 8 }}>
+        <a href="/console" style={{ color: 'var(--primary)', textDecoration: 'none' }}>{label}</a>
+      </span>
     </nav>
   );
 }
@@ -258,12 +231,36 @@ function Boot() {
       const params = new URLSearchParams(window.location.search);
       const t = params.get('theme');
       if (t === 'dark' || t === 'light') dispatch({ type: 'ui/set', patch: { theme: t } });
-      const v = (params.get('view') || '').toLowerCase();
-       if (v === 'overview' || v === 'savings' || v === 'models' || v === 'tools' || v === 'memory' || v === 'evals' || v === 'cache' || v === 'alerts' || v === 'projects' || v === 'billing' || v === 'settings' || v === 'run' || v === 'intelligence' || v === 'conversations' || v === 'traces' || v === 'api') {
-        dispatch({ type: 'ui/set', patch: { view: v as View } });
+      // Real route semantics first (/console/*), legacy ?view= as fallback.
+      const route = parseRoute(window.location.pathname, window.location.search);
+      dispatch({ type: 'ui/set', patch: { view: route.view } });
+      if (route.runId) dispatch({ type: 'runs/active', id: route.runId });
+      else {
+        const v = (params.get('view') || '').toLowerCase();
+        if (!window.location.pathname.startsWith('/console/') && (v === 'overview' || v === 'savings' || v === 'models' || v === 'agents' || v === 'tools' || v === 'skills' || v === 'workflows' || v === 'workspaces' || v === 'memory' || v === 'evals' || v === 'cache' || v === 'alerts' || v === 'approvals' || v === 'deployments' || v === 'incidents' || v === 'projects' || v === 'billing' || v === 'settings' || v === 'run' || v === 'intelligence' || v === 'conversations' || v === 'traces' || v === 'api')) {
+          dispatch({ type: 'ui/set', patch: { view: v as View } });
+        }
       }
+      const onPop = () => {
+        const r = parseRoute(window.location.pathname, window.location.search);
+        dispatch({ type: 'ui/set', patch: { view: r.view } });
+        if (r.runId) dispatch({ type: 'runs/active', id: r.runId });
+      };
+      window.addEventListener('popstate', onPop);
+      return () => window.removeEventListener('popstate', onPop);
     } catch { /* ignore */ }
   }, []);
+
+  // Keep the URL in sync with view + active run (deep links, Back/Forward).
+  const viewForUrl = state.ui.view;
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      if (!window.location.pathname.startsWith('/console') && window.location.pathname !== '/') return;
+      const want = buildRoute(viewForUrl, viewForUrl === 'run' ? activeId : null);
+      if (window.location.pathname !== want) window.history.replaceState({}, '', want);
+    } catch { /* ignore */ }
+  }, [viewForUrl, activeId]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -346,7 +343,7 @@ function Boot() {
         <main className="center cx-center" aria-label="Workspace">
           <PageHeader title={state.ui.view === 'run' ? 'Run Execution' : state.ui.view === 'overview' ? 'Overview' : state.ui.view === 'savings' ? 'Savings' : state.ui.view ? capitalizeFirst(state.ui.view) : 'OrchestraAI'} eyebrow={state.ui.view !== 'run' && state.ui.view ? getEyebrow(state.ui.view) : undefined} view={state.ui.view} />
           {state.ui.view !== 'run' ? (
-           state.ui.view === 'overview' ? <OverviewPage /> : state.ui.view === 'savings' ? <SavingsPage /> : state.ui.view === 'intelligence' ? <React.Suspense fallback={<div className="page" aria-label="Loading intelligence"><Skeleton lines={7} /></div>}><IntelligencePage /></React.Suspense> : state.ui.view === 'models' ? <ModelsPage /> : state.ui.view === 'memory' ? <MemoryPage /> : state.ui.view === 'tools' ? <ToolsPage /> : state.ui.view === 'evals' ? <OperationsPage kind="alerts" /> : state.ui.view === 'cache' ? <OperationsPage kind="cache" /> : state.ui.view === 'alerts' ? <OperationsPage kind="alerts" /> : state.ui.view === 'projects' ? <ProjectsPage /> : state.ui.view === 'billing' ? <BillingPage /> : state.ui.view === 'settings' ? <SettingsPage /> : state.ui.view === 'conversations' ? <OperationsPage kind="sessions" /> : state.ui.view === 'traces' ? <IntelligencePage /> : state.ui.view === 'api' ? <div className="page"><div className="o2-banner info" role="alert"><span>Developer API reference — coming soon.</span></div></div> : null
+            state.ui.view === 'overview' ? <OverviewPage /> : state.ui.view === 'savings' ? <SavingsPage /> : state.ui.view === 'intelligence' ? <React.Suspense fallback={<div className="page" aria-label="Loading intelligence"><Skeleton lines={7} /></div>}><IntelligencePage /></React.Suspense> : state.ui.view === 'models' ? <ModelsPage /> : state.ui.view === 'agents' ? <AgentsPage /> : state.ui.view === 'workflows' ? <WorkflowsPage /> : state.ui.view === 'skills' ? <SkillsPage /> : state.ui.view === 'workspaces' ? <WorkspacesPage /> : state.ui.view === 'approvals' ? <ApprovalsPage /> : state.ui.view === 'deployments' ? <DeploymentsPage /> : state.ui.view === 'incidents' ? <IncidentsPage /> : state.ui.view === 'memory' ? <MemoryPage /> : state.ui.view === 'tools' ? <ToolsPage /> : state.ui.view === 'evals' ? <EvalsPage /> : state.ui.view === 'cache' ? <OperationsPage kind="cache" /> : state.ui.view === 'alerts' ? <OperationsPage kind="alerts" /> : state.ui.view === 'projects' ? <ProjectsPage /> : state.ui.view === 'billing' ? <BillingPage /> : state.ui.view === 'settings' ? <SettingsPage /> : state.ui.view === 'conversations' ? <OperationsPage kind="sessions" /> : state.ui.view === 'traces' ? <div className="page"><div className="o2-banner info" role="status"><span>Standalone traces are not available yet — inspect execution traces in a run's Technical details or Live Intelligence.</span></div></div> : state.ui.view === 'api' ? <div className="page"><div className="o2-banner info" role="alert"><span>Developer API reference — coming soon.</span></div></div> : null
           ) : !snap ? (
             state.server.conn.status === 'disconnected' ? (
               <div className="o2-banner err" role="alert" style={{ margin: '12px 24px 0' }}>
@@ -371,7 +368,7 @@ function Boot() {
               {failedBanner(snap.status, activeRun?.status)}
               <FirstRunBanner />
               <RunHeader />
-              <MessageList messages={snap.messages} />
+              <RunStudio snap={snap} run={activeRun} messages={snap.messages} />
               <Composer />
             </>
           )}
@@ -411,11 +408,18 @@ function getEyebrow(view: View): string {
     savings: 'Customer economics and modeled savings',
     run: 'Live execution and runtime evidence',
     models: 'Model catalog and provider routing',
+    agents: 'Observed agent work — no invented catalog',
     tools: 'Tool executor and activity',
+    skills: 'Reusable capabilities — honest empty until backend ships skills',
+    workflows: 'Executable run plans from backend state',
+    workspaces: 'Projects and runtime environments',
     memory: 'Memory store and context',
     evals: 'Evaluation and quality evidence',
     cache: 'Cache hit rate and provider calls avoided',
     alerts: 'Reliability control and provider health',
+    approvals: 'Human decisions waiting — nothing auto-approved',
+    deployments: 'Release targets — honest empty until backend ships deploys',
+    incidents: 'Failed runs needing attention',
     projects: 'Workspace projects and teams',
     billing: 'BYOK platform accounting',
     settings: 'Configuration and policies',

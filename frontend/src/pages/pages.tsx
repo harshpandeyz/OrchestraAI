@@ -4,7 +4,8 @@ import { useRuntime } from '../state/store';
 import { resetOnboarding } from '../components/Onboarding';
 import { ProvidersSection } from '../components/Providers';
 import { Empty, StatusDot, displaySnippet, fmtPct, fmtSec, relTime, usd } from '../components/ui';
-import type { EvaluationRecord, HealthResponse, RuntimeConfigResponse, RuntimePreset, RuntimeSettings } from '../types';
+import { ParetoChart, useModelProfiles, ModelWhy } from '../components/models/ModelIntelligence';
+import type { EvaluationRecord, HealthResponse, PrincipalInfo, RuntimeConfigResponse, RuntimePreset, RuntimeSettings } from '../types';
 import '../styles/pages.css';
 
 /* ───────────────── MODELS ───────────────── */
@@ -143,13 +144,14 @@ export function ModelsPage() {
   const compareModels = compareIds
     .map((id) => state.server.models.find((m) => m.id === id))
     .filter((m): m is (typeof state.server.models)[number] => !!m);
+  const profiles = useModelProfiles();
 
   return (
     <div className="page">
       <div className="page-header">
         <div>
-          <h2>Models</h2>
-          <p className="lede">What OrchestraAI can use — and what it actually knows from real runs. {state.server.models.length} registered.</p>
+          <h2>Model Intelligence</h2>
+          <p className="lede">What each model is good at, how it performs in this workspace, what it costs, and how reliable it is. {state.server.models.length} registered.</p>
         </div>
         <button className="icon-btn sm" onClick={refresh} disabled={refreshing} aria-label="Refresh model catalog from provider">
           {refreshing ? 'Refreshing…' : 'Refresh catalog'}
@@ -182,6 +184,11 @@ export function ModelsPage() {
           ))}
         </div>
       </div>
+      {state.server.models.length > 0 && (
+        <section aria-label="Quality versus cost frontier" style={{ marginTop: 4 }}>
+          <ParetoChart models={state.server.models} />
+        </section>
+      )}
       {rows.length === 0 ? (
         <Empty what="Models" hint={state.server.models.length ? 'No models match this filter.' : 'No model metadata is currently available.'}
           action={!state.server.models.length ? <button className="icon-btn sm" onClick={refresh} disabled={refreshing}>Refresh catalog</button> : undefined} />
@@ -256,6 +263,23 @@ export function ModelsPage() {
                       <div className="mc-detail-item">
                         <span className="mc-detail-label">Provider</span>
                         <span className="mc-detail-value">{m.provider}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Lifecycle</span>
+                        <span className="mc-detail-value"><ModelWhy model={m} profile={profiles[m.id]} /></span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Good at</span>
+                        <span className="mc-detail-value">{profiles[m.id]?.strengths?.length ? profiles[m.id].strengths!.slice(0, 3).join(' · ') : (m.capabilities || []).length ? (m.capabilities || []).join(' · ') : 'Unknown — no capability signal recorded'}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">In this workspace</span>
+                        <span className="mc-detail-value mono">{(() => {
+                          const tp = profiles[m.id]?.taskPerformance || {};
+                          const entries = Object.entries(tp).slice(0, 3);
+                          if (!entries.length) return m.observed?.samples ? `${m.observed.samples} observed runs` : 'No workspace runs yet';
+                          return entries.map(([k, v]) => `${k}: ${v.successRate != null ? fmtPct(v.successRate, 0) : '—'}${v.samples ? ` (${v.samples})` : ''}`).join(' · ');
+                        })()}</span>
                       </div>
                     </div>
                     <details className="oa-details">
@@ -410,6 +434,30 @@ export function ToolsPage() {
                       <div className="mc-detail-item">
                         <span className="mc-detail-label">Success Rate</span>
                         <span className="mc-detail-value mono">{fmtPct(t.successRate, 1)}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Purpose</span>
+                        <span className="mc-detail-value">{t.description || 'Unknown — no purpose recorded.'}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Schema</span>
+                        <span className="mc-detail-value mono">Unknown — parameter schema not exposed by /api/tools.</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Side effects</span>
+                        <span className="mc-detail-value">Unknown — not classified by the backend; approvals gate risky calls.</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Permissions</span>
+                        <span className="mc-detail-value">{blocked ? 'BLOCKED by registry status' : 'Allowed subject to run toolPolicy'}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Risk</span>
+                        <span className="mc-detail-value">{blocked ? 'Blocked — cannot execute' : t.lastStatus === 'failed' ? 'Elevated — last call failed (observed)' : 'Unknown — no risk metadata exposed'}</span>
+                      </div>
+                      <div className="mc-detail-item">
+                        <span className="mc-detail-label">Last used</span>
+                        <span className="mc-detail-value mono">{t.calls > 0 ? `${t.calls} calls observed` : 'Never observed in this session'}</span>
                       </div>
                     </div>
                   </div>
@@ -1046,38 +1094,26 @@ export function SettingsPage() {
   );
 }
 
-// API access token for backends with authentication enabled. Write-only UI:
-// the stored token is never displayed back, only SET / NOT SET status.
+// Account / session status. There is no privileged token in this browser:
+// authentication is an HttpOnly session cookie managed by the server, so the
+// credential is never readable by JavaScript and survives XSS-style reads.
 function ApiAccessRow() {
-  const [draft, setDraft] = useState('');
-  const [hasToken, setHasToken] = useState<boolean>(() => !!api.getApiToken());
-  const [saved, setSaved] = useState(false);
+  const [session, setSession] = useState<PrincipalInfo | null | undefined>(undefined);
+  React.useEffect(() => {
+    let cancelled = false;
+    api.me().then((r) => { if (!cancelled) setSession(r.authenticated ? r.principal : null); })
+      .catch(() => { if (!cancelled) setSession(undefined); });
+    return () => { cancelled = true; };
+  }, []);
+  const state = session === undefined ? '…' : session ? `${session.role || 'authenticated'}` : 'Not signed in';
   return (
     <div className="settings-row">
       <div className="settings-row-info">
-        <span className="settings-row-label">API access</span>
-        <span className="settings-row-desc">Bearer token for API requests — only needed when the backend enables authentication. Stored only in this browser, never shown again.</span>
+        <span className="settings-row-label">Account session</span>
+        <span className="settings-row-desc">Signed in via a server-managed HttpOnly session cookie. No bearer token is stored in this browser. Use environment-configured API tokens for non-browser (scripts/CI) callers.</span>
       </div>
       <div className="settings-row-controls">
-        <span className={`pill sm ${hasToken ? 'ok' : 'neutral'}`}>{hasToken ? 'SET' : 'NOT SET'}</span>
-        <input
-          type="password"
-          autoComplete="off"
-          aria-label="API access token"
-          placeholder={hasToken ? '••••••••' : 'Paste token'}
-          value={draft}
-          onChange={(e) => { setDraft(e.target.value); setSaved(false); }}
-          style={{ maxWidth: 160 }}
-        />
-        <button
-          className="icon-btn sm"
-          disabled={!draft.trim()}
-          onClick={() => { api.setApiToken(draft.trim()); setDraft(''); setHasToken(true); setSaved(true); }}
-        >Save</button>
-        {hasToken && (
-          <button className="icon-btn sm" onClick={() => { api.setApiToken(null); setDraft(''); setHasToken(false); setSaved(false); }}>Clear</button>
-        )}
-        {saved && <span className="settings-row-desc" role="status">Saved.</span>}
+        <span className={`pill sm ${session ? 'ok' : 'neutral'}`}>{state}</span>
       </div>
     </div>
   );

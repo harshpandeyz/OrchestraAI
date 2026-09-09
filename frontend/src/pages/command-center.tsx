@@ -60,8 +60,14 @@ export function OverviewPage() {
   const s = data.summary;
   const state = aggregateState(s);
   const headline = state === 'saved' ? `${usd(s.customerNetSavings)} kept this period` : state === 'cost_increase' ? `${s.customerNetSavings === null ? '—' : usd(Math.abs(s.customerNetSavings))} cost increase this period` : stateLabel(state);
+  const failedRuns = (data.recentRuns || []).filter((r) => String(r.status).toLowerCase() === 'failed');
   return <div className="page command-page">
     <div className="page-header"><div><div className="eyebrow">CONTROL CENTER</div><h2>Overview</h2><p className="lede">Money first. Execution detail when you need to explain it.</p></div><StatePill result={{ calculationStatus: state === 'incomplete' ? 'incomplete' : state === 'insufficient_data' ? 'insufficient_data' : 'verified_modeled', economicOutcome: state === 'saved' || state === 'unchanged' || state === 'cost_increase' ? state : null, customerNetSavings: s.customerNetSavings }} /></div>
+    {failedRuns.length > 0 && (
+      <div className="banner warn" role="alert" style={{ margin: '0 0 12px' }}>
+        <span><b>{failedRuns.length} run{failedRuns.length === 1 ? '' : 's'} need{failedRuns.length === 1 ? 's' : ''} attention.</b> {failedRuns.slice(0, 2).map((r) => r.title).join(' · ')} — open Approvals & inbox to triage.</span>
+      </div>
+    )}
     <section className="economics-hero"><div><span className="eyebrow">CUSTOMER ECONOMICS · BYOK</span><h1>{headline}</h1><p>{s.runCount ? `${s.runCount} run${s.runCount === 1 ? '' : 's'} · modeled where pricing and usage are available, not invoice-reconciled` : 'Run real traffic to establish your baseline.'}</p></div><div className="economics-badge"><strong>{fmtPct(s.savingsRate || 0)}</strong><span>eligible savings rate</span></div></section>
     <div className="econ-grid"><Metric label={<span>Modeled baseline <CostBasisBadge basis="modeled" title="Counterfactual reference cost from the SavingsEngine" /></span>} value={usd(s.baselineCost)} detail="Counterfactual reference cost" /><Metric label={<span>Actual provider cost <CostBasisBadge basis="actual" title="Metered provider spend — backend authoritative" /></span>} value={usd(s.optimizedProviderCost)} detail="Paid directly by you" /><Metric label={<span>Orchestra platform fee <CostBasisBadge basis="modeled" title="Fee on positive modeled savings only" /></span>} value={usd(s.platformFee)} detail="Fee on positive modeled savings" /><Metric label="Customer final cost" value={usd(s.customerFinalCost)} detail="Provider cost + platform fee" tone={s.customerNetSavings !== null && s.customerNetSavings > 0 ? 'positive' : ''} /></div>
     <EconomicsLegend compact />

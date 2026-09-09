@@ -5,6 +5,7 @@ import { Execution, Reliability } from './Execution';
 import { Hero } from './Hero';
 import { Nav } from './Nav';
 import { Routing } from './Routing';
+import { StrategyDemo } from './StrategyDemo';
 import { ConsoleShowcase, Pricing, Security } from './Showcase';
 import { CapabilityStrip, Why } from './Why';
 
@@ -23,6 +24,7 @@ export function LandingPage() {
         <CapabilityStrip />
         <Why />
         <Routing />
+        <StrategyDemo />
         <Analytics />
         <Execution />
         <Reliability />

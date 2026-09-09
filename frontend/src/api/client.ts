@@ -2,26 +2,19 @@
 import type { AlertRecord, AnalyticsOverview, ApprovalRecord, BillingResponse, CacheOverview, ChangeSetView, CompareResponse, EpisodeView, EvaluationRecord, ExecutionView, HealthResponse, MemoryItem, ModelChange, ModelInfo, NewRunOptions, PrincipalInfo, ProjectCreateOptions, ProjectInfo, ProviderInfo, Run, RuntimeConfigResponse, RuntimePreset, RuntimeSettings, RuntimeSnapshot, SavingsRunRow, SessionRecord, UserInfo, VerificationRecord, WaterfallRow } from '../types';
 
 const BASE = '';
-const TOKEN_KEY = 'orchestra-api-token';
 const REQUEST_ID_KEY = 'orchestra-request-id';
-// Runtime API token for backends with authentication enabled. Stored only in
-// this browser, sent as a Bearer header, never rendered or logged. The
-// Local development may be open; production uses a session cookie or this
-// optional operator token. Tokens are only sent as Authorization headers.
+// Authentication is an HttpOnly session cookie managed by the server
+// (SameSite=Lax; Secure in production). The browser never stores or reads any
+// credential in JavaScript: credentialed fetches carry the cookie
+// automatically, and there is intentionally no localStorage bearer token
+// path. Server-to-server clients continue to use env-configured bearer
+// tokens, which is out of scope for this browser client.
 
-export function getApiToken(): string | null {
-  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
-}
-export function setApiToken(token: string | null): void {
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch { /* private mode — session only */ }
-}
 export function generateRequestId(): string {
   return 'req-' + Math.random().toString(36).substring(2, 18);
 }
 // Cached request ID per browser session, so consecutive calls correlate.
+// (This is a non-secret correlation id, not a credential.)
 export function getRequestId(): string | null {
   try { return localStorage.getItem(REQUEST_ID_KEY); } catch { return null; }
 }
@@ -29,7 +22,7 @@ export function setRequestId(id: string | null): void {
   try {
     if (id) localStorage.setItem(REQUEST_ID_KEY, id);
     else localStorage.removeItem(REQUEST_ID_KEY);
-  } catch { /* private mode — session only */ }
+  } catch { /* private mode — session-only */ }
 }
 
 export class ApiError extends Error {
@@ -48,12 +41,10 @@ export class ApiError extends Error {
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...((init?.headers || {}) as Record<string, string>) };
   try {
-    const token = localStorage.getItem(TOKEN_KEY);
-    if (token && !headers['Authorization']) headers['Authorization'] = `Bearer ${token}`;
     const rid = localStorage.getItem(REQUEST_ID_KEY) || generateRequestId();
     headers['X-Request-Id'] = rid;
     localStorage.setItem(REQUEST_ID_KEY, rid);
-  } catch { /* private mode — unauthenticated */ }
+  } catch { /* private mode — no correlation id */ }
   const res = await fetch(`${BASE}${path}`, { credentials: 'include', ...init, headers });
   if (!res.ok) {
     let detail = '';
@@ -64,15 +55,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       else if ((parsedBody as { code?: string }).code) detail = ` (${(parsedBody as { code?: string }).code})`;
     } catch { /* ignore */ }
     // 401/403 surface explicitly (never silent): callers show the message,
-    // and the Settings API-access row explains the token requirement.
+    // and the account/settings surface explains the session requirement.
     throw new ApiError(`API ${res.status} ${path}${detail}`, res.status, path, localStorage.getItem(REQUEST_ID_KEY) || generateRequestId());
   }
   return res.json() as Promise<T>;
 }
 
 export const api = {
-  getApiToken,
-  setApiToken,
   health: () => req<HealthResponse>(`/api/health`),
   config: () => req<RuntimeConfigResponse>(`/api/config`),
   getRuns: () => req<{ runs: Run[] }>(`/api/runs`),
@@ -110,6 +99,9 @@ export const api = {
   continueRun: (id: string, content: string) => req<{ ok: boolean; episode?: EpisodeView; error?: string }>(`/api/runs/${id}/continue`, { method: 'POST', body: JSON.stringify({ content }) }),
   getPlan: (id: string) => req<{ plan: ExecutionView['plan'] }>(`/api/runs/${id}/plan`),
   getChangesets: (id: string) => req<{ changesets: ChangeSetView[] }>(`/api/runs/${id}/changesets`),
+  applyChangeset: (id: string, changesetId: string, approvalId?: string | null) => req<{ changeset?: ChangeSetView; needsApproval?: boolean; approvalId?: string }>(`/api/runs/${id}/changesets/${changesetId}/apply`, { method: 'POST', body: JSON.stringify(approvalId ? { approvalId } : {}) }),
+  rollbackChangeset: (id: string, changesetId: string) => req<{ ok: boolean; restored?: unknown; changeset?: ChangeSetView; error?: string }>(`/api/runs/${id}/changesets/${changesetId}/rollback`, { method: 'POST', body: JSON.stringify({}) }),
+  getModelIntelligence: () => req<{ profiles: { modelId: string; strengths?: string[]; taskPerformance?: Record<string, { successRate?: number | null; samples?: number }>; providerHealth?: { healthy?: boolean | null; lastError?: string | null } }[] }>(`/api/models/intelligence`),
   verifyRun: (id: string) => req<{ ok: boolean; records?: VerificationRecord[] }>(`/api/runs/${id}/verify`, { method: 'POST', body: JSON.stringify({}) }),
   streamUrl: (id: string, since?: number) => `/api/runs/${id}/events${since ? `?since=${since}` : ''}`,
   getSavings: (query = '') => req<{ summary: AnalyticsOverview['summary']; runs: SavingsRunRow[]; waterfall: WaterfallRow[]; note: string }>(`/api/savings${query}`),
