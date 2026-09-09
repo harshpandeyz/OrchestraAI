@@ -56,7 +56,7 @@ const { TaskStatus, EventType } = require('./src/core/types');
 const { IntelligenceStore, buildCapabilityProfile } = require('./src/intelligence');
 const { VERSIONS } = require('./src/intelligence/versions');
 const { attachExecution } = require('./src/execution/controller');
-const { loadAuthConfig, authenticate, requireRole, canAccessRun, isGlobalAdmin } = require('./src/auth');
+const { loadAuthConfig, authenticate, requireRole, canAccessRun, isGlobalAdmin, readSessionCookie, buildSessionCookie, clearSessionCookie } = require('./src/auth');
 const { resolveProviderRuntime, disabledSet } = require('./src/provider-runtime');
 const { loadLimits } = require('./src/limits');
 const { appVersion } = require('./src/version');
@@ -628,8 +628,19 @@ async function persistActive() {
     for (const run of runs) {
       safeRuns.push(persistedRunSummary(run, await privacyModeForRun(run)));
     }
-    const r = await runStore.saveRunIndex(mergeIndex(await runStore.loadRunIndex(), safeRuns));
-    if (!r.ok) log.warn('run index persist failed', { error: r.error });
+    let r;
+    if (runStore.kind === 'postgres') {
+      // Postgres already persists each terminal summary incrementally (run-end
+      // hook). Re-writing the whole run_index every tick would be O(all runs)
+      // and re-scan the per-tenant retention prune; only the active window
+      // needs a refresh here.
+      if (safeRuns.length) r = await runStore.saveRunIndex(safeRuns);
+    } else {
+      // File mode stores the index as one JSON document, so reconcile the
+      // active summaries over the persisted index and rewrite it.
+      r = await runStore.saveRunIndex(mergeIndex(await runStore.loadRunIndex(), safeRuns));
+    }
+    if (r && !r.ok) log.warn('run index persist failed', { error: r.error });
     for (const run of runs) {
       await persistRunArtifacts(run.id, run);
     }
@@ -752,6 +763,9 @@ const execution = attachExecution(orchestrator, {
 wireQueueHandlers(jobQueue);
 
 // Merge live summaries over the persisted index (live wins on conflict).
+// No global count cap: retention is enforced per-tenant by the adapters, and
+// the listing surface filters by ownership, so no tenant's history is ever
+// silently dropped because another tenant is more active.
 function mergeIndex(persisted, live) {
   const byId = new Map();
   for (const entry of persisted || []) {
@@ -760,7 +774,7 @@ function mergeIndex(persisted, live) {
   for (const run of live || []) {
     if (run && run.id) byId.set(run.id, run);
   }
-  return Array.from(byId.values()).slice(-200);
+  return Array.from(byId.values());
 }
 
 function economicsForRuntime(runtimeState, explicitReferenceModelId = null) {
@@ -860,7 +874,9 @@ async function persistRunArtifacts(runId, summary = null) {
 }
 
 async function visibleRunIndex(principal) {
-  const all = mergeIndex(await runStore.loadRunIndex(), orchestrator.getActiveRuns());
+  const scoped = authConfig.enabled && principal && !isGlobalAdmin(principal)
+    ? { orgId: principal.orgId } : {};
+  const all = mergeIndex(await runStore.loadRunIndex(scoped), orchestrator.getActiveRuns());
   if (!authConfig.enabled || !principal || isGlobalAdmin(principal)) return all;
   return all.filter((r) => {
     const owner = r && (r.ownerId || r.owner);
@@ -1075,23 +1091,9 @@ function newRequestId() {
   return `req-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
 }
 
-// CORS: configured frontend origin(s) only in production. Loopback origins
-// stay usable for local development outside live mode. Unknown origins get no
-// ACAO header (browser blocks); non-browser clients (no Origin) are unaffected.
-// Pure + unit-testable CORS rule. corsHeaders() below binds it to this
-// process's config.
-function resolveCorsOrigin(origin, opts = {}) {
-  if (!origin) return {};
-  const configured = String(opts.frontendOrigin || '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  if (configured.includes(origin)) {
-    return { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
-  }
-  if (!opts.isLive && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-    return { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
-  }
-  return {};
-}
+// CORS + security headers live in src/security/http-headers.js (pure/unit-
+// testable). These bindings preserve the existing export surface exactly.
+const { resolveCorsOrigin, securityHeaders: buildSecurityHeaders } = require('./src/security/http-headers');
 
 function corsHeaders(req) {
   return resolveCorsOrigin(req.headers && req.headers.origin, {
@@ -1101,17 +1103,7 @@ function corsHeaders(req) {
 }
 
 function securityHeaders() {
-  const headers = {
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
-    'Content-Security-Policy': "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:5173 http://127.0.0.1:5173",
-  };
-  if (config.isProduction || currentMode() === 'live') {
-    headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
-  }
-  return headers;
+  return buildSecurityHeaders({ secure: config.isProduction || currentMode() === 'live' });
 }
 
 function send(res, code, obj) {
@@ -1235,73 +1227,18 @@ function sseLine(envelope) {
 
 // ---------- production console (frontend/dist) ----------
 //
-// `npm run build` (frontend) + Docker both produce frontend/dist. When it is
-// present the runtime also serves the console itself, so one process is the
-// whole deployable product (:8787 serves UI + API). Dev keeps using Vite
-// (:5173 with /api proxy) — this only engages for the built bundle.
-// Zero dependencies: minimal safe static server (GET only, traversal-proof,
-// no directory listing, SPA fallback to index.html for non-/api routes).
+// Zero-dependency static server (GET only, traversal-proof, no directory
+// listing, SPA fallback). Implemented in src/services/static-console.js and
+// bound here so one process serves UI + API on :8787.
 
-const DIST_DIR = path.resolve(__dirname, '..', 'frontend', 'dist');
-let DIST_OK = false;
-try {
-  DIST_OK = fs.existsSync(path.join(DIST_DIR, 'index.html'));
-} catch { DIST_OK = false; }
-
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-  '.woff': 'font/woff',
-  '.ttf': 'font/ttf',
-  '.map': 'application/json; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-};
-
-function serveConsole(req, res, pathname) {
-  if (!DIST_OK || (req.method !== 'GET' && req.method !== 'HEAD')) return false;
-  if (pathname.startsWith('/api/')) return false;
-  let rel;
-  try {
-    rel = decodeURIComponent(pathname);
-  } catch {
-    return false;
-  }
-  if (rel === '/' || rel === '') rel = '/index.html';
-  // Traversal guard: resolve inside DIST_DIR only.
-  const resolved = path.normalize(path.join(DIST_DIR, rel));
-  if (resolved !== DIST_DIR && !resolved.startsWith(DIST_DIR + path.sep)) return false;
-  let file = resolved;
-  try {
-    const st = fs.statSync(file);
-    if (st.isDirectory()) file = path.join(file, 'index.html');
-  } catch {
-    // SPA fallback: unknown non-asset routes serve the console shell.
-    if (!path.extname(resolved)) file = path.join(DIST_DIR, 'index.html');
-    else return false;
-  }
-  let data;
-  try {
-    data = fs.readFileSync(file);
-  } catch {
-    return false;
-  }
-  const headers = {
-    ...securityHeaders(),
-    'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-    'Cache-Control': file.includes(`${path.sep}assets${path.sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
-    ...(res._cors || {}),
-  };
-  res.writeHead(200, headers);
-  if (req.method === 'GET') res.end(data);
-  else res.end();
-  return true;
-}
+const { resolveConsoleRoot, createConsoleHandler } = require('./src/services/static-console');
+const consoleRoot = resolveConsoleRoot(path.resolve(__dirname, '..'));
+const serveConsole = createConsoleHandler({
+  dist: consoleRoot.dist,
+  enabled: consoleRoot.ok,
+  securityHeaders,
+  cors: (req) => req._cors || {},
+});
 
 // ---------- validation ----------
 
@@ -1485,7 +1422,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const created = await tenants.signup({ email: json.email, password: json.password, name: json.name });
           const session = await tenants.login({ email: json.email, password: json.password });
-          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || config.isProduction ? '; Secure' : ''}`;
+          res._setCookie = buildSessionCookie(session.token, { secure: currentMode() === 'live' || config.isProduction });
           await auditEvent({ actor: created.user.id, action: 'auth.signup', orgId: created.user.orgId, detail: { projectId: created.project && created.project.id } });
           return send(res, 201, { user: created.user, project: created.project });
         } catch (e) {
@@ -1496,7 +1433,7 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && path === '/api/auth/login') {
         try {
           const session = await tenants.login({ email: json.email, password: json.password });
-          res._setCookie = `oa_session=${encodeURIComponent(session.token)}; HttpOnly; SameSite=Lax; Path=/${currentMode() === 'live' || config.isProduction ? '; Secure' : ''}`;
+          res._setCookie = buildSessionCookie(session.token, { secure: currentMode() === 'live' || config.isProduction });
           await auditEvent({ actor: session.user.id, action: 'auth.login', orgId: session.user.orgId });
           return send(res, 200, { user: session.user });
         } catch (e) {
@@ -1504,11 +1441,11 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (req.method === 'POST' && path === '/api/auth/logout') {
-        const rawCookie = String(req.headers.cookie || '').split(';').map((v) => v.trim()).find((v) => v.startsWith('oa_session='));
+        const rawCookie = readSessionCookie(req.headers);
         if (rawCookie) {
-          try { await tenants.revoke(decodeURIComponent(rawCookie.slice('oa_session='.length))); } catch {}
+          try { await tenants.revoke(rawCookie); } catch {}
         }
-        res._setCookie = 'oa_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0';
+        res._setCookie = clearSessionCookie();
         return send(res, 200, { ok: true });
       }
       if (req.method === 'GET' && path === '/api/auth/me') {
@@ -1874,7 +1811,7 @@ const server = http.createServer(async (req, res) => {
         const models = await modelRegistry.getModels();
         const profiles = models.map((m) => {
           const obs = typeof modelRegistry.getObserved === 'function' ? modelRegistry.getObserved(m.id) : null;
-          const taskPerf = intelligence.performance ? intelligence.performance.forModel(m.id) : {};
+          const taskPerf = intelligence.performance ? intelligence.performance.forModel(m.id, principal && principal.orgId) : {};
           return buildCapabilityProfile(m, obs, taskPerf);
         });
         return send(res, 200, { profiles, versions: VERSIONS, mode: currentMode() });
@@ -1886,7 +1823,7 @@ const server = http.createServer(async (req, res) => {
         const model = await modelRegistry.getModel(modelId);
         if (!model) return sendError(res, 404, 'not_found', 'model not found');
         const obs = typeof modelRegistry.getObserved === 'function' ? modelRegistry.getObserved(modelId) : null;
-        const taskPerf = intelligence.performance ? intelligence.performance.forModel(modelId) : {};
+        const taskPerf = intelligence.performance ? intelligence.performance.forModel(modelId, principal && principal.orgId) : {};
         return send(res, 200, {
           profile: buildCapabilityProfile(model, obs, taskPerf),
           versions: VERSIONS,
@@ -2193,6 +2130,7 @@ const server = http.createServer(async (req, res) => {
           runs: allRuns, economicsByRun, snapshotsByRun,
           models: registryModels, observedByModel, intelligence,
           mode: intelMode,
+          tenantId: principal ? (principal.orgId || null) : null,
           options: { granularity, range, from, to, filters },
         });
         const sectionKey = INTELLIGENCE_SECTIONS[path];
@@ -2264,14 +2202,7 @@ const server = http.createServer(async (req, res) => {
         // only their own tenant's runs. Ownerless legacy records are
         // quarantined rather than treated as public.
         if (authConfig.enabled && needAuth(res, principal)) return;
-        const all = mergeIndex(await runStore.loadRunIndex(), orchestrator.getActiveRuns());
-        if (authConfig.enabled && principal && !isGlobalAdmin(principal)) {
-          return send(res, 200, { runs: all.filter((r) => {
-            const owner = (r && (r.ownerId || r.owner)) || null;
-            return !!owner && (owner === principal.id || (r.orgId && principal.orgId && r.orgId === principal.orgId));
-          }) });
-        }
-        return send(res, 200, { runs: all });
+        return send(res, 200, { runs: await visibleRunIndex(principal) });
       }
       if (req.method === 'POST' && path === '/api/runs') {
         if (isDraining()) return sendError(res, 503, 'draining', 'server is shutting down; no new runs accepted');
