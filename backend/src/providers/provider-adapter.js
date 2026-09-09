@@ -57,6 +57,8 @@ class ProviderError extends Error {
 function classifyHttpStatus(status) {
   if (status === 401 || status === 403) return { code: 'auth', retryable: false };
   if (status === 429) return { code: 'rate_limit', retryable: true };
+  if (status === 408) return { code: 'timeout', retryable: true };
+  if (status === 409) return { code: 'conflict', retryable: false };
   if (status === 400 || status === 422) return { code: 'bad_request', retryable: false };
   if (status === 404) return { code: 'not_found', retryable: false };
   if (status >= 500) return { code: 'unavailable', retryable: true };
@@ -863,6 +865,7 @@ module.exports = {
   normalizedUsage,
   parseSseData,
   isModelAccessFailure,
+  classifyHttpStatus,
   ProviderError,
   ProviderAdapter,
   OpenAICompatibleAdapter,

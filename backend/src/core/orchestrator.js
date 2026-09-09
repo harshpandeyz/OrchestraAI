@@ -373,6 +373,8 @@ class Orchestrator {
           const hasTestCounts = calls.some((c) => c && c.name === 'run_tests' && c.success === true && c.result && (Number.isFinite(Number(c.result.passed)) || Number.isFinite(Number(c.result.failed))));
           this.intelligence.ingestRunOutcome({
             runId: runtimeState.runId,
+            orgId: runtimeState.orgId || null,
+            projectId: runtimeState.projectId || null,
             modelId: runtimeState.model.currentModel,
             taskText: runtimeState.task.objective,
             taskCategory: runtimeState.task.taskType && runtimeState.task.taskType !== 'general'

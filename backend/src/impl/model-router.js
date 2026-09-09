@@ -645,6 +645,7 @@ class InMemoryModelRouter extends ModelRouter {
       if (this.intelligence && this.intelligence.routingHistory) {
         this.intelligence.routingHistory.record({
           runId: runtimeState.runId,
+          tenantId: runtimeState.orgId || null,
           taskCategory: (evaluation.taskProfile && evaluation.taskProfile.category) || selected.taskCategory || 'general',
           selectedModel,
           candidates: ranked.map((c) => ({
@@ -864,6 +865,7 @@ class InMemoryModelRouter extends ModelRouter {
       const scored = routerIntel.scoreCandidate(model, {
         taskProfile: profile,
         performanceStore: store,
+        tenantId: (runtimeState.orgId) || null,
         needTokens,
         cachedTokens,
         remainingBudget: remaining,
