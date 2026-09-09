@@ -8,6 +8,7 @@ import { Empty, fmtK, fmtPct, fmtSec, fmtTime, relTime, usd } from '../component
 import { IconChevronRight } from '../components/icons';
 import { ApprovalCenter } from '../components/execution/ApprovalCenter';
 import { EvidencePanel } from '../components/outcome/EvidencePanel';
+import { DecisionCard, RiskCard, CostWaterfall, ContextComposition, WhyPopover } from '../components/v2/cards';
 import { LineChart } from './charts';
 import { useRuntimeTelemetry } from './telemetry';
 import type { RuntimeSnapshot } from '../types';
@@ -311,6 +312,14 @@ export function LiveIntelligence() {
   const eff = effectiveStatus(snap.status, runRec?.status);
   const terminal = ['completed', 'failed', 'cancelled'].includes(eff);
   const pendingCount = (snap.execution?.pendingApprovals || []).length || (snap.approvals || []).filter((a) => a.status === 'pending' || a.status === 'PENDING').length;
+  // Risk: files affected is real (changesets); external/irreversible stay
+  // Unknown unless the backend exposes them — never invented.
+  const changesetFiles = (snap.execution?.changesets || []).reduce((a, c) => a + (c.files || []).length, 0);
+  const riskFiles = changesetFiles > 0 ? changesetFiles : snap.changes.length > 0 ? null : null;
+  const waitingApproval = !!snap.execution?.waitingForApproval || pendingCount > 0;
+  const planSteps = snap.execution?.plan?.steps || [];
+  const planDone = planSteps.filter((s) => /complete|done|verif/i.test(s.status)).length;
+  const decision = snap.routing.decision;
   return (
     <aside className={`o2-intel ${open ? 'open' : ''}`} aria-label="Runtime inspector">
       <span className="o2-sheet-handle" aria-hidden="true" />
@@ -325,12 +334,44 @@ export function LiveIntelligence() {
         {terminal ? 'Final state · read-only history' : 'Live · updating as the run executes'}
       </div>
 
-      <ModelBlock snap={snap} />
-      <LatencyHero snap={snap} />
-      <CostFlow snap={snap} />
-      <ContextFlow snap={snap} />
-      <ToolsFlow snap={snap} />
+      {/* 1 — CURRENT DECISION */}
+      <div className="o2-telesec" aria-label="Current decision">
+        <div className="o2-telerow" style={{ marginBottom: 6 }}><span className="o2-eyebrow">Current decision</span>
+          <WhyPopover title="Why this model?" lines={(decision?.factors || []).map((f) => `${f.label}${f.detail ? ` — ${f.detail}` : ''}`)} meta={decision ? `${decision.kind} · ${relTime(decision.timestamp)}` : undefined} />
+        </div>
+        <DecisionCard
+          decision={decision}
+          selectedLabel={snap.activeModelId ? String(snap.activeModelId).split('/').pop() : undefined}
+          alternatives={(snap.routing.candidates || []).filter((c) => c.modelId !== snap.routing.currentId).slice(0, 2).map((c) => ({ id: String(c.modelId).split('/').pop() || c.modelId, note: `score ${Number(c.score).toFixed(2)}` }))}
+        />
+      </div>
 
+      {/* 2 — MODEL / AGENT */}
+      <ModelBlock snap={snap} />
+
+      {/* 3 — PROGRESS */}
+      <div className="o2-telesec" aria-label="Progress">
+        <div className="o2-telerow"><span className="o2-eyebrow">Progress</span></div>
+        {planSteps.length > 0 ? (
+          <div className="o2-telesub"><span className="o2-num">{planDone}/{planSteps.length}</span> plan steps complete</div>
+        ) : (
+          <div className="o2-telesub">No plan steps recorded — progress follows the execution trace.</div>
+        )}
+        <LatencyHero snap={snap} />
+      </div>
+
+      {/* 4 — COST */}
+      <CostFlow snap={snap} />
+      <div className="o2-telesec" aria-label="Cost breakdown">
+        <CostWaterfall rows={snap.cost.breakdown || []} total={snap.cost.spentUsd} budget={snap.cost.budgetUsd} remaining={typeof snap.cost.budgetUsd === 'number' ? snap.cost.budgetUsd - snap.cost.spentUsd : null} />
+      </div>
+
+      {/* 5 — RISK (high-risk dominates) */}
+      <div className="o2-telesec" aria-label="Risk">
+        <RiskCard filesAffected={riskFiles} externalActions={null} irreversible={null} approvalRequired={waitingApproval ? true : pendingCount === 0 ? false : null} level={waitingApproval ? 'high' : undefined} />
+      </div>
+
+      {/* Approvals stay visible as the attention surface */}
       <div className="o2-telesec" aria-label="Approvals" style={{ paddingBottom: 8 }}>
         <div className="o2-telerow" style={{ marginBottom: 6 }}>
           <span className="o2-eyebrow">Approvals{pendingCount > 0 ? ` · ${pendingCount} waiting` : ''}</span>
@@ -338,14 +379,25 @@ export function LiveIntelligence() {
         <ApprovalCenter snap={snap} />
       </div>
 
+      {/* 6 — TOOLS */}
+      <ToolsFlow snap={snap} />
+      <ContextFlow snap={snap} />
+
+      {/* 7 — EVIDENCE */}
+      <Disclosure id="evidence" title="Evidence">
+        <div id="sec-evidence"><EvidencePanel snap={snap} /></div>
+      </Disclosure>
+
+      {/* 8 — CONTEXT */}
+      <div className="o2-telesec" aria-label="Context composition">
+        <ContextComposition segments={snap.context.segments || []} items={snap.context.items || []} />
+      </div>
+
       <RoutingFlow snap={snap} />
       <WhyFlow snap={snap} />
       <SwitchFlow snap={snap} />
       <CacheFlow snap={snap} />
 
-      <Disclosure id="evidence" title="Evidence">
-        <div id="sec-evidence"><EvidencePanel snap={snap} /></div>
-      </Disclosure>
       <Disclosure id="changes" title="What changed?">
         <div id="sec-changes">
           {!snap.changes.length && <Empty what="Changes" hint="Runtime change events appear here." />}
@@ -357,8 +409,8 @@ export function LiveIntelligence() {
           ))}
         </div>
       </Disclosure>
-      <TraceFlow />
 
+      {/* 9 — TECHNICAL */}
       <Disclosure id="technical" title="Technical details">
         <div className="o2-kv"><span className="o2-k">Status</span><span className="o2-v mono">{String(snap.status)}</span></div>
         <div className="o2-kv"><span className="o2-k">Run</span><span className="o2-v mono">{snap.runId}</span></div>
@@ -376,6 +428,9 @@ export function LiveIntelligence() {
           </div>
         )}
       </Disclosure>
+
+      {/* 10 — TRACE */}
+      <TraceFlow />
     </aside>
   );
 }

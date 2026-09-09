@@ -17,6 +17,19 @@ const AUTONOMY: { id: 'auto' | 'readonly'; label: string; hint: string }[] = [
   { id: 'readonly', label: 'Restricted', hint: 'I operate under strict limitations — no file edits or deploys.' },
 ];
 
+const INTENT_TEMPLATES: { label: string; title: string; taskMode: string }[] = [
+  { label: 'Fix bug', title: 'Fix bug: ', taskMode: 'debug' },
+  { label: 'Build feature', title: 'Build feature: ', taskMode: 'code' },
+  { label: 'Research', title: 'Research: ', taskMode: 'research' },
+  { label: 'Review', title: 'Review: ', taskMode: 'general' },
+  { label: 'Analyze', title: 'Analyze: ', taskMode: 'research' },
+  { label: 'Automate', title: 'Automate: ', taskMode: 'code' },
+  { label: 'Deploy', title: 'Deploy: ', taskMode: 'code' },
+  { label: 'Security audit', title: 'Security audit: ', taskMode: 'debug' },
+  { label: 'Fix CI', title: 'Fix CI: ', taskMode: 'debug' },
+  { label: 'Review PR', title: 'Review PR: ', taskMode: 'general' },
+];
+
 /**
  * New task flow: outcome-first. "What do you want done?" dominates;
  * "How should I work?" maps to real backend presets + tool policy with
@@ -118,6 +131,18 @@ export function NewRunDialog() {
           <span className="sr-only">Task title</span>
           <input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={200} placeholder="Fix the authentication refresh bug…" aria-label="Task title" autoFocus />
         </label>
+        <div className="nr-field">
+          <span id="nr-template-label">Start from a template</span>
+          <div className="nr-modes" role="group" aria-labelledby="nr-template-label" style={{ flexWrap: 'wrap' }}>
+            {INTENT_TEMPLATES.map((t) => (
+              <button key={t.label} type="button" className="chip" title={`Template: ${t.label} (sets ${t.taskMode} mode)`}
+                onClick={() => { setTaskMode(t.taskMode); setTitle((prev) => (prev === 'New agent run' || !prev ? t.title : prev)); dispatch({ type: 'ui/set', patch: { taskMode: t.taskMode } }); }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <small className="nr-hint">Templates set the task mode and title prefix — execution still follows backend presets and policy.</small>
+        </div>
         <div className="nr-field">
           <span id="nr-mode-label">Task mode</span>
           <div className="nr-modes" role="radiogroup" aria-labelledby="nr-mode-label">

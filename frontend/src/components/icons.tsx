@@ -108,3 +108,36 @@ export const IconArrowDown = (p: P) => (
 export const IconCollapse = (p: P) => (
   <Svg {...p}><path d="M10 3 5 8l5 5" /></Svg>
 );
+export const IconHome = (p: P) => (
+  <Svg {...p}><path d="M2.5 7.2 8 2.8l5.5 4.4" /><path d="M4 6.6V13h8V6.6" /></Svg>
+);
+export const IconRuns = (p: P) => (
+  <Svg {...p}><circle cx="8" cy="8" r="5.6" /><path d="M6.7 5.7v4.6L10.3 8z" /></Svg>
+);
+export const IconFolder = (p: P) => (
+  <Svg {...p}><path d="M2 4.4h4.2l1.4 2H14v5.2H2z" /></Svg>
+);
+export const IconTrendDown = (p: P) => (
+  <Svg {...p}><path d="M2.5 3.5 7 8l3-3 3.5 3.5" /><path d="M10.5 8.5h3v-3" /></Svg>
+);
+export const IconCpu = (p: P) => (
+  <Svg {...p}><rect x="3.5" y="3.5" width="9" height="9" rx="2" /><rect x="6.8" y="6.8" width="2.4" height="2.4" rx="0.6" /><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M4.8 4.8l1.2 1.2M10 10l1.2 1.2M11.2 4.8 10 6M6 10l-1.2 1.2" /></Svg>
+);
+export const IconMessages = (p: P) => (
+  <Svg {...p}><path d="M2.5 3.5h11v6.5h-7l-2.2 2V3.5Z" /><path d="M6 6h4M6 8h2.5" /></Svg>
+);
+export const IconBell = (p: P) => (
+  <Svg {...p}><path d="M8 2.3c-1.8 0-3.1 1.4-3.1 3.4 0 1.9-.5 2.7-1.2 3.7h8.6c-.7-1-1.2-1.8-1.2-3.7 0-2-1.3-3.4-3.1-3.4Z" /><path d="M6.6 12.4a1.5 1.5 0 0 0 2.8 0" /></Svg>
+);
+export const IconCode = (p: P) => (
+  <Svg {...p}><path d="M5 4.6 2.6 8 5 11.4M11 4.6 13.4 8 11 11.4M9.2 3.4 6.8 12.6" /></Svg>
+);
+export const IconShield = (p: P) => (
+  <Svg {...p}><path d="M8 2 13 4v3.4c0 2.8-2 4.8-5 6.6-3-1.8-5-3.8-5-6.6V4z" /><path d="M6.1 8.1 7.6 9.6l2.3-2.7" /></Svg>
+);
+export const IconArchive = (p: P) => (
+  <Svg {...p}><path d="M2.5 4.4h11v3h-11z" /><path d="M3.5 7.4V12h9V7.4" /><path d="M6.5 9.6h3" /></Svg>
+);
+export const IconNetwork = (p: P) => (
+  <Svg {...p}><circle cx="3" cy="8" r="1.6" /><circle cx="13" cy="8" r="1.6" /><circle cx="8" cy="3" r="1.6" /><circle cx="8" cy="13" r="1.6" /><path d="M4.3 6.7 6.7 4.3M9.3 4.3 11.7 6.7M4.3 9.3 6.7 11.7M9.3 11.7 11.7 9.3" /></Svg>
+);

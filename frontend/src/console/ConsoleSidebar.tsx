@@ -1,131 +1,196 @@
-// Console sidebar, v4: authenticated console navigation — restrained, typography-first.
-import React, { useMemo } from 'react';
+// Console sidebar V2: Workspace / Build / Intelligence / Operate IA.
+// Collapsible groups, keyboard navigation, workspace switching, search.
+// Collapsed mode via leftOpen=false rail affordance in App shell.
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useRuntime } from '../state/store';
+import type { View } from '../state/store';
 import { relTime } from '../components/ui';
 import { Tip, shortcutLabel } from '../components/Tooltip';
-import { IconPlus, IconSearch, IconSettings, IconChevronRight, IconChevronDown } from '../components/icons';
+import { navigateRoute } from '../lib/routes';
+import {
+  IconChevronRight, IconHome, IconRuns, IconFolder, IconModel, IconEval,
+  IconSettings, IconTool, IconMemory, IconCpu, IconNetwork,
+  IconArchive, IconBell, IconMessages, IconCreditCard, IconShield, IconCode,
+  IconSearch, IconPlus, IconChevronDown,
+} from '../components/icons';
+import { api } from '../api/client';
+import type { ProjectInfo } from '../types';
 
-const NAV = [
-  { view: 'overview' as const, label: 'Home' },
-  { view: 'run' as const, label: 'Runs' },
-  { view: 'models' as const, label: 'Models' },
-  { view: 'tools' as const, label: 'Tools' },
-  { view: 'memory' as const, label: 'Memory' },
-  { view: 'evals' as const, label: 'Evaluations' },
-  { view: 'projects' as const, label: 'Projects' },
-  { view: 'settings' as const, label: 'Settings' },
+type NavItem = { view: View; label: string; icon: (p: { size?: number; className?: string }) => React.ReactElement; anchor?: string };
+
+const GROUPS: { id: string; label: string; items: NavItem[] }[] = [
+  {
+    id: 'workspace', label: 'Workspace', items: [
+      { view: 'overview', label: 'Overview', icon: IconHome },
+      { view: 'run', label: 'Runs', icon: IconRuns },
+      { view: 'agents', label: 'Agents', icon: IconCpu },
+      { view: 'models', label: 'Models', icon: IconModel },
+    ],
+  },
+  {
+    id: 'build', label: 'Build', items: [
+      { view: 'workflows', label: 'Workflows', icon: IconNetwork },
+      { view: 'tools', label: 'Tools', icon: IconTool },
+      { view: 'skills', label: 'Skills', icon: IconShield },
+      { view: 'workspaces', label: 'Workspaces', icon: IconFolder },
+    ],
+  },
+  {
+    id: 'intelligence', label: 'Intelligence', items: [
+      { view: 'evals', label: 'Evaluations', icon: IconEval },
+      { view: 'memory', label: 'Memory', icon: IconMemory },
+      { view: 'intelligence', label: 'Analytics', icon: IconCpu },
+    ],
+  },
+  {
+    id: 'operate', label: 'Operate', items: [
+      { view: 'approvals', label: 'Approvals', icon: IconShield },
+      { view: 'alerts', label: 'Alerts', icon: IconBell },
+      { view: 'deployments', label: 'Deployments', icon: IconArchive },
+      { view: 'incidents', label: 'Incidents', icon: IconBell },
+    ],
+  },
 ];
 
-const MORE_NAV = [
-  { view: 'savings' as const, label: 'Savings' },
-  { view: 'cache' as const, label: 'Cache' },
-  { view: 'alerts' as const, label: 'Alerts' },
-  { view: 'billing' as const, label: 'Billing' },
-  { view: 'intelligence' as const, label: 'Intelligence' },
-  { view: 'conversations' as const, label: 'Conversations' },
-  { view: 'traces' as const, label: 'Traces' },
-  { view: 'api' as const, label: 'API' },
+const MORE: NavItem[] = [
+  { view: 'savings', label: 'Savings', icon: IconCreditCard },
+  { view: 'projects', label: 'Projects', icon: IconFolder },
+  { view: 'billing', label: 'Billing', icon: IconCreditCard },
+  { view: 'cache', label: 'Cache', icon: IconArchive },
+  { view: 'conversations', label: 'Conversations', icon: IconMessages },
+  { view: 'traces', label: 'Traces', icon: IconNetwork },
+  { view: 'settings', label: 'Settings', icon: IconSettings },
+  { view: 'api', label: 'API', icon: IconCode },
 ];
-
-const GROUPED_HISTORY = [
-  { label: 'Today', filter: (r: any) => new Date().toDateString() === new Date(r.updatedAt).toDateString() },
-  { label: 'Yesterday', filter: (r: any) => {
-    const yesterday = new Date(Date.now() - 86400000);
-    return new Date().toDateString() !== new Date(r.updatedAt).toDateString() && yesterday.toDateString() === new Date(r.updatedAt).toDateString();
-  }},
-  { label: 'Older', filter: (r: any) => {
-    const day = new Date(r.updatedAt).toDateString();
-    return day !== new Date().toDateString() && day !== new Date(Date.now() - 86400000).toDateString();
-  }},
-];
-
-function dot(status: string): string {
-  const s = String(status || '').toLowerCase();
-  if (s === 'completed') return '';
-  if (s === 'running' || s === 'planning' || s === 'waiting') return 'work';
-  if (s === 'failed') return 'bad';
-  if (s === 'cancelled') return '';
-  return '';
-}
 
 export function RunStatusGlyph({ status }: { status: string }) {
   const s = String(status || '').toLowerCase();
-  const label = s || 'idle';
-  return <span className={`o2-dot ${dot(status)}`} title={label} aria-label={`Status ${label}`} role="img" />;
+  const cls = s === 'completed' ? '' : s === 'running' || s === 'planning' || s === 'waiting' ? 'work' : s === 'failed' ? 'bad' : '';
+  return <span className={`o2-dot ${cls}`} title={s || 'idle'} aria-label={`Status ${s || 'idle'}`} role="img" />;
 }
 
-function sortByUpdatedAt(runs: any[]) {
-  return [...runs].sort((a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+function NavButton({ item, active, onGo }: { item: NavItem; active: boolean; onGo: (v: NavItem) => void }) {
+  const Icon = item.icon;
+  return (
+    <button
+      className={`o2-navitem ${active ? 'active' : ''}`}
+      aria-current={active ? 'page' : undefined}
+      onClick={() => onGo(item)}
+    >
+      <span className="o2-ico" aria-hidden="true"><Icon size={15} /></span>
+      {item.label}
+    </button>
+  );
 }
 
 export function ConsoleSidebar() {
   const { state, dispatch } = useRuntime();
   const { runs, activeRunId } = state.server;
   const q = state.ui.runQuery.toLowerCase();
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ workspace: true, build: false, intelligence: false, operate: false });
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [navFilter, setNavFilter] = useState('');
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [activeProject, setActiveProject] = useState<string>('');
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getProjects().then(({ projects: p }) => { if (!cancelled) setProjects(p || []); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   const visible = useMemo(
-    () => runs.filter((r: any) => !q || (r.title + r.id + r.taskMode + r.status).toLowerCase().includes(q)).slice(0, 40),
+    () => runs.filter((r: { title: string; id: string; taskMode: string; status: string }) => !q || (r.title + r.id + r.taskMode + r.status).toLowerCase().includes(q)).slice(0, 40),
     [runs, q],
   );
 
-  const go = (view: typeof state.ui.view) => {
-    dispatch({ type: 'ui/set', patch: { view, leftOpen: typeof window !== 'undefined' && window.innerWidth > 980 ? state.ui.leftOpen : false } });
+  const go = (item: NavItem) => {
+    dispatch({ type: 'ui/set', patch: { view: item.view, ...(item.anchor ? { settingsAnchor: item.anchor } : {}), leftOpen: typeof window !== 'undefined' && window.innerWidth > 980 ? state.ui.leftOpen : false } });
+    navigateRoute(item.view, item.view === 'run' ? activeRunId : null);
   };
   const pickRun = (id: string) => {
     dispatch({ type: 'runs/active', id });
     dispatch({ type: 'ui/set', patch: { view: 'run', leftOpen: typeof window !== 'undefined' && window.innerWidth > 980 ? state.ui.leftOpen : false } });
+    navigateRoute('run', id);
+  };
+
+  const isActive = (item: NavItem) => state.ui.view === item.view && (!item.anchor || state.ui.settingsAnchor === item.anchor);
+  const nq = navFilter.toLowerCase();
+  const matchNav = (label: string) => !nq || label.toLowerCase().includes(nq);
+
+  // Keyboard navigation across nav buttons + run list
+  const onNavKey = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const els = Array.from(listRef.current?.querySelectorAll<HTMLElement>('button.o2-navitem, .o2-run-item[tabindex]') || []);
+    const idx = els.indexOf(document.activeElement as HTMLElement);
+    e.preventDefault();
+    const next = e.key === 'ArrowDown' ? Math.min(els.length - 1, idx + 1) : Math.max(0, idx - 1);
+    els[next]?.focus();
   };
 
   return (
-    <nav className={`o2-side ${state.ui.leftOpen ? 'open' : ''}`} aria-label="Primary navigation">
+    <nav className={`o2-side ${state.ui.leftOpen ? 'open' : ''}`} aria-label="Primary navigation" ref={listRef} onKeyDown={onNavKey}>
       <Tip label="Start a new run" shortcut={shortcutLabel('mod+n')}>
         <button className="o2-newrun" onClick={() => dispatch({ type: 'ui/set', patch: { newRunOpen: true } })} aria-label={`Create a new run (${shortcutLabel('mod+n')})`}>
           <IconPlus size={16} /> New Run
         </button>
       </Tip>
 
-      <div className="o2-navgroup">
-        {NAV.map((i) => {
-          const active = state.ui.view === i.view;
-          return (
-            <button key={i.view} className={`o2-navitem ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={() => go(i.view)}>
-              <span className="o2-ico" aria-hidden="true"><IconPlus size={15} /></span>
-              {i.label}
+      <div className="o2-searchwrap">
+        <IconSearch size={13} />
+        <input className="o2-search" placeholder="Search navigation" aria-label="Search navigation" value={navFilter} onChange={(e) => setNavFilter(e.target.value)} />
+      </div>
+
+      {/* Workspace switcher */}
+      <div style={{ margin: '4px 0 6px' }}>
+        <label className="v2-meta" htmlFor="ws-switch" style={{ marginLeft: 10 }}>Workspace</label>
+        <select
+          id="ws-switch"
+          className="search"
+          style={{ width: '100%', marginTop: 4 }}
+          aria-label="Switch workspace"
+          value={activeProject}
+          onChange={(e) => {
+            setActiveProject(e.target.value);
+            const p = projects.find((x) => x.id === e.target.value);
+            dispatch({ type: 'toast/push', toast: { kind: 'info', title: p ? `Workspace: ${p.name}` : 'Workspace: all projects' } });
+          }}
+        >
+          <option value="">All projects</option>
+          {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </div>
+
+      <div className="o2-navgroup" role="list">
+        {GROUPS.map((g) => (
+          <div key={g.id}>
+            <button
+              type="button"
+              className="o2-advanced-toggle"
+              aria-expanded={!!openGroups[g.id]}
+              aria-controls={`nav-group-${g.id}`}
+              onClick={() => setOpenGroups((s) => ({ ...s, [g.id]: !s[g.id] }))}
+            >
+              <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase' }}>{g.label}</span>
+              <IconChevronRight size={13} className="o2-chev" aria-hidden="true" />
             </button>
-          );
-        })}
+            {openGroups[g.id] && (
+              <div id={`nav-group-${g.id}`} role="group" aria-label={g.label}>
+                {g.items.filter((i) => matchNav(i.label)).map((item) => (
+                  <NavButton key={item.label} item={item} active={isActive(item)} onGo={go} />
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
       </div>
 
       <div className="o2-navsec">Runs <span className="o2-n">{runs.length}</span></div>
-
       <div className="o2-searchwrap">
         <IconSearch size={13} />
         <input className="o2-search" placeholder="Filter runs" aria-label="Filter runs" value={state.ui.runQuery}
           onChange={(e) => dispatch({ type: 'ui/set', patch: { runQuery: e.target.value } })} />
-      </div>
-
-      <div className="o2-grouped-history" role="region" aria-label="Run history">
-        <div className="o2-grouped-history-header">
-          <span className="o2-group-label">History</span>
-          <IconChevronDown size={12} />
-        </div>
-        <div className="o2-grouped-history-list">
-          {GROUPED_HISTORY.map((section) => {
-            const filtered = sortByUpdatedAt(runs.filter(section.filter));
-            const itemCount = filtered.length;
-            return (
-              <div key={section.label} className={`o2-grouped-history-item${itemCount > 0 ? '' : ' o2-empty'}`} role="button" aria-label={`${section.label} runs`} onClick={() => dispatch({ type: 'ui/set', patch: { runQuery: '' } })} style={{ cursor: itemCount > 0 ? 'pointer' : 'default' }}>
-                <span className="o2-grouped-history-label">{section.label}</span>
-                {itemCount > 0 && <span className="o2-grouped-history-count">{itemCount}</span>}
-              </div>
-            );
-          })}
-          {runs.length === 0 && (
-            <div className="o2-grouped-history-item o2-empty" style={{ cursor: 'default' }}>
-              <span>No runs yet</span>
-            </div>
-          )}
-        </div>
       </div>
 
       <div className="o2-run-list" role="listbox" aria-label="Recent runs">
@@ -149,24 +214,26 @@ export function ConsoleSidebar() {
         ))}
       </div>
 
+      <div className="o2-advanced-group">
+        <button type="button" className="o2-advanced-toggle" aria-expanded={moreOpen} aria-controls="o2-more-list" onClick={() => setMoreOpen((v) => !v)}>
+          <span className="o2-ico" aria-hidden="true"><IconSettings size={15} /></span>
+          More
+          <IconChevronDown size={13} aria-hidden="true" />
+        </button>
+        {moreOpen && (
+          <div id="o2-more-list" className="o2-advanced-list">
+            {MORE.filter((i) => matchNav(i.label)).map((item) => (
+              <NavButton key={item.label} item={item} active={isActive(item)} onGo={go} />
+            ))}
+          </div>
+        )}
+      </div>
+
       <div className="o2-sidefoot">
         <button className="o2-navitem" aria-label="Collapse navigation sidebar" onClick={() => dispatch({ type: 'ui/set', patch: { leftOpen: false } })}>
+          <span className="o2-ico" aria-hidden="true"><IconChevronRight size={15} /></span>
           « Collapse
         </button>
-        <details style={{ marginTop: 4 }}>
-          <summary style={{ cursor: 'pointer', fontWeight: 700, padding: '6px 10px', fontSize: 12.5 }}>More views</summary>
-          <div style={{ display: 'flex', flexDirection: 'column', marginTop: 4 }}>
-            {MORE_NAV.map((i) => (
-              <button key={i.view} className={`o2-navitem ${state.ui.view === i.view ? 'active' : ''}`}
-                aria-current={state.ui.view === i.view ? 'page' : undefined} onClick={() => go(i.view)}>
-                {i.label}
-              </button>
-            ))}
-            <button className="o2-navitem" onClick={() => dispatch({ type: 'ui/set', patch: { view: 'settings' as const, settingsAnchor: 'runtime' } })}>
-              Policies
-            </button>
-          </div>
-        </details>
       </div>
     </nav>
   );
