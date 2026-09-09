@@ -104,23 +104,32 @@ class ModelPerformanceStore {
     this.priorSuccess = Number.isFinite(options.priorSuccess) ? options.priorSuccess : DEFAULT_PRIOR_SUCCESS;
     this.priorSamples = Number.isFinite(options.priorSamples) ? options.priorSamples : DEFAULT_PRIOR_SAMPLES;
     this.alpha = Number.isFinite(options.alpha) ? options.alpha : DEFAULT_ALPHA;
-    // key `${modelId}::${category}` -> record
+    // key `${modelId}::${tenantId}::${category}` -> record. tenantId is the
+    // organization that owns the observations: one tenant's outcomes never
+    // move another tenant's model/task estimate (§45 tenant isolation).
     this.records = new Map();
-    // modelId -> { errors: {code: count}, samples }
+    // `${modelId}::${tenantId}` -> { errors: {code: count}, samples }
     this.reliability = new Map();
     this.version = VERSIONS.performanceEstimator;
   }
 
-  _key(modelId, category) {
-    return `${modelId}::${category || 'general'}`;
+  _tenant(tenantId) {
+    // null/''/undefined all normalize to the explicit unscoped bucket so
+    // legacy callers (unit tests, pre-tenant records) stay self-consistent.
+    return tenantId === null || tenantId === undefined || tenantId === '' ? '' : String(tenantId).slice(0, 128);
   }
 
-  _record(modelId, category) {
-    const k = this._key(modelId, category);
+  _key(modelId, category, tenantId) {
+    return `${modelId}::${this._tenant(tenantId)}::${category || 'general'}`;
+  }
+
+  _record(modelId, category, tenantId) {
+    const k = this._key(modelId, category, tenantId);
     let r = this.records.get(k);
     if (!r) {
       r = {
         modelId, category: category || 'general',
+        tenantId: this._tenant(tenantId) || null,
         attempts: 0, successes: 0,
         qualityEwma: null,
         latencySamples: [],
@@ -140,7 +149,8 @@ class ModelPerformanceStore {
   // moves success counters (learning safety: unknown stays unknown).
   recordOutcome(modelId, category, outcome = {}) {
     if (!modelId) return null;
-    const r = this._record(modelId, category);
+    const tenantId = outcome.tenantId !== undefined && outcome.tenantId !== null ? outcome.tenantId : (outcome.orgId || null);
+    const r = this._record(modelId, category, tenantId);
     const hasSuccess = outcome.success === true || outcome.success === false;
     if (hasSuccess) {
       r.attempts += 1;
@@ -167,13 +177,15 @@ class ModelPerformanceStore {
       }
     }
     r.lastUpdated = new Date().toISOString();
-    if (outcome.errorCode) this._recordReliability(modelId, outcome);
-    return this.describe(modelId, category);
+    if (outcome.errorCode) this._recordReliability(modelId, outcome, tenantId);
+    return this.describe(modelId, category, tenantId);
   }
 
-  _recordReliability(modelId, outcome) {
-    let rel = this.reliability.get(modelId);
-    if (!rel) { rel = { samples: 0, failures: 0, byError: {} }; this.reliability.set(modelId, rel); }
+  _recordReliability(modelId, outcome, tenantId = '') {
+    const tk = this._tenant(tenantId);
+    const rkey = `${modelId}::${tk}`;
+    let rel = this.reliability.get(rkey);
+    if (!rel) { rel = { modelId, tenantId: tk || null, samples: 0, failures: 0, byError: {} }; this.reliability.set(rkey, rel); }
     rel.samples += 1;
     if (outcome.success === false) {
       rel.failures += 1;
@@ -182,8 +194,8 @@ class ModelPerformanceStore {
     }
   }
 
-  rawRate(modelId, category) {
-    const r = this.records.get(this._key(modelId, category));
+  rawRate(modelId, category, tenantId = null) {
+    const r = this.records.get(this._key(modelId, category, tenantId));
     if (!r || r.attempts < MIN_SAMPLES_FOR_OBSERVED) return null;
     return r.successes / r.attempts;
   }
@@ -197,8 +209,8 @@ class ModelPerformanceStore {
   // to the matching workload slice. Slices with < 2 attempts blend toward
   // the category rate (prior weight 2) so one sample can never dominate;
   // the category-level fields below are unchanged.
-  predictedSuccess(modelId, category, workload = null) {
-    const r = this.records.get(this._key(modelId, category));
+  predictedSuccess(modelId, category, workload = null, tenantId = null) {
+    const r = this.records.get(this._key(modelId, category, tenantId));
     const attempts = r ? r.attempts : 0;
     const successes = r ? r.successes : 0;
     const smoothed = (successes + this.priorSuccess * this.priorSamples) / (attempts + this.priorSamples);
@@ -230,14 +242,14 @@ class ModelPerformanceStore {
     return out;
   }
 
-  latency(modelId, category) {
-    const r = this.records.get(this._key(modelId, category));
+  latency(modelId, category, tenantId = null) {
+    const r = this.records.get(this._key(modelId, category, tenantId));
     const stats = latencyStats(r ? r.latencySamples : []);
     return { modelId, category: category || 'general', ...stats };
   }
 
-  reliabilityFor(modelId) {
-    const rel = this.reliability.get(modelId);
+  reliabilityFor(modelId, tenantId = null) {
+    const rel = this.reliability.get(`${modelId}::${this._tenant(tenantId)}`);
     if (!rel || rel.samples < MIN_SAMPLES_FOR_OBSERVED) return null;
     return {
       modelId,
@@ -247,26 +259,29 @@ class ModelPerformanceStore {
     };
   }
 
-  describe(modelId, category) {
-    const pred = this.predictedSuccess(modelId, category);
-    const lat = this.latency(modelId, category);
-    const r = this.records.get(this._key(modelId, category));
+  describe(modelId, category, tenantId = null) {
+    const pred = this.predictedSuccess(modelId, category, null, tenantId);
+    const lat = this.latency(modelId, category, tenantId);
+    const r = this.records.get(this._key(modelId, category, tenantId));
     return {
       ...pred,
       qualityEwma: r && r.qualityEwma !== null ? r.qualityEwma : null,
       latency: { p50: lat.p50, p75: lat.p75, p95: lat.p95, mean: lat.mean, count: lat.count },
-      reliability: this.reliabilityFor(modelId),
+      reliability: this.reliabilityFor(modelId, tenantId),
       lastUpdated: r ? r.lastUpdated : null,
     };
   }
 
   // All categories observed for a model (for capability profiles / model
-  // comparison data §35).
-  forModel(modelId) {
+  // comparison data §35). `tenantId` scopes to one organization's private
+  // observations; omit it to enumerate the unscoped/legacy bucket only.
+  forModel(modelId, tenantId = null) {
+    const tk = this._tenant(tenantId);
     const out = {};
     for (const [k, r] of this.records.entries()) {
       if (r.modelId !== modelId) continue;
-      out[r.category] = this.describe(modelId, r.category);
+      if (this._tenant(r.tenantId) !== tk) continue;
+      out[r.category] = this.describe(modelId, r.category, tenantId);
     }
     return out;
   }
@@ -286,7 +301,7 @@ class ModelPerformanceStore {
       priorSamples: this.priorSamples,
       alpha: this.alpha,
       records: Array.from(this.records.values()).map((r) => ({ ...r, latencySamples: (r.latencySamples || []).slice(-MAX_LATENCY_SAMPLES) })),
-      reliability: Array.from(this.reliability.entries()).map(([modelId, rel]) => ({ modelId, ...rel, byError: { ...rel.byError } })),
+      reliability: Array.from(this.reliability.values()).map((rel) => ({ modelId: rel.modelId, tenantId: rel.tenantId || null, samples: rel.samples, failures: rel.failures, byError: { ...rel.byError } })),
     };
   }
 
@@ -300,9 +315,10 @@ class ModelPerformanceStore {
     if (Number.isFinite(data.alpha)) this.alpha = data.alpha;
     for (const r of data.records || []) {
       if (!r || !r.modelId) continue;
-      this.records.set(this._key(r.modelId, r.category), {
+      this.records.set(this._key(r.modelId, r.category, r.tenantId), {
         modelId: r.modelId,
         category: r.category || 'general',
+        tenantId: r.tenantId || null,
         attempts: Math.max(0, Math.floor(Number(r.attempts) || 0)),
         successes: Math.max(0, Math.floor(Number(r.successes) || 0)),
         qualityEwma: Number.isFinite(Number(r.qualityEwma)) ? clamp01(r.qualityEwma) : null,
@@ -315,7 +331,10 @@ class ModelPerformanceStore {
     }
     for (const rel of data.reliability || []) {
       if (!rel || !rel.modelId) continue;
-      this.reliability.set(rel.modelId, {
+      const tk = this._tenant(rel.tenantId);
+      this.reliability.set(`${rel.modelId}::${tk}`, {
+        modelId: rel.modelId,
+        tenantId: tk || null,
         samples: Math.max(0, Math.floor(Number(rel.samples) || 0)),
         failures: Math.max(0, Math.floor(Number(rel.failures) || 0)),
         byError: { ...(rel.byError || {}) },
@@ -336,6 +355,7 @@ class RoutingHistoryStore {
       id: entry.id || `route-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
       ts: entry.ts || new Date().toISOString(),
       runId: entry.runId || null,
+      tenantId: entry.tenantId || null,
       taskCategory: entry.taskCategory || 'general',
       taskComplexity: entry.taskComplexity || null,
       selectedModel: entry.selectedModel || null,

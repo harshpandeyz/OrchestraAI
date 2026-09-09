@@ -97,6 +97,7 @@ function buildIntelligence(input = {}) {
     observedByModel = new Map(),
     intelligence = null,
     mode = 'demo',
+    tenantId = null,
     options = {},
   } = input;
   const granularity = ['daily', 'weekly', 'monthly'].includes(options.granularity) ? options.granularity : 'daily';
@@ -346,7 +347,7 @@ function buildLeaderboard({ withEcon, models, observedByModel, intelligence, mod
     const reg = models.find((m) => m.id === modelId) || null;
     const obs = (observedByModel && observedByModel.get(modelId)) || null;
     const cost = costByModel.get(modelId) || null;
-    const forModel = perf && typeof perf.forModel === 'function' ? perf.forModel(modelId) : {};
+    const forModel = perf && typeof perf.forModel === 'function' ? perf.forModel(modelId, tenantId) : {};
     const cats = Object.values(forModel || {});
     let attempts = 0; let successes = 0; let qSum = 0; let qN = 0; const latSamples = [];
     for (const d of cats) {
@@ -512,7 +513,7 @@ function buildTasks({ leaderboardRows, intelligence, mode, baseProvenance }) {
       if (perf && typeof perf.predictedSuccess === 'function') {
         for (const c of spec.categories) {
           try {
-            const d = perf.describe ? perf.describe(row.model, c) : null;
+            const d = perf.describe ? perf.describe(row.model, c, tenantId) : null;
             if (d && d.attempts >= 1) {
               samples += d.attempts;
               if (d.predicted !== undefined && (catSuccess === null || d.predicted > catSuccess)) catSuccess = d.predicted;

@@ -28,11 +28,14 @@ class IntelligenceStore {
   // Returns { outcome, learning } where learning is the performance update
   // applied (or null when evidence was insufficient — unknown stays unknown).
   ingestRunOutcome(input = {}) {
+    const tenantId = input.orgId || input.tenantId || null;
     const taskProfile = input.taskProfile || classifyTask(input.taskText || '');
     const outcome = evaluateOutcome({
       runId: input.runId || null,
       modelId: input.modelId || null,
       taskCategory: input.taskCategory || taskProfile.category,
+      orgId: tenantId,
+      projectId: input.projectId || null,
       signals: {
         completed: input.completed,
         hasAssistantMessage: input.hasAssistantMessage,
@@ -49,6 +52,8 @@ class IntelligenceStore {
         steps: input.steps,
       },
     });
+    outcome.orgId = tenantId;
+    outcome.projectId = input.projectId || null;
     this.outcomeEvals.push(outcome);
     if (this.outcomeEvals.length > this.maxOutcomeEvals) {
       this.outcomeEvals.splice(0, this.outcomeEvals.length - this.maxOutcomeEvals);
@@ -66,7 +71,7 @@ class IntelligenceStore {
       if (update.latencyOnly) {
         learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
           success: null, qualityScore: null, latencyMs: input.latencyMs, errorCode: null,
-          contextTokens, toolProfile,
+          contextTokens, toolProfile, tenantId,
         });
       } else {
         learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
@@ -74,14 +79,14 @@ class IntelligenceStore {
           qualityScore: Number.isFinite(Number(update.qualityScore)) ? update.qualityScore : null,
           latencyMs: input.latencyMs,
           errorCode: update.success === false ? (input.errorCode || 'task_failed') : null,
-          contextTokens, toolProfile,
+          contextTokens, toolProfile, tenantId,
         });
       }
     } else if (input.modelId && Number.isFinite(Number(input.latencyMs))) {
       // Latency observations are always safe to record (no success claim).
       learning = this.performance.recordOutcome(input.modelId, outcome.taskCategory, {
         success: null, qualityScore: null, latencyMs: input.latencyMs, errorCode: null,
-        contextTokens, toolProfile,
+        contextTokens, toolProfile, tenantId,
       });
     }
     if (input.runId) this.routingHistory.attachOutcome(input.runId, { taskSuccess: outcome.taskSuccess, overallScore: outcome.overallScore });

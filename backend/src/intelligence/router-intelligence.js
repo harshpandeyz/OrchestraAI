@@ -113,6 +113,7 @@ function expectedLatencyMs(model, perfLatency) {
 function scoreCandidate(model, ctx = {}) {
   const taskProfile = ctx.taskProfile || classifyTask(ctx.taskText || '');
   const perf = ctx.performanceStore || null;
+  const tenantId = ctx.tenantId || null;
   const needTokens = Number(ctx.needTokens) || 0;
   const inputTokens = needTokens;
   const policy = ctx.policy || {};
@@ -127,11 +128,11 @@ function scoreCandidate(model, ctx = {}) {
       // Workload-aware when the store supports it (context-size slice blends
       // toward the category rate at low n); plain category rate otherwise.
       const p = perf.predictedSuccess.length >= 3
-        ? perf.predictedSuccess(model.id, taskProfile.category, { contextTokens: needTokens })
-        : perf.predictedSuccess(model.id, taskProfile.category);
+        ? perf.predictedSuccess(model.id, taskProfile.category, { contextTokens: needTokens }, tenantId)
+        : perf.predictedSuccess(model.id, taskProfile.category, null, tenantId);
       predicted = p.predicted;
       predMeta = { attempts: p.attempts, confidence: p.confidence, observed: p.observed, workload: p.workload || null };
-      perfLatency = perf.latency(model.id, taskProfile.category);
+      perfLatency = perf.latency(model.id, taskProfile.category, tenantId);
     } catch { /* performance is advisory */ }
   }
 
@@ -145,7 +146,7 @@ function scoreCandidate(model, ctx = {}) {
   let reliabilityNote = null;
   if (perf && typeof perf.reliabilityFor === 'function') {
     try {
-      const rel = perf.reliabilityFor(model.id);
+      const rel = perf.reliabilityFor(model.id, tenantId);
       if (rel && rel.samples >= 3) {
         const infra = ['timeout', 'rate_limit', 'rate-limit', 'provider_outage', 'overloaded', 'cancelled'];
         const infraCount = Object.entries(rel.byError || {}).filter(([k]) => infra.includes(k)).reduce((a, [, v]) => a + v, 0);
