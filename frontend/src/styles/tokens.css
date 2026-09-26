@@ -1,0 +1,158 @@
+/* OrchestraAI V2 semantic tokens — single source of truth.
+   One coherent system for dark + light. Semantic names only; components must
+   use these instead of hardcoded colors. Legacy --bg/--panel/--accent etc.
+   are mapped below to the new names for back-compat (do not add new usages).
+   Brand: emerald foundation, never a full-green UI. Selection violet/blue.
+   Info blue/cyan, success emerald, warning amber, danger coral/red. */
+:root {
+  /* Core surfaces */
+  --background: #111713;
+  --surface: #1c251e;
+  --surface-raised: #182019;
+  --surface-elevated: #243129;
+  --overlay: rgba(18, 32, 25, 0.48);
+  --border: #2e3b32;
+  --border-soft: #253026;
+  --border-strong: #41544a;
+
+  /* Text */
+  --text: #edf3ee;
+  --text-muted: #c6d2c9;
+  --text-subtle: #9daca4;
+  --text-faint: #71816f;
+
+  /* Brand + semantics */
+  --primary: #46c08b;
+  --primary-ink: #0a1f15;
+  --primary-deep: #6fd8a6;
+  --primary-dim: #235c44;
+  --primary-soft: #14291f;
+  --secondary: #7fb5e8;
+  --secondary-deep: #9cc8f0;
+  --info: #7fb5e8;
+  --info-soft: #16283a;
+  --info-dim: #2c4a66;
+  --success: #4bd79a;
+  --success-dim: #1e5c42;
+  --success-soft: #16382b;
+  --warning: #f2c14e;
+  --warning-dim: #5c4a17;
+  --warning-soft: #38300f;
+  --danger: #f08a8a;
+  --danger-dim: #5e2626;
+  --danger-soft: #3a1d1d;
+  --selection: #8b7cf6;
+
+  /* Execution states */
+  --running: #46c08b;
+  --waiting: #f2c14e;
+  --blocked: #f08a8a;
+  --failed: #f08a8a;
+  --verified: #4bd79a;
+  --unknown: #71816f;
+
+  /* Typography scale */
+  --font-display: 27px;
+  --font-page: 22px;
+  --font-section: 15px;
+  --font-body: 14px;
+  --font-label: 12.5px;
+  --font-meta: 11px;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+
+  /* Shape / elevation / motion */
+  --radius-s: 6px;
+  --radius: 10px;
+  --radius-l: 14px;
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.35);
+  --focus-ring: 0 0 0 2px var(--surface-raised), 0 0 0 3px var(--primary);
+  --motion-fast: 120ms;
+  --motion-base: 200ms;
+  --motion-slow: 320ms;
+  --motion-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* Legacy aliases (do not extend) */
+  --bg: var(--background);
+  --bg2: var(--surface-raised);
+  --panel: var(--surface);
+  --panel2: var(--surface-elevated);
+  --panel3: #2f3f35;
+  --muted: var(--text-subtle);
+  --faint: var(--text-faint);
+  --text2: var(--text-muted);
+  --accent: var(--primary);
+  --accent-ink: var(--primary-ink);
+  --accent-deep: var(--primary-deep);
+  --accent-dim: var(--primary-dim);
+  --accent-soft: var(--primary-soft);
+  --sky: var(--secondary);
+  --sky-deep: var(--secondary-deep);
+  --sky-dim: var(--info-dim);
+  --sky-soft: var(--info-soft);
+  --ok: var(--success);
+  --ok-dim: var(--success-dim);
+  --ok-soft: var(--success-soft);
+  --warn: var(--warning);
+  --warn-dim: var(--warning-dim);
+  --warn-soft: var(--warning-soft);
+  --err: var(--danger);
+  --err-dim: var(--danger-dim);
+  --err-soft: var(--danger-soft);
+  --mono: var(--font-mono);
+  --sans: var(--font-sans);
+}
+
+[data-theme='light'] {
+  --background: #f7f9fb;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-elevated: #f1f5f4;
+  --overlay: rgba(20, 28, 24, 0.45);
+  --border: #e2e8e6;
+  --border-soft: #edf2f0;
+  --border-strong: #cbd5d0;
+  --text: #0f172a;
+  --text-muted: #334155;
+  --text-subtle: #5b6b63;
+  --text-faint: #8a9a92;
+  --primary: #0b7a53;
+  --primary-ink: #ffffff;
+  --primary-deep: #0a5a3f;
+  --primary-dim: #5ec294;
+  --primary-soft: #dff1e9;
+  --secondary: #0ea5e9;
+  --secondary-deep: #0284c7;
+  --info: #0ea5e9;
+  --info-soft: #e0f2fe;
+  --info-dim: #bae6fd;
+  --success: #12804a;
+  --success-dim: #7fd0a1;
+  --success-soft: #d9f3e3;
+  --warning: #b45309;
+  --warning-dim: #e6b95c;
+  --warning-soft: #fdf0d3;
+  --danger: #c23333;
+  --danger-dim: #ea8f8f;
+  --danger-soft: #fbe3e3;
+  --selection: #7c6cf6;
+  --running: #0b7a53;
+  --waiting: #b45309;
+  --blocked: #c23333;
+  --failed: #c23333;
+  --verified: #12804a;
+  --unknown: #8a9a92;
+  --shadow: 0 10px 30px rgba(15, 40, 28, 0.08);
+  --shadow-sm: 0 4px 12px rgba(15, 40, 28, 0.06);
+}
+
+/* Type scale utilities — typography/spacing carry hierarchy, not extra cards */
+.v2-display { font-size: var(--font-display); font-weight: 800; letter-spacing: -0.025em; line-height: 1.2; }
+.v2-page { font-size: var(--font-page); font-weight: 800; letter-spacing: -0.02em; line-height: 1.25; }
+.v2-section { font-size: var(--font-section); font-weight: 750; letter-spacing: -0.01em; }
+.v2-body { font-size: var(--font-body); line-height: 1.65; }
+.v2-label { font-size: var(--font-label); font-weight: 650; }
+.v2-meta { font-size: var(--font-meta); color: var(--text-subtle); }
+.v2-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.v2-eyebrow { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
