@@ -1,0 +1,318 @@
+{
+  "modelId": "demo-baseline",
+  "provenance": "DEMO",
+  "generatedAt": "2026-09-26T02:19:45.381Z",
+  "total": 24,
+  "passed": 24,
+  "successRate": 1,
+  "avgCost": 0.001354,
+  "avgLatencyMs": 583,
+  "categories": [
+    {
+      "category": "coding",
+      "total": 6,
+      "passed": 6,
+      "successRate": 1,
+      "avgCost": 0.001,
+      "avgLatencyMs": 400
+    },
+    {
+      "category": "reasoning",
+      "total": 5,
+      "passed": 5,
+      "successRate": 1,
+      "avgCost": 0.0012,
+      "avgLatencyMs": 500
+    },
+    {
+      "category": "tool-use",
+      "total": 5,
+      "passed": 5,
+      "successRate": 1,
+      "avgCost": 0.002,
+      "avgLatencyMs": 900
+    },
+    {
+      "category": "long-context",
+      "total": 4,
+      "passed": 4,
+      "successRate": 1,
+      "avgCost": 0.00175,
+      "avgLatencyMs": 775
+    },
+    {
+      "category": "cheap-simple",
+      "total": 4,
+      "passed": 4,
+      "successRate": 1,
+      "avgCost": 0.000875,
+      "avgLatencyMs": 375
+    }
+  ],
+  "rows": [
+    {
+      "taskId": "code-01-reverse-string",
+      "category": "coding",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "code-02-sum-array",
+      "category": "coding",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "code-03-patch-shape",
+      "category": "coding",
+      "pass": true,
+      "reason": "contains \"bar\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "code-04-json-keys",
+      "category": "coding",
+      "pass": true,
+      "reason": "contains \"\\\"a\\\":1\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "code-05-fizzbuzz-3",
+      "category": "coding",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "code-06-semver-next",
+      "category": "coding",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "reason-01-cheapest-healthy",
+      "category": "reasoning",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "reason-02-cache-tradeoff",
+      "category": "reasoning",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "reason-03-order-plans",
+      "category": "reasoning",
+      "pass": true,
+      "reason": "sequence plan>execute>test",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "reason-04-fallback",
+      "category": "reasoning",
+      "pass": true,
+      "reason": "contains \"fallback\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "reason-05-budget-stop",
+      "category": "reasoning",
+      "pass": true,
+      "reason": "contains \"stop\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "tool-01-read-then-test",
+      "category": "tool-use",
+      "pass": true,
+      "reason": "sequence read_file>run_tests",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "tool-02-search-then-patch",
+      "category": "tool-use",
+      "pass": true,
+      "reason": "sequence search_code>apply_patch",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "tool-03-status-diff-log",
+      "category": "tool-use",
+      "pass": true,
+      "reason": "sequence git_status>git_diff>git_log",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "tool-04-env-then-build",
+      "category": "tool-use",
+      "pass": true,
+      "reason": "sequence env_inspect>build_project",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "tool-05-fetch-citation",
+      "category": "tool-use",
+      "pass": true,
+      "reason": "retrieved \"title\"",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "ctx-01-needle",
+      "category": "long-context",
+      "pass": true,
+      "reason": "retrieved \"magpie-42\"",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "ctx-02-two-hop",
+      "category": "long-context",
+      "pass": true,
+      "reason": "retrieved \"ember-7\"",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "ctx-03-compress-keep",
+      "category": "long-context",
+      "pass": true,
+      "reason": "retrieved \"r-keep-1\"",
+      "secondary": null,
+      "cost": 0.002,
+      "latencyMs": 900,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "ctx-04-window-math",
+      "category": "long-context",
+      "pass": true,
+      "reason": "contains \"25\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "cheap-01-ping",
+      "category": "cheap-simple",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "cheap-02-echo",
+      "category": "cheap-simple",
+      "pass": true,
+      "reason": "exact match",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "cheap-03-yes",
+      "category": "cheap-simple",
+      "pass": true,
+      "reason": "contains \"yes\"",
+      "secondary": null,
+      "cost": 0.001,
+      "latencyMs": 400,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    },
+    {
+      "taskId": "cheap-04-cheap-ceiling",
+      "category": "cheap-simple",
+      "pass": true,
+      "reason": "within bounds (cost 0.0005, 300ms)",
+      "secondary": null,
+      "cost": 0.0005,
+      "latencyMs": 300,
+      "modelId": "demo-baseline",
+      "provenance": "DEMO"
+    }
+  ]
+}
