@@ -21,9 +21,19 @@ const { buildIntelligence, VALUE_FORMULA } = require('../src/intelligence-analyt
 
 // Populated demo traffic → DEMO provenance, real aggregation, defined formula.
 {
+  // NOTE (Session 12): fixtures use dates relative to *now* so the default
+  // 30d range window in buildIntelligence() always contains them. Fixed
+  // 2026-08-20 dates fell out of the window once wall-clock passed 2026-09-20
+  // and the test failed with INSUFFICIENT_DATA instead of DEMO (TEST BUG, not
+  // a product bug — the range filter behaved correctly).
+  const now = Date.now();
+  const d1 = new Date(now - 2 * 24 * 3600 * 1000).toISOString();
+  const d1b = new Date(now - 2 * 24 * 3600 * 1000 + 3600 * 1000).toISOString();
+  const d2 = new Date(now - 1 * 24 * 3600 * 1000).toISOString();
+  const d2b = new Date(now - 1 * 24 * 3600 * 1000 + 3600 * 1000).toISOString();
   const runs = [
-    { id: 'r1', title: 'Fix auth', taskMode: 'debug', status: 'completed', createdAt: '2026-08-20T00:00:00.000Z', updatedAt: '2026-08-20T01:00:00.000Z', activeModelId: 'model-a', projectId: null },
-    { id: 'r2', title: 'Write docs', taskMode: 'general', status: 'completed', createdAt: '2026-08-21T00:00:00.000Z', updatedAt: '2026-08-21T01:00:00.000Z', activeModelId: 'model-b', projectId: null },
+    { id: 'r1', title: 'Fix auth', taskMode: 'debug', status: 'completed', createdAt: d1, updatedAt: d1b, activeModelId: 'model-a', projectId: null },
+    { id: 'r2', title: 'Write docs', taskMode: 'general', status: 'completed', createdAt: d2, updatedAt: d2b, activeModelId: 'model-b', projectId: null },
   ];
   const econ = (actual, baseline) => ({
     status: 'verified_modeled', calculationStatus: 'verified_modeled', economicOutcome: actual < baseline ? 'saved' : 'unchanged',

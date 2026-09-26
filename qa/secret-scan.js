@@ -94,7 +94,11 @@ function scanFile(root, rel) {
 function selfTest(root) {
   const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'secret-scan-'));
   const planted = path.join(dir, 'planted.js');
-  fs.writeFileSync(planted, 'const OPENAI_API_KEY = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";\n');
+  // NOTE (Session 12): the planted secret is assembled by concatenation so
+  // this source file itself never contains a contiguous sk-proj-… token that
+  // would trip the scanner (INFRASTRUCTURE BUG fix — the planted runtime file
+  // still contains the contiguous token and is still detected).
+  fs.writeFileSync(planted, 'const OPENAI_API_KEY = "' + 'sk-proj-' + 'abcdefghijklmnopqrstuvwxyz123456";\n');
   const findings = scanFile(dir, 'planted.js');
   fs.rmSync(dir, { recursive: true, force: true });
   if (findings.length === 0) {
