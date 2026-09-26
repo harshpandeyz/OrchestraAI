@@ -247,8 +247,8 @@ describe('console live intelligence states', () => {
     void ts;
     render(<RuntimeProvider><Seed snap={withApproval}><LiveIntelligence /></Seed></RuntimeProvider>);
     expect(screen.getByLabelText(/approval required: run shell command/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /approve this change/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /deny/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /approve once/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^reject$/i })).toBeInTheDocument();
   });
   it('keeps an accessible label on every interactive region', () => {
     const { container } = render(<RuntimeProvider><Seed snap={baseSnap()}><LiveIntelligence /></Seed></RuntimeProvider>);
