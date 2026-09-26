@@ -210,17 +210,29 @@ const TOOL_DEFINITIONS = [
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
-    // Honest placeholder: the capability category exists so policy, routing
-    // and the UI can reason about it, but no browser automation is
-    // implemented. available=false + disabled means every call is rejected
-    // with 'disabled/unavailable' — never a fake result.
+    // Browser v1 (Session 12): read-only snapshot after navigation, via
+    // backend/src/execution/browser-tool.js (DEMO mock or SSRF-guarded
+    // fetch). Disabled by default: needs explicit policy opt-in + approval.
+    // `engine` on every result says which snapshot engine ran (mock/fetch).
     id: 'tool-browser-navigate', name: 'browser_navigate', category: ToolCategory.BROWSER,
-    description: 'Browser automation (not implemented in this runtime)',
+    description: 'Navigate to a URL and return a bounded, redacted snapshot (DEMO mock or policy-gated fetch)',
     riskLevel: RiskLevel.HIGH, permissions: ['browser:automate'],
-    timeoutMs: 20000, supportsDryRun: false, idempotent: false,
-    requiresApproval: true, disabled: true, available: false,
-    delivery: DeliverySemantics.UNKNOWN,
-    inputSchema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    timeoutMs: 20000, supportsDryRun: false, idempotent: true,
+    requiresApproval: true, disabled: true,
+    delivery: DeliverySemantics.AT_MOST_ONCE,
+    inputSchema: { type: 'object', properties: { url: { type: 'string' }, maxBytes: { type: 'number' } }, required: ['url'] },
+  },
+  {
+    // Read-only companion: same snapshot engine, MEDIUM risk like fetch_url.
+    // Disabled by default (explicit opt-in); approval follows the run's
+    // approval mode rather than forcing per-call approval.
+    id: 'tool-browser-snapshot', name: 'browser_snapshot', category: ToolCategory.BROWSER,
+    description: 'Read-only page snapshot (title/headings/links/text) via DEMO mock or policy-gated fetch',
+    riskLevel: RiskLevel.MEDIUM, permissions: ['browser:read'],
+    timeoutMs: 20000, supportsDryRun: false, idempotent: true,
+    requiresApproval: false, disabled: true,
+    delivery: DeliverySemantics.AT_MOST_ONCE,
+    inputSchema: { type: 'object', properties: { url: { type: 'string' }, maxBytes: { type: 'number' } }, required: ['url'] },
   },
 ];
 

@@ -200,6 +200,28 @@ async function main() {
     assert.strictEqual(env.SANDBOX_ISOLATED, '1');
   });
 
+  await test('browse DEMO mock is deterministic and never networked', () => {
+    const a = worker.browseDemoSnapshot('demo:smoke');
+    const b = worker.browseDemoSnapshot('demo:smoke');
+    assert.deepStrictEqual(a, b);
+    assert.strictEqual(a.engine, 'mock');
+    assert.strictEqual(a.mocked, true);
+    assert.strictEqual(worker.validateBrowseRequest({ url: 'demo:smoke' }).demo, true);
+  });
+
+  await test('browse rejects credentials, private targets, and non-allowlisted hosts', () => {
+    // The worker throws plain { status, code, message } objects (not Errors).
+    const msg = (fn) => {
+      try { fn(); } catch (e) { return String((e && e.message) || ''); }
+      throw new Error('expected throw, but nothing threw');
+    };
+    assert.match(msg(() => worker.validateBrowseRequest({ url: 'https://user:pass@example.com/' })), /credential/i);
+    assert.match(msg(() => worker.validateBrowseRequest({ url: 'http://127.0.0.1/admin', networkMode: 'allowlist', networkAllowlist: ['example.com'] })), /blocked/i);
+    assert.match(msg(() => worker.validateBrowseRequest({ url: 'https://evil.example/', networkMode: 'allowlist', networkAllowlist: ['example.com'] })), /allowlist/i);
+    assert.match(msg(() => worker.validateBrowseRequest({ url: 'https://example.com/', networkMode: 'disabled' })), /allowlist/i);
+    assert.match(msg(() => worker.validateBrowseRequest({ url: '' })), /url is required/i);
+  });
+
   console.log(`\n--- Sandbox-worker results: ${passed} passed, ${failed} failed ---`);
   try { fs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true }); } catch { /* best-effort */ }
   process.exit(failed ? 1 : 0);

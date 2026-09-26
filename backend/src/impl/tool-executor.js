@@ -567,6 +567,20 @@ async function handleFetchUrl(params, ctx) {
   return { url: r.url, status: r.status, body: r.body.slice(0, 8000), truncated: r.truncated || r.body.length > 8000, bytes: r.bytes };
 }
 
+async function handleBrowser(toolName, params, ctx) {
+  // Browser v1 routes through the same policy/SSRF path as fetch_url, plus
+  // the tool-level gate: disabled-by-default tools need explicit opt-in and
+  // browser_navigate always needs approval (handled by the executor gate;
+  // enforced again here for direct callers).
+  const { executeBrowserTool } = require('../execution/browser-tool');
+  const mode = ctx.mode || process.env.RUNTIME_MODE || 'demo';
+  return executeBrowserTool(toolName, params || {}, {
+    mode,
+    policy: ctx.policy || { networkAccess: mode === 'demo' ? 'disabled' : 'allowlist', networkAllowlist: [] },
+    timeoutMs: Math.min(ctx.timeLeftMs || 20000, 20000),
+  });
+}
+
 const HANDLERS = {
   read_file: handleReadFile,
   search_code: handleSearchCode,
@@ -579,6 +593,8 @@ const HANDLERS = {
   env_inspect: handleEnvInspect,
   build_project: handleBuildProject,
   fetch_url: handleFetchUrl,
+  browser_navigate: (p, c) => handleBrowser('browser_navigate', p, c),
+  browser_snapshot: (p, c) => handleBrowser('browser_snapshot', p, c),
 };
 
 class InMemoryToolExecutor extends ToolExecutor {

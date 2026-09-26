@@ -380,6 +380,114 @@ function readBody(req) {
   });
 }
 
+// --- Browser snapshot endpoint (Session 12): POST /v1/browse ---
+//
+// Same isolation contract as /v1/execute: token auth, no secrets in the
+// request, ephemeral handling, bounded outputs. DEMO mock (`demo:` URLs)
+// never touches the network. LIVE URLs require networkMode=allowlist plus
+// an explicit networkAllowlist containing the host, and pass the same
+// shape/host guards as /v1/execute egress (literal private IPs, localhost,
+// metadata hosts, credentialed URLs rejected). The snapshot engine is the
+// dependency-free guarded fetch; interactive Playwright-driven sessions run
+// operator-side through the existing e2e Playwright installation (no new
+// tooling introduced). Every response labels its `engine`.
+const BROWSE_MAX_BYTES = 65536;
+const BROWSE_TIMEOUT_MS = 15000;
+const BROWSE_BLOCKED_HOST_RES = [/^localhost$/i, /^metadata\./i, /^instance-data/i, /\.local$/i, /\.internal$/i, /\.lan$/i, /\.localhost$/i, /\.invalid$/i, /\.test$/i];
+const BROWSE_BLOCKED_IP_RES = [/^127\./, /^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^169\.254\./, /^0\./, /^::1$/, /^\[::1\]$/];
+
+function browseDemoSnapshot(url) {
+  const h = require('crypto').createHash('sha256').update(String(url)).digest('hex').slice(0, 8);
+  return {
+    ok: true, url: String(url), status: 200, title: `Demo page ${h}`,
+    headings: ['Demo snapshot', `Section ${h.slice(0, 4)}`],
+    links: [{ href: 'demo:next', text: 'Next demo step' }],
+    text: `Deterministic DEMO browser snapshot for ${url}. No network was used.`,
+    bytes: 512, truncated: false, engine: 'mock', provenance: 'DEMO', mocked: true,
+    isolated: true, executorVersion: EXECUTOR_VERSION,
+  };
+}
+
+function validateBrowseRequest(body) {
+  if (!body || typeof body !== 'object') throw { status: 400, code: 'bad_params', message: 'body must be JSON' };
+  const secrets = findSecretKeys(body);
+  if (secrets.length) throw { status: 400, code: 'secret_refused', message: `request must never carry secrets (found: ${secrets.slice(0, 3).join(', ')})` };
+  const url = String(body.url || '');
+  if (!url) throw { status: 400, code: 'bad_params', message: 'url is required' };
+  if (url.length > 2000) throw { status: 400, code: 'bad_params', message: 'url exceeds length limit' };
+  if (/[;`$(){}!#~\n\r\0]/.test(url)) throw { status: 403, code: 'denied', message: 'url contains rejected characters' };
+  // DEMO mock session: never gated, never networked.
+  if (/^demo:/i.test(url) || /^about:demo/i.test(url)) return { url, demo: true };
+  let u;
+  try { u = new URL(url); } catch { throw { status: 400, code: 'bad_params', message: 'invalid URL' }; }
+  if (!['http:', 'https:'].includes(u.protocol)) throw { status: 403, code: 'denied', message: `protocol not allowed: ${u.protocol}` };
+  if (u.username || u.password) throw { status: 403, code: 'denied', message: 'URLs with embedded credentials are rejected' };
+  const host = String(u.hostname || '').toLowerCase();
+  for (const re of BROWSE_BLOCKED_HOST_RES) {
+    if (re.test(host)) throw { status: 403, code: 'denied', message: `blocked host: ${host}` };
+  }
+  for (const re of BROWSE_BLOCKED_IP_RES) {
+    if (re.test(host)) throw { status: 403, code: 'denied', message: `blocked IP target: ${host}` };
+  }
+  const networkMode = body.networkMode || 'disabled';
+  if (networkMode !== 'allowlist') throw { status: 403, code: 'denied', message: 'browse requires networkMode=allowlist (DEMO mock excepted)' };
+  const allow = Array.isArray(body.networkAllowlist) ? body.networkAllowlist.map(String) : [];
+  const ok = allow.some((a) => host === String(a).toLowerCase() || host.endsWith(`.${String(a).toLowerCase()}`));
+  if (!ok) throw { status: 403, code: 'denied', message: `host not in network allowlist: ${host}` };
+  return { url, demo: false };
+}
+
+function fetchForBrowse(targetUrl) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(targetUrl); } catch (e) { reject(e); return; }
+    const lib = u.protocol === 'https:' ? require('https') : require('http');
+    const timer = setTimeout(() => reject(Object.assign(new Error('browse timed out'), { code: 'timeout' })), BROWSE_TIMEOUT_MS);
+    const req = lib.get(u, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        clearTimeout(timer);
+        try { res.resume(); } catch {}
+        reject(Object.assign(new Error('redirects are not followed by the browse snapshot engine'), { code: 'redirect' }));
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', (c) => {
+        bytes += c.length;
+        if (bytes > BROWSE_MAX_BYTES) { try { res.destroy(); } catch {} }
+        else chunks.push(c);
+      });
+      res.on('end', () => {
+        clearTimeout(timer);
+        if (bytes > BROWSE_MAX_BYTES) { reject(Object.assign(new Error('response exceeds browse byte limit'), { code: 'oversized' })); return; }
+        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString('utf8'), bytes });
+      });
+      res.on('error', (e) => { clearTimeout(timer); reject(e); });
+    });
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    req.setTimeout(BROWSE_TIMEOUT_MS, () => { try { req.destroy(); } catch {} });
+  });
+}
+
+function snapshotFromHtml(url, status, html) {
+  const title = (/\<title[^>]*\>([^<]{1,200})\<\/title\>/i.exec(html) || [])[1]?.trim() || null;
+  const headings = [];
+  const hre = /\<h[1-3][^>]*\>([^<]{1,200})\<\/h[1-3]\>/gi;
+  let m;
+  while ((m = hre.exec(html)) && headings.length < 10) headings.push(m[1].trim());
+  const links = [];
+  const lre = /\<a[^>]+href\s*=\s*["']([^"']{1,500})["'][^>]*\>([^<]{0,120})\<\/a\>/gi;
+  while ((m = lre.exec(html)) && links.length < 20) links.push({ href: m[1].slice(0, 500), text: (m[2] || '').trim().slice(0, 120) });
+  const text = html.replace(/\<script[\s\S]*?\<\/script\>/gi, ' ').replace(/\<style[\s\S]*?\<\/style\>/gi, ' ')
+    .replace(/\<[^>]+\>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4000);
+  return {
+    ok: true, url, status, title, headings, links, text,
+    bytes: Buffer.byteLength(html, 'utf8'), truncated: html.length > 8000,
+    engine: 'fetch', provenance: 'OBSERVED', mocked: false,
+    isolated: true, executorVersion: EXECUTOR_VERSION,
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/v1/health') {
@@ -387,16 +495,49 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true, isolated: true, executorVersion: EXECUTOR_VERSION }));
       return;
     }
+    const expected = process.env.SANDBOX_WORKER_TOKEN || null;
+    const checkAuth = () => {
+      if (expected) {
+        const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+        if (got !== expected) { fail(res, 401, 'unauthorized', 'invalid worker token'); return false; }
+      }
+      return true;
+    };
+    if (req.method === 'POST' && req.url === '/v1/browse') {
+      if (!checkAuth()) return;
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch (e) {
+        if (e && e.status) return fail(res, e.status, e.code || 'bad_params', e.message);
+        return fail(res, 400, 'bad_params', 'invalid JSON body');
+      }
+      let v;
+      try {
+        v = validateBrowseRequest(body);
+      } catch (e) {
+        return fail(res, (e && e.status) || 403, (e && e.code) || 'denied', (e && e.message) || 'denied');
+      }
+      if (v.demo) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(browseDemoSnapshot(v.url)));
+        return;
+      }
+      try {
+        const r = await fetchForBrowse(v.url);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(snapshotFromHtml(v.url, r.status, r.body)));
+      } catch (e) {
+        return fail(res, 502, (e && e.code) || 'fetch_failure', (e && e.message) || 'browse fetch failed');
+      }
+      return;
+    }
     if (req.method !== 'POST' || req.url !== '/v1/execute') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: false, code: 'not_found', isolated: true, executorVersion: EXECUTOR_VERSION }));
       return;
     }
-    const expected = process.env.SANDBOX_WORKER_TOKEN || null;
-    if (expected) {
-      const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-      if (got !== expected) return fail(res, 401, 'unauthorized', 'invalid worker token');
-    }
+    if (!checkAuth()) return;
     let body;
     try {
       body = JSON.parse(await readBody(req));
@@ -443,4 +584,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, validateRequest, assertWorkspaceRelPath, validateWorkspaceSnapshot, collectArtifacts, manifestWorkspace, childEnv, executeInEphemeralWorkspace, EXECUTOR_VERSION };
+module.exports = { server, validateRequest, validateBrowseRequest, browseDemoSnapshot, assertWorkspaceRelPath, validateWorkspaceSnapshot, collectArtifacts, manifestWorkspace, childEnv, executeInEphemeralWorkspace, EXECUTOR_VERSION };
