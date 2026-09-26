@@ -1,5 +1,9 @@
 # OrchestraAI — Adaptive Agent Runtime
 
+[![CI](https://github.com/harshpandeyz/OrchestraAI/actions/workflows/ci.yml/badge.svg)](https://github.com/harshpandeyz/OrchestraAI/actions/workflows/ci.yml)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/Node-22-green.svg)](Dockerfile)
+
 > **A production-oriented agent runtime that routes tasks to AI models, executes tools safely, learns from outcomes, and streams execution state in real time.**
 
 ### Architecture
