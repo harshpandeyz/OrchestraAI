@@ -1,0 +1,28 @@
+/* Execution graph — quiet, precise, data-driven. */
+.v2-graph { border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+.v2-graph-toolbar { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
+.v2-graph-toolbar .v2-meta { margin-left: auto; }
+.v2-graph-canvas { position: relative; overflow: hidden; touch-action: none; }
+.v2-graph-canvas svg { display: block; width: 100%; height: auto; }
+.v2-gnode { cursor: pointer; }
+.v2-gnode rect { fill: var(--surface-raised); stroke: var(--border); stroke-width: 1.5; rx: 10; }
+.v2-gnode[data-status='running'] rect { stroke: var(--running); stroke-width: 2; }
+.v2-gnode[data-status='failed'] rect, .v2-gnode[data-status='blocked'] rect { stroke: var(--failed); stroke-width: 2; }
+.v2-gnode[data-status='verified'] rect { stroke: var(--verified); }
+.v2-gnode[data-selected='true'] rect { stroke: var(--selection); stroke-width: 2.5; }
+.v2-gnode text { fill: var(--text); font-size: 12px; font-weight: 700; }
+.v2-gnode .sub { fill: var(--text-subtle); font-size: 10.5px; font-weight: 600; }
+.v2-gedge { stroke: var(--border-strong); stroke-width: 1.5; fill: none; }
+.v2-gedge.done { stroke: var(--verified); }
+.v2-minimap { position: absolute; right: 8px; bottom: 8px; width: 120px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-raised); opacity: 0.92; }
+.v2-graph-timeline { display: flex; flex-direction: column; gap: 0; padding: 6px 0; }
+.v2-graph-timeline .v2-tl-row { display: grid; grid-template-columns: 28px 1fr; gap: 8px; padding: 8px 12px; border: 0; background: none; text-align: left; width: 100%; cursor: pointer; color: var(--text); border-radius: 8px; font-size: 13px; }
+.v2-graph-timeline .v2-tl-row:hover { background: var(--surface-elevated); }
+.v2-graph-timeline .v2-tl-rail { display: flex; flex-direction: column; align-items: center; }
+.v2-graph-timeline .v2-tl-dot { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border-strong); background: var(--surface); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; }
+.v2-graph-timeline .v2-tl-row[data-status='verified'] .v2-tl-dot { background: var(--verified); border-color: var(--verified); color: #fff; }
+.v2-graph-timeline .v2-tl-row[data-status='running'] .v2-tl-dot { border-color: var(--running); color: var(--running); }
+.v2-graph-timeline .v2-tl-row[data-status='failed'] .v2-tl-dot, .v2-graph-timeline .v2-tl-row[data-status='blocked'] .v2-tl-dot { background: var(--failed); border-color: var(--failed); color: #fff; }
+@media (prefers-reduced-motion: reduce) {
+  .v2-gnode rect, .v2-gedge { transition: none !important; }
+}
