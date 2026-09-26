@@ -1764,6 +1764,33 @@ const server = http.createServer(async (req, res) => {
         const tools = await toolRegistry.getTools();
         return send(res, 200, { tools });
       }
+      // ---------- Browser tool v1 (Session 12): POST /api/browse ----------
+      // Auth-gated snapshot endpoint. DEMO mode (or demo: URLs) returns the
+      // deterministic mock with zero network. LIVE mode requires an explicit
+      // networkAllowlist in the body and routes through the SSRF-guarded
+      // engine — never a fake result, never an ungated fetch.
+      if (req.method === 'POST' && path === '/api/browse') {
+        if (authConfig.enabled && needAuth(res, principal)) return;
+        const body = (json && typeof json === 'object') ? json : {};
+        try {
+          const { executeBrowserTool } = require('./src/execution/browser-tool');
+          const mode = currentMode();
+          const snap = await executeBrowserTool('browser_snapshot', body, {
+            mode,
+            policy: {
+              networkAccess: mode === 'demo' ? 'disabled' : 'allowlist',
+              networkAllowlist: Array.isArray(body.networkAllowlist) ? body.networkAllowlist.map(String).slice(0, 20) : [],
+              allowedTools: ['browser_snapshot', 'browser_navigate'],
+            },
+            timeoutMs: 20000,
+          });
+          return send(res, 200, { snapshot: snap });
+        } catch (e) {
+          const code = (e && e.code) || 'browse_failed';
+          const status = code === 'bad_params' ? 400 : code === 'denied' ? 403 : 502;
+          return sendError(res, status, code, String((e && e.message) || e).slice(0, 300));
+        }
+      }
       if (req.method === 'GET' && path === '/api/memory') {
         const scope = u.searchParams.get('scope');
         const q = (u.searchParams.get('q') || '').slice(0, 200).toLowerCase();
@@ -1801,6 +1828,18 @@ const server = http.createServer(async (req, res) => {
           }
         }
         return send(res, 200, { evaluations: evaluations.list({ runId, limit }) });
+      }
+      // ---------- Evals v2 golden suite (Session 12, read-only, DEMO-labelled) ----------
+      // Deterministic self-check leaderboard: runs the fixed golden tasks with
+      // DEMO measurements through the real scorer. Real numbers, honestly
+      // labelled — never presented as production measurements.
+      if (req.method === 'GET' && path === '/api/evals/golden') {
+        if (authConfig.enabled && needAuth(res, principal)) return;
+        const { GOLDEN_TASKS } = require('./src/evals/golden-tasks');
+        const { runGoldenSuite, demoAttempts } = require('./src/evals/golden-runner');
+        const modelId = String(u.searchParams.get('model') || 'demo-baseline').slice(0, 64);
+        const result = runGoldenSuite(demoAttempts(modelId), { modelId, provenance: 'DEMO' });
+        return send(res, 200, { tasks: GOLDEN_TASKS.length, suite: result, note: 'DEMO self-check through the deterministic scorer — same pipeline, mock measurements, explicitly labelled.' });
       }
       // ---------- Session 2 intelligence API (read-only unless noted) ----------
       // Model capability profiles + empirical performance (Session 4 consumes

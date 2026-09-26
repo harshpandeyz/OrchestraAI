@@ -64,7 +64,8 @@ gate is release-blocking the overall verdict is `BLOCKED` (incomplete), never
 | Backend tests       | `npm run test:all`                        | **yes**  | Runtime, auth, tenant isolation, recovery, queue, sandbox, providers, economics, intelligence. |
 | Frontend tests      | `npm run test:frontend`                   | **yes**  | Vitest console tests. |
 | Frontend build      | `npm run build:frontend`                  | **yes**  | `tsc --noEmit` typecheck + Vite production build. |
-| Browser E2E         | `npm run test:e2e`                        | **yes**  | Core journey, auth, tenant isolation, navigation, SSE, responsive, a11y. |
+| Browser E2E         | `npm run test:e2e`                        | **yes**  | Core journey, auth, tenant isolation, navigation, SSE, responsive, a11y, browser-tool DEMO. |
+| Evals golden        | `node qa/evals-golden-check.js`           | no (info) | 24-task deterministic suite; writes `qa/evals-golden-report.json`. Non-blocking until promoted to blocking once stable. |
 | Container smoke     | `bash deploy/scripts/smoke-container.sh`  | **yes**  | Production image boots, `/api/health`, `/api/ready`, console served. |
 | Full topology smoke | `bash deploy/scripts/smoke-topology.sh`   | **yes*** | Postgres + Redis + sandbox. Slow; requires Docker. `*` runs on push/release CI, not the local fast path. |
 

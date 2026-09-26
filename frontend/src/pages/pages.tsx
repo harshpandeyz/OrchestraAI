@@ -585,6 +585,15 @@ export function EvalsPage() {
   const [evalQuery, setEvalQuery] = useState('');
   const [evalSort, setEvalSort] = useState<'score' | 'cost' | 'latency' | 'name'>('score');
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  // Evals v2 golden leaderboard (Session 12): real DEMO self-check numbers
+  // from /api/evals/golden, explicitly labelled. Never mixed with production
+  // measurements; renders only when the backend answers.
+  const [golden, setGolden] = useState<null | { modelId: string; provenance: string; total: number; passed: number; successRate: number | null; categories: { category: string; total: number; passed: number; successRate: number | null; avgCost: number | null; avgLatencyMs: number | null }[] }>(null);
+  useEffect(() => {
+    let live = true;
+    api.getGoldenEvals().then((r) => { if (live) setGolden(r.suite); }).catch(() => {});
+    return () => { live = false; };
+  }, []);
 
   const evals = state.server.evals;
   const q = evalQuery.toLowerCase();
@@ -609,6 +618,20 @@ export function EvalsPage() {
           <p className="lede">Runtime quality metrics. {evals.length} evaluation{evals.length !== 1 ? 's' : ''}.</p>
         </div>
       </div>
+      {golden && (
+        <section className="card" aria-label="Golden benchmark leaderboard">
+          <h3>Golden benchmark — {golden.passed}/{golden.total} passed (rate {golden.successRate ?? '—'})</h3>
+          <p className="note">Model {golden.modelId} · provenance {golden.provenance} (DEMO self-check, explicitly labelled — not production measurements).</p>
+          <div className="mc-detail-grid">
+            {golden.categories.map((c) => (
+              <div key={c.category} className="mc-detail-item">
+                <span className="mc-detail-label">{c.category}</span>
+                <span className="mc-detail-value mono">{c.passed}/{c.total} · rate {c.successRate ?? '—'}{typeof c.avgCost === 'number' ? ` · ${usd(c.avgCost)}` : ''}{typeof c.avgLatencyMs === 'number' ? ` · ${fmtSec(c.avgLatencyMs)}` : ''}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       {evals.length > 0 && (
         <div className="toolbar" role="toolbar" aria-label="Evaluation filters">
           <div className="search-wrap">

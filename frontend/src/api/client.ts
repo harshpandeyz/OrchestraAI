@@ -80,6 +80,7 @@ export const api = {
   getTools: () => req<{ tools: RuntimeSnapshot['tools'] }>(`/api/tools`),
   getMemory: (scope?: string, q?: string) => req<{ items: MemoryItem[] }>(`/api/memory${scope || q ? `?${new URLSearchParams({ ...(scope ? { scope } : {}), ...(q ? { q } : {}) })}` : ''}`),
   getEvaluations: () => req<{ evaluations: EvaluationRecord[]; note?: string }>(`/api/evaluations`),
+  getGoldenEvals: () => req<{ tasks: number; suite: { modelId: string; provenance: string; total: number; passed: number; successRate: number | null; avgCost: number | null; avgLatencyMs: number | null; categories: { category: string; total: number; passed: number; successRate: number | null; avgCost: number | null; avgLatencyMs: number | null }[] }; note: string }>(`/api/evals/golden`),
   // Providers (backend-mediated; keys are write-only and never readable).
   getProviders: () => req<{ mode: string; providers: ProviderInfo[] }>(`/api/providers`),
   getProvider: (id: string) => req<{ provider: ProviderInfo; mode: string }>(`/api/providers/${id}/status`),

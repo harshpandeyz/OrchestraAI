@@ -61,6 +61,10 @@ const STAGES = [
   { id: 'backend', scope: 'fast', cmd: 'npm', args: ['run', 'test:all'] },
   { id: 'frontend', scope: 'fast', cmd: 'npm', args: ['run', 'test:frontend'] },
   { id: 'frontendBuild', scope: 'fast', cmd: 'npm', args: ['run', 'build:frontend'] },
+  // Evals v2 golden suite — NON-BLOCKING info gate (Session 12). It always
+  // runs (fast, zero keys) and writes qa/evals-golden-report.json, but a
+  // failure never blocks the release until promoted per qa/RELEASE.md.
+  { id: 'evalsGolden', scope: 'fast', cmd: 'node', args: ['qa/evals-golden-check.js'], blocking: false },
   { id: 'e2e', scope: 'full', cmd: 'npm', args: ['run', 'test:e2e'] },
   { id: 'containerSmoke', scope: 'full', cmd: 'bash', args: ['deploy/scripts/smoke-container.sh'] },
 ];
@@ -97,7 +101,12 @@ async function main() {
     const r = await sh(stage.cmd, stage.args);
     const ms = Date.now() - t0;
     const passed = r.code === 0;
-    checks[stage.id] = passed ? 'PASS' : 'FAIL';
+    const nonBlocking = stage.blocking === false;
+    checks[stage.id] = passed ? 'PASS' : nonBlocking ? 'WARN' : 'FAIL';
+    if (!passed && nonBlocking) {
+      console.log(`  ⇒ WARN (non-blocking info gate, exit ${r.code}) (${(ms / 1000).toFixed(1)}s)`);
+      continue;
+    }
     if (!passed) failures.push({ id: stage.id, state: 'FAIL', exitCode: r.code });
     console.log(`  ⇒ ${passed ? 'PASS' : 'FAIL'} (${(ms / 1000).toFixed(1)}s)`);
     // A critical stage failure stops the gate: later stages depend on these
