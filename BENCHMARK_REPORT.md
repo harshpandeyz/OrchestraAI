@@ -38,19 +38,18 @@ node qa/evals-golden-check.js --model router-v2
 #    { delta, regressions[], fixes[], byCategory[{ category, before, after, delta }] }
 ```
 
-A negative `delta` or any entry in `regressions[]` blocks promotion of the
-change until triaged per `qa/RELEASE.md` (PRODUCT BUG vs TEST BUG vs
-ENVIRONMENT vs INFRA vs FLAKY). The gate is currently **non-blocking info**
-until the suite proves stable, then it promotes to blocking with no code
-change beyond flipping `blocking: true` in `qa/release-check.js`.
+A negative `delta` or any entry in `regressions[]` means the change must be
+investigated and resolved before it is promoted (see the defect triage
+process in `qa/RELEASE.md`). The golden check currently runs as a
+non-blocking informational gate; it can be promoted to a blocking gate by
+setting `blocking: true` in `qa/release-check.js`.
 
 ## First regression comparison (pending)
 
-No router/model/prompt change has shipped against this baseline yet, so
-there is no before/after pair beyond the self-consistency check in
-`backend/test/evals-golden.test.js` (a synthetic one-task corruption is
-detected as exactly one `coding` regression, `delta < 0`). The first real
-comparison lands with the next router change — the harness is ready.
+No before/after comparison against a router change has been recorded yet.
+The self-consistency check in `backend/test/evals-golden.test.js` verifies
+the mechanism (a synthetic one-task corruption is detected as exactly one
+`coding` regression, `delta < 0`).
 
 ## Honesty notes
 

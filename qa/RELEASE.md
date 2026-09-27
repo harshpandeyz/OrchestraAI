@@ -117,8 +117,8 @@ For the full path:
 
 Every failing test is classified before any change is made:
 
-- `PRODUCT BUG` — the application is wrong. **Report to the owning area; do
-  not patch the product.**
+- `PRODUCT BUG` — the application is wrong. **Escalate to the responsible
+  maintainers; do not mask the failure in the product.**
 - `TEST BUG` — the test encodes a wrong expectation. Fix the test (keeping the
   production invariant intact).
 - `ENVIRONMENT BUG` — missing dependency, wrong runtime. Fix the environment.

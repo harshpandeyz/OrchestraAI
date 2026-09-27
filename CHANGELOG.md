@@ -2,16 +2,17 @@
 
 ## 2026-09-26 — Integrate, Verify, and Ship
 
-Six separately-pushed commits on top of `674696d`, all green (`RELEASE READY`).
+Release-hardening changes since `674696d`. All release gates pass (`RELEASE READY`).
 
 ### `b175f8e` — fix(qa): time-relative fixtures + non-self-tripping scanner
 Unblocked the release gate. `backend/test/intelligence-analytics.test.js`
 used hardcoded Aug-2026 fixture dates while `buildIntelligence()` applies a
 rolling 30-day range window, so past ~Sep 20 the fixtures filtered to zero
-runs (`INSUFFICIENT_DATA` vs `DEMO`) — a TEST BUG; fixtures are now relative
-to `Date.now()`. `qa/secret-scan.js --self-test` planted a contiguous
-`sk-proj-…` literal the scanner matched in its own source — an
-INFRASTRUCTURE BUG; the planted secret is now assembled by concatenation.
+runs (`INSUFFICIENT_DATA` vs `DEMO`) — a defect in the test rather than the
+product; fixtures are now relative to `Date.now()`.
+`qa/secret-scan.js --self-test` planted a contiguous `sk-proj-…` literal the
+scanner matched in its own source — a defect in the scanner tooling; the
+planted secret is now assembled by concatenation.
 
 ### `f7c4617` — feat(evals): Evals v2 golden suite (+687)
 `backend/src/evals/golden-tasks.js`: 24 frozen tasks across coding (6),
