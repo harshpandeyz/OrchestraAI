@@ -1,4 +1,4 @@
-# OrchestraAI — Golden Benchmark Report (Session 12)
+# OrchestraAI — Golden Benchmark Report
 
 All numbers below are **real outputs of the deterministic golden suite**
 (`backend/src/evals/golden-tasks.js` + `golden-runner.js`), run via
@@ -12,7 +12,7 @@ cat qa/evals-golden-report.json   # gitignored working copy
 cat qa/evals-golden-baseline.json # checked-in baseline for diffs
 ```
 
-## Baseline result (2026-09-26, commit `b175f8e` + Session 12 work)
+## Baseline result (2026-09-26, commit `b175f8e`)
 
 - Model: `demo-baseline`, provenance `DEMO`
 - **24/24 passed, success rate 1.0**, avg cost $0.001354/task, avg latency 583ms
@@ -44,10 +44,10 @@ ENVIRONMENT vs INFRA vs FLAKY). The gate is currently **non-blocking info**
 until the suite proves stable, then it promotes to blocking with no code
 change beyond flipping `blocking: true` in `qa/release-check.js`.
 
-## First regression comparison (this session)
+## First regression comparison (pending)
 
-No router/model/prompt change shipped in Session 12, so there is no
-before/after pair yet beyond the self-consistency check in
+No router/model/prompt change has shipped against this baseline yet, so
+there is no before/after pair beyond the self-consistency check in
 `backend/test/evals-golden.test.js` (a synthetic one-task corruption is
 detected as exactly one `coding` regression, `delta < 0`). The first real
 comparison lands with the next router change — the harness is ready.

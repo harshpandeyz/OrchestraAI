@@ -1,8 +1,8 @@
 # OrchestraAI — Release Gate & QA Playbook
 
 This document is the authoritative definition of what it means for OrchestraAI
-to be **RELEASE READY** versus **RELEASE BLOCKED**. It is owned by Session 5
-(QA / E2E / release engineering). The single entry point is:
+to be **RELEASE READY** versus **RELEASE BLOCKED**. It is owned by the
+QA / E2E / release-engineering area. The single entry point is:
 
 ```bash
 npm run release:check
@@ -117,7 +117,7 @@ For the full path:
 
 Every failing test is classified before any change is made:
 
-- `PRODUCT BUG` — the application is wrong. **Report to the owning session; do
+- `PRODUCT BUG` — the application is wrong. **Report to the owning area; do
   not patch the product.**
 - `TEST BUG` — the test encodes a wrong expectation. Fix the test (keeping the
   production invariant intact).

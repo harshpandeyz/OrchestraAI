@@ -273,26 +273,26 @@ All decisions are structured, never free-text chain-of-thought:
 - `tool_selection`, `tool_enable`, `tool_disable`
 - `retry`, `fallback`, `pause`, `resume`, `terminate`, `checkpoint`
 
-## Interfaces (Extension Points for Sessions 2–4)
+## Interfaces (Extension Points)
 
 | Interface | Implemented By | Consumed By |
 |-----------|----------------|-------------|
-| `ModelRegistry` | Session 2 | Orchestrator, ModelRouter |
-| `ModelRouter` | Session 2 | Orchestrator |
-| `ContextManager` | Session 3 | Orchestrator |
-| `MemoryManager` | Session 3 | Orchestrator |
-| `CacheManager` | Session 3 | Orchestrator |
-| `ToolRegistry` | Session 3 | Orchestrator, ToolExecutor |
-| `ToolExecutor` | Session 3 | Orchestrator |
-| `CostEstimatorInterface` | Session 2 | Orchestrator |
-| `PolicyEngineInterface` | Session 1 (core) | Orchestrator |
-| `TelemetryCollector` | Session 1 (core) | Frontend (Session 4) |
-| `EvaluationEngine` | Session 5 | Orchestrator |
+| `ModelRegistry` | Model layer | Orchestrator, ModelRouter |
+| `ModelRouter` | Model layer | Orchestrator |
+| `ContextManager` | Execution layer | Orchestrator |
+| `MemoryManager` | Execution layer | Orchestrator |
+| `CacheManager` | Execution layer | Orchestrator |
+| `ToolRegistry` | Execution layer | Orchestrator, ToolExecutor |
+| `ToolExecutor` | Execution layer | Orchestrator |
+| `CostEstimatorInterface` | Model layer | Orchestrator |
+| `PolicyEngineInterface` | Core runtime | Orchestrator |
+| `TelemetryCollector` | Core runtime | Console |
+| `EvaluationEngine` | Evaluation layer | Orchestrator |
 
 ## Key Architectural Decisions
 
 ### 1. Orchestrator as Control Plane
-The orchestrator contains **no provider-specific logic**. It only calls interfaces. All provider/model logic lives in `ModelRegistry`/`ModelRouter` (Session 2).
+The orchestrator contains **no provider-specific logic**. It only calls interfaces. All provider/model logic lives in `ModelRegistry`/`ModelRouter` in the model layer.
 
 ### 2. Switching Cost is First-Class
 Model switches are never free. `SwitchingCostCalculator` accounts for:

@@ -178,7 +178,6 @@ The backend uses canonical dotted event names and enforces the event contract so
 | `ARCHITECTURE.md`             | System architecture    |
 | `CONTRACTS.md`                | Backend contracts      |
 | `MODEL_INTELLIGENCE.md`       | Routing & intelligence |
-| `CONTEXT_MEMORY_CACHE.md`     | Context & memory       |
 | `FRONTEND.md`                 | Console architecture   |
 | `deploy/backup-procedures.md` | Production backups     |
 

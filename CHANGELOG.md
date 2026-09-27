@@ -1,6 +1,6 @@
 # Changelog
 
-## Session 12 — Integrate, Verify, and Ship (2026-09-26)
+## 2026-09-26 — Integrate, Verify, and Ship
 
 Six separately-pushed commits on top of `674696d`, all green (`RELEASE READY`).
 
@@ -48,4 +48,4 @@ non-blocking `evalsGolden` info stage.
 ### `5a90af4` — docs (+285)
 ISC `LICENSE` (matches `package.json`), README badges (real CI workflow,
 license, Node 22), `BENCHMARK_REPORT.md` (real 24/24 DEMO numbers +
-regression procedure), `SESSION_12_HANDOFF.md`.
+regression procedure).
