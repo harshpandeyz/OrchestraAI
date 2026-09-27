@@ -10,3 +10,7 @@ backend/.runtime-data-contractcheck/
 backend/.runtime-data-livetest/
 *.log
 .DS_Store
+.orchestra-work/
+SESSION_11_HANDOFF.md
+SESSION_12_HANDOFF.md
+CONTEXT_MEMORY_CACHE.md
