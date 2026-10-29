@@ -185,6 +185,6 @@ The backend uses canonical dotted event names and enforces the event contract so
 
 ### Status
 
-**OrchestraAI is designed as a real end-to-end agent runtime — not a simulated UI.**
+**OrchestraAI is designed as a real end-to-end agent runtime —- not a simulated UI.**
 
 Real providers, real tools, real persistence, real event streaming, explicit DEMO mode, and production-boundary tests.
